@@ -299,7 +299,7 @@ static int epl_register_device(void)
 		return result;
 	}
 	device_file_major_number = result;
-	dev_class = class_create(THIS_MODULE, device_name);
+	dev_class = class_create(device_name);
 	if (dev_class == NULL) {
 		pr_err("%s> Could not create class for device\n", device_name);
 		goto class_fail;
@@ -402,10 +402,9 @@ static void epl_client_shutdown(struct platform_device *pdev)
 	epl_unregister_device();
 }
 
-static int epl_client_remove(struct platform_device *pdev)
+static void epl_client_remove(struct platform_device *pdev)
 {
 	epl_unregister_device();
-	return 0;
 }
 
 static struct platform_driver epl_client = {

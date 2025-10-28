@@ -516,14 +516,13 @@ abort:
 	return ret;
 }
 
-static int hsierrrptinj_remove(struct platform_device *pdev)
+static void hsierrrptinj_remove(struct platform_device *pdev)
 {
 	/* We must explicitly remove the debugfs entries we created. They are not
 	 * automatically removed upon module removal.
 	 */
 	pr_debug("tegra-hsierrrptinj: Recursively remove directory and node created\n");
 	debugfs_remove_recursive(hsierrrptinj_debugfs_root);
-	return 0;
 }
 
 static struct platform_driver hsierrrptinj = {
