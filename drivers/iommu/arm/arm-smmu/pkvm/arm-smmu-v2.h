@@ -106,22 +106,11 @@ struct smmu_v2_domain {
 
 /*
  * Tegra Memory Controller (MC) Integration
- * Used for SID override validation
+ *
+ * MC structures and functions have been moved to drivers/memory/tegra/pkvm/.
+ * The MC module registers with SMMU via platform hooks (smmu-platform.h).
+ * See tegra234-mc.h for MC client definitions.
  */
-struct mc_client_info {
-	u32			client_id;	/* TEGRA234_MEMORY_CLIENT_* */
-	const char		*name;		/* Client name (for logging) */
-	u16			sid_override_offset;
-	u16			sid_security_offset;
-};
-
-struct hyp_tegra_mc {
-	phys_addr_t		mmio_addr;
-	void __iomem		*base;
-	size_t			mmio_size;
-	const struct mc_client_info *clients;
-	u32			num_clients;
-};
 
 /*
  * Global State - nVHE symbols for EL2/EL1 communication
@@ -136,7 +125,6 @@ extern size_t kvm_nvhe_sym(kvm_hyp_arm_smmu_v2_count);
 
 /* EL2-only state */
 extern struct sid_assignment sid_map[ARM_SMMU_MAX_SIDS];
-extern struct hyp_tegra_mc tegra234_mc;
 
 /* Forward declaration of EL2 ops structure for EL1 registration */
 struct kvm_iommu_ops;
@@ -240,12 +228,12 @@ int smmu_v2_assign_sid(u32 smmu_id, u32 sid, u32 client_id, pkvm_handle_t domain
 int smmu_v2_release_sid(u32 smmu_id, u32 sid);
 struct sid_assignment *smmu_v2_lookup_sid(u32 sid);
 
-/* MC integration */
-int mc_init(phys_addr_t mmio_addr, size_t mmio_size);
-bool mc_mmio_handler(u64 addr, bool is_write, u64 *val);
-int mc_register_sid_mapping(u32 client_id, u32 sid);
-int mc_validate_sid_for_client(u32 client_id, u32 sid);
-const struct mc_client_info *mc_offset_to_client(u32 offset);
+/*
+ * MC integration
+ *
+ * MC functions have been moved to drivers/memory/tegra/pkvm/tegra234-mc.h.
+ * The MC module registers with SMMU via platform hooks (smmu-platform.h).
+ */
 
 /* Helper functions */
 static inline struct hyp_arm_smmu_v2_device *smmu_v2_find_by_mmio_addr(u64 addr)
