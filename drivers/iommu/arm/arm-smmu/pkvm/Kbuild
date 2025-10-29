@@ -1,5 +1,11 @@
 # SPDX-License-Identifier: GPL-2.0-only
+#
+# pKVM SMMUv2 hypervisor integration
+#
+# Note: tegra234-mc.o has been moved to drivers/memory/tegra/pkvm/
+# and is built separately via TEGRA_MC_PKVM config option.
+#
 subdir-ccflags-y += -I$(srctree)/arch/arm64/kvm/hyp/include/
 subdir-ccflags-y += -DMODULE
-hyp-obj-y := arm-smmu-v2.o tegra234-mc.o ../../../io-pgtable-arm.o
+hyp-obj-y := arm-smmu-v2.o ../../../io-pgtable-arm.o
 include $(srctree)/arch/arm64/kvm/hyp/nvhe/Makefile.module

@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# pKVM Tegra Memory Controller integration
+#
+# This builds the EL2 hypervisor component that traps MC MMIO accesses
+# to validate Stream ID override writes.
+#
+
+subdir-ccflags-y += -I$(srctree)/arch/arm64/kvm/hyp/include/
+subdir-ccflags-y += -I$(srctree)/drivers/iommu/arm/arm-smmu/pkvm/
+subdir-ccflags-y += -DMODULE
+
+hyp-obj-y := tegra234-mc.o
+
+include $(srctree)/arch/arm64/kvm/hyp/nvhe/Makefile.module
