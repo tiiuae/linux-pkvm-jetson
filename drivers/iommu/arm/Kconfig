@@ -73,6 +73,22 @@ config ARM_SMMU_QCOM_DEBUG
 	  register dumps.
 endif
 
+config ARM_SMMU_V2_PKVM
+	bool "ARM SMMUv2 support for protected Virtual Machines (Tegra234)"
+	depends on KVM && ARM64 && ARM_SMMU && ARCH_TEGRA_234_SOC
+	select IOMMU_IO_PGTABLE_LPAE
+	help
+	  Enable a SMMUv2 driver in the KVM hypervisor to protect VMs against
+	  memory accesses from devices owned by the host on NVIDIA Tegra234
+	  (Jetson AGX Orin) platforms.
+
+	  This provides DMA isolation for protected VMs by having the hypervisor
+	  (EL2) own and control the SMMU hardware, validating all Stream ID
+	  assignments and enforcing Stage-2 translation for device DMA.
+
+	  Say Y here if you intend to enable KVM in protected mode on Tegra234
+	  and want to pass through devices like GPU to protected guest VMs.
+
 config ARM_SMMU_V3
 	tristate "ARM Ltd. System MMU Version 3 (SMMUv3) Support"
 	depends on ARM64
