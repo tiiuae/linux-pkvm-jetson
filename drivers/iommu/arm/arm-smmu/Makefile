@@ -4,3 +4,11 @@ obj-$(CONFIG_ARM_SMMU) += arm_smmu.o
 arm_smmu-objs += arm-smmu.o arm-smmu-impl.o arm-smmu-nvidia.o
 arm_smmu-$(CONFIG_ARM_SMMU_QCOM) += arm-smmu-qcom.o
 arm_smmu-$(CONFIG_ARM_SMMU_QCOM_DEBUG) += arm-smmu-qcom-debug.o
+
+obj-$(CONFIG_ARM_SMMU_V2_PKVM) += arm_smmu_v2_kvm.o
+ccflags-$(CONFIG_ARM_SMMU_V2_PKVM) += -Iarch/arm64/kvm/
+arm_smmu_v2_kvm-objs-y += arm-smmu-kvm.o
+arm_smmu_v2_kvm-objs := $(arm_smmu_v2_kvm-objs-y)
+
+# Build hypervisor objects
+obj-$(CONFIG_ARM_SMMU_V2_PKVM) += pkvm/
