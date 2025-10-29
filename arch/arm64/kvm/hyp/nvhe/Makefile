@@ -41,6 +41,15 @@ hyp-obj-$(CONFIG_ARM_SMMU_V3_PKVM_PV) += $(HYP_SMMU_V3_DRV_PATH)/pkvm/pv/arm-smm
 	$(HYP_SMMU_V3_DRV_PATH)/pkvm/arm-smmu-v3-lib-hyp.o
 endif
 
+ifeq ($(CONFIG_ARM_SMMU_V2_PKVM),y)
+HYP_SMMU_V2_DRV_PATH = ../../../../../drivers/iommu/arm/arm-smmu
+
+hyp-obj-$(CONFIG_ARM_SMMU_V2_PKVM) += $(HYP_SMMU_V2_DRV_PATH)/pkvm/arm-smmu-v2.o \
+	$(HYP_SMMU_V2_DRV_PATH)/pkvm/tegra234-mc.o \
+	$(HYP_SMMU_V2_DRV_PATH)/pkvm/io-pgtable-arm-hyp.o \
+	$(HYP_SMMU_V2_DRV_PATH)/../../io-pgtable-arm.o
+endif
+
 $(obj)/hyp.lds: $(src)/hyp.lds.S FORCE
 	$(call if_changed_dep,cpp_lds_S)
 
