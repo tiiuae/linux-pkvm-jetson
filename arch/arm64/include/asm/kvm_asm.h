@@ -137,12 +137,12 @@ enum __kvm_host_smccc_func {
 	__KVM_HOST_SMCCC_FUNC___pkvm_host_map_guest_mmio,
 	__KVM_HOST_SMCCC_FUNC___pkvm_pviommu_attach,
 	__KVM_HOST_SMCCC_FUNC___pkvm_pviommu_add_vsid,
-
+	__KVM_HOST_SMCCC_FUNC___pkvm_mc_register_sid,
 	/*
 	 * Start of the dynamically registered hypercalls. Start a bit
 	 * further, just in case some modules...
 	 */
-	__KVM_HOST_SMCCC_FUNC___dynamic_hcalls = 128,
+	__KVM_HOST_SMCCC_FUNC___dynamic_hcalls = 129,  // Moved to 129 to avoid collision
 };
 
 #define DECLARE_KVM_VHE_SYM(sym)	extern char sym[]

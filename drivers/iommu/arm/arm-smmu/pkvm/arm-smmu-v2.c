@@ -21,15 +21,37 @@
 #include <nvhe/trap_handler.h>
 
 #include "arm-smmu-v2.h"
+#include "smmu-platform.h"
 #include <nvhe/serial.h>
 #include "../../../io-pgtable-arm.h"
 
+/* Tegra Memory Controller integration (platform-specific) */
+#ifdef CONFIG_TEGRA_MC_PKVM
+#include "../../../../../drivers/memory/tegra/pkvm/tegra234-mc.h"
+#endif
+
 /*
  * Global State
+ *
+ * Note: MC MMIO symbols (kvm_hyp_tegra_mc_mmio_addr/size) have been moved to
+ * drivers/memory/tegra/pkvm/tegra234-mc.c as part of MC/SMMU separation.
  */
 struct hyp_arm_smmu_v2_device *kvm_hyp_arm_smmu_v2_smmus;
 size_t kvm_hyp_arm_smmu_v2_count;
 struct sid_assignment sid_map[ARM_SMMU_MAX_SIDS];
+
+/*
+ * Platform Hooks
+ *
+ * Platform-specific code (e.g., Tegra MC) can register hooks to handle
+ * platform-specific MMIO trapping (like SID override validation).
+ */
+static const struct smmu_v2_platform_hooks *platform_hooks;
+
+void smmu_v2_register_platform_hooks(const struct smmu_v2_platform_hooks *hooks)
+{
+	platform_hooks = hooks;
+}
 
 /*
  * Memory Donation Helpers
@@ -1829,6 +1851,11 @@ int smmu_v2_global_init(void)
 		/* Continue without UART - debug output will be silent */
 	}
 
+#ifdef CONFIG_TEGRA_MC_PKVM
+	/* Register Tegra MC platform hooks for SID override validation */
+	tegra234_mc_register_hooks();
+#endif
+
 	hyp_info("SMMUv2: Starting global initialization");
 
 	/*
@@ -1872,6 +1899,15 @@ int smmu_v2_global_init(void)
 		}
 
 		hyp_info("SMMUv2: SMMU %u initialization complete", i);
+	}
+
+	/* Call platform-specific initialization (e.g., Tegra MC) */
+	if (platform_hooks && platform_hooks->init) {
+		ret = platform_hooks->init();
+		if (ret) {
+			hyp_err("SMMUv2: Platform init failed (ret=%d)", ret);
+			return ret;
+		}
 	}
 
 	/* Initialize global identity-mapped page table (shared by all SMMUs) */
@@ -2859,8 +2895,12 @@ static bool smmu_v2_dabt_handler(struct user_pt_regs *regs, u64 esr, u64 addr)
 	if (is_write)
 		val = regs->regs[rt];
 
-	/* Handle MMIO access */
+	/* Try SMMU MMIO handler first */
 	handled = smmu_v2_mmio_handler(addr, is_write, &val);
+
+	/* If not SMMU, try platform-specific MMIO handler (e.g., Tegra MC) */
+	if (!handled && platform_hooks && platform_hooks->mmio_handler)
+		handled = platform_hooks->mmio_handler(addr, is_write, &val);
 
 	if (handled) {
 		/* Write result to register if read */

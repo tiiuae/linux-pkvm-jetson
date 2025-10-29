@@ -45,9 +45,18 @@ ifeq ($(CONFIG_ARM_SMMU_V2_PKVM),y)
 HYP_SMMU_V2_DRV_PATH = ../../../../../drivers/iommu/arm/arm-smmu
 
 hyp-obj-$(CONFIG_ARM_SMMU_V2_PKVM) += $(HYP_SMMU_V2_DRV_PATH)/pkvm/arm-smmu-v2.o \
-	$(HYP_SMMU_V2_DRV_PATH)/pkvm/tegra234-mc.o \
 	$(HYP_SMMU_V2_DRV_PATH)/pkvm/io-pgtable-arm-hyp.o \
 	$(HYP_SMMU_V2_DRV_PATH)/../../io-pgtable-arm.o
+endif
+
+# Tegra Memory Controller pKVM integration (separate from SMMU driver)
+ifeq ($(CONFIG_TEGRA_MC_PKVM),y)
+HYP_TEGRA_MC_PATH = ../../../../../drivers/memory/tegra
+
+# Add include path for SMMU platform hooks header (smmu-platform.h)
+CFLAGS_$(HYP_TEGRA_MC_PATH)/pkvm/tegra234-mc.nvhe.o += -I$(srctree)/drivers/iommu/arm/arm-smmu/pkvm
+
+hyp-obj-$(CONFIG_TEGRA_MC_PKVM) += $(HYP_TEGRA_MC_PATH)/pkvm/tegra234-mc.o
 endif
 
 # Only for built-in, not modules

@@ -14,8 +14,20 @@
 #include <asm/kvm_mmu.h>
 #include <nvhe/iommu.h>
 #include <nvhe/memory.h>
+#include <nvhe/mem_protect.h>
+#include <nvhe/serial.h>
+#include <dt-bindings/memory/tegra234-mc.h>
 
+#include "tegra234-mc.h"
+#include "smmu-platform.h"
 #include "arm-smmu-v2.h"
+
+/*
+ * EL2 hypervisor symbols for MC MMIO configuration.
+ * These are populated by the EL1 stub (tegra-mc-kvm.c) before EL2 init.
+ */
+phys_addr_t kvm_hyp_tegra_mc_mmio_addr;
+size_t kvm_hyp_tegra_mc_mmio_size;
 
 /* Memory Controller instance */
 struct hyp_tegra_mc tegra234_mc;
@@ -115,27 +127,6 @@ static const struct mc_client_info tegra234_mc_clients[] = {
 };
 
 /**
- * mc_init - Initialize Memory Controller EL2 integration
- * @mmio_addr: Physical address of MC registers
- * @mmio_size: Size of MC register region
- *
- * Maps MC MMIO region and configures stage-2 page tables to trap
- * all MC register accesses.
- */
-int mc_init(phys_addr_t mmio_addr, size_t mmio_size)
-{
-	tegra234_mc.mmio_addr = mmio_addr;
-	tegra234_mc.mmio_size = mmio_size;
-	tegra234_mc.clients = tegra234_mc_clients;
-	tegra234_mc.num_clients = ARRAY_SIZE(tegra234_mc_clients);
-
-	/* TODO: Map MMIO region as shared memory with EL2 */
-	/* TODO: Configure stage-2 to trap all MC accesses */
-
-	return 0;
-}
-
-/**
  * mc_offset_to_client - Find MC client by register offset
  * @offset: Register offset within MC MMIO region
  *
@@ -169,17 +160,21 @@ const struct mc_client_info *mc_offset_to_client(u32 offset)
 int mc_validate_sid_for_client(u32 client_id, u32 sid)
 {
 	struct sid_assignment *entry;
+	int i;
 
-	/* Look up the assigned SID for this client */
+	/* Look up the assigned SID */
 	entry = smmu_v2_lookup_sid(sid);
 	if (!entry)
 		return -EPERM;  /* SID not assigned to any domain */
 
-	if (entry->client_id != client_id)
-		return -EPERM;  /* SID doesn't match this client */
+	/* Check if this client is in the list of clients for this SID */
+	for (i = 0; i < entry->num_clients; i++) {
+		if (entry->client_ids[i] == client_id)
+			return 0;  /* Valid - client is registered for this SID */
+	}
 
-	/* Valid assignment */
-	return 0;
+	/* Client not found in SID's client list */
+	return -EPERM;
 }
 
 /**
@@ -188,21 +183,40 @@ int mc_validate_sid_for_client(u32 client_id, u32 sid)
  * @val: Value being written
  *
  * Validates that the Stream ID being written matches the client's
- * assigned SID.
+ * assigned SID. This is the core security enforcement mechanism - it
+ * prevents devices from stealing Stream IDs assigned to other devices.
  *
  * Returns: 0 if valid and write should proceed, -EPERM to block write
  */
 static int mc_handle_sid_override(const struct mc_client_info *client, u32 val)
 {
-	u32 sid = val & 0xFF;  /* SID is typically in lower 8 bits */
+	u32 sid = val & 0xFF;  /* SID is in lower 8 bits (MC_SID_STREAMID_OVERRIDE_MASK) */
+	struct sid_assignment *entry;
 
-	/* Validate SID assignment */
-	if (mc_validate_sid_for_client(client->client_id, sid) != 0) {
-		/* TODO: Log security violation */
+	/*
+	 * Special case: SID 0 is typically used as a default/invalid value.
+	 * Allow it unconditionally to support initialization.
+	 */
+	if (sid == 0) {
+		writel_relaxed(val, tegra234_mc.base + client->sid_override_offset);
+		return 0;
+	}
+
+	/* Validate that this client is authorized to use this SID */
+	if (mc_validate_sid_for_client(client->client_id, sid)) {
+		/* SID not assigned to this client - security violation */
+		entry = smmu_v2_lookup_sid(sid);
+		if (!entry || !entry->active) {
+			hyp_err("MC: Client '%s' (ID 0x%x) attempted to use unassigned SID %u\n",
+				client->name, client->client_id, sid);
+		} else {
+			hyp_err("MC: Client '%s' (ID 0x%x) attempted to steal SID %u\n",
+				client->name, client->client_id, sid);
+		}
 		return -EPERM;
 	}
 
-	/* Allow write to proceed by writing to real hardware */
+	/* Validation passed - allow write to hardware */
 	writel_relaxed(val, tegra234_mc.base + client->sid_override_offset);
 
 	return 0;
@@ -214,25 +228,36 @@ static int mc_handle_sid_override(const struct mc_client_info *client, u32 val)
  * @is_write: true for write, false for read
  * @val: Pointer to value
  *
- * Security registers control access protections. For now, emulate
- * them as read-only.
+ * Security registers control whether SID override is enabled and whether
+ * the register is writable. These are typically configured once during
+ * boot and should not change during runtime.
+ *
+ * Policy: Allow reads, allow writes (EL2 validates the actual SID values
+ * in the override registers, so manipulating security bits is harmless).
  */
 static int mc_handle_sid_security(const struct mc_client_info *client,
 				  bool is_write, u64 *val)
 {
+	u32 offset = client->sid_security_offset;
+
 	if (is_write) {
-		/* TODO: Decide policy for security register writes */
-		/* For now, reject them */
-		return -EPERM;
+		/*
+		 * Allow security register writes. The host MC driver may need
+		 * to enable SID override functionality or configure write
+		 * protection. Since we validate actual SID values in the
+		 * override registers, this is safe.
+		 */
+		writel_relaxed((u32)*val, tegra234_mc.base + offset);
+		return 0;
 	}
 
 	/* Read from hardware */
-	*val = readl_relaxed(tegra234_mc.base + client->sid_security_offset);
+	*val = readl_relaxed(tegra234_mc.base + offset);
 	return 0;
 }
 
 /**
- * mc_mmio_handler - Main MMIO trap handler for Memory Controller
+ * tegra234_mc_mmio_handler - Main MMIO trap handler for Memory Controller
  * @addr: Physical address being accessed
  * @is_write: true for write access, false for read
  * @val: Pointer to value (read or write)
@@ -241,16 +266,24 @@ static int mc_handle_sid_security(const struct mc_client_info *client,
  *
  * Returns: true if handled, false otherwise
  */
-bool mc_mmio_handler(u64 addr, bool is_write, u64 *val)
+static bool tegra234_mc_mmio_handler(u64 addr, bool is_write, u64 *val)
 {
 	const struct mc_client_info *client;
 	u32 offset;
 	int ret;
+	static bool first_access = true;
 
 	/* Check if address is within MC range */
 	if (addr < tegra234_mc.mmio_addr ||
 	    addr >= tegra234_mc.mmio_addr + tegra234_mc.mmio_size)
 		return false;
+
+	/* Log first MC access for debugging */
+	if (first_access) {
+		hyp_info("MC: First MMIO access at 0x%llx (%s)",
+			 addr, is_write ? "write" : "read");
+		first_access = false;
+	}
 
 	offset = addr - tegra234_mc.mmio_addr;
 
@@ -274,10 +307,16 @@ bool mc_mmio_handler(u64 addr, bool is_write, u64 *val)
 		}
 
 		/* Validate and handle write */
-		ret = mc_handle_sid_override(client, *val);
+		ret = mc_handle_sid_override(client, (u32)*val);
 		if (ret != 0) {
-			/* TODO: Inject fault to guest? */
-			/* For now, silently drop the write */
+			/*
+			 * Security violation detected. Silently drop the write
+			 * and return success to avoid alerting the host.
+			 *
+			 * Alternative: Could inject a data abort here, but that
+			 * might crash the host MC driver during resume. Silently
+			 * dropping is safer for initial implementation.
+			 */
 			return true;
 		}
 
@@ -293,24 +332,148 @@ bool mc_mmio_handler(u64 addr, bool is_write, u64 *val)
 	return false;
 }
 
+/**
+ * tegra234_mc_init - Initialize Memory Controller EL2 integration
+ *
+ * Maps MC MMIO region and configures stage-2 page tables to trap
+ * all MC register accesses. This is called during EL2 initialization.
+ *
+ * Returns: 0 on success, negative error code on failure
+ */
+static int tegra234_mc_init(void)
+{
+	phys_addr_t mmio_addr;
+	size_t mmio_size;
+	int ret;
+	phys_addr_t page_base;
+	size_t nr_pages;
+	unsigned int i;
+
+	/* Get MC MMIO configuration from hypervisor symbols set by EL1 stub */
+	mmio_addr = kvm_hyp_tegra_mc_mmio_addr;
+	mmio_size = kvm_hyp_tegra_mc_mmio_size;
+
+	/* Check if MC configuration was provided */
+	if (!mmio_addr || !mmio_size) {
+		hyp_info("MC: No MMIO configuration provided, skipping init");
+		return 0;
+	}
+
+	/* Store in the MC instance structure */
+	tegra234_mc.mmio_addr = mmio_addr;
+	tegra234_mc.mmio_size = mmio_size;
+	tegra234_mc.clients = tegra234_mc_clients;
+	tegra234_mc.num_clients = ARRAY_SIZE(tegra234_mc_clients);
+
+	/*
+	 * Donate MC MMIO region to EL2, which unmaps it from host stage-2.
+	 * This causes all host accesses to generate data aborts that trap
+	 * to EL2 where tegra234_mc_mmio_handler() validates SID override writes.
+	 */
+	page_base = mmio_addr & PAGE_MASK;
+	nr_pages = PAGE_ALIGN(mmio_size + (mmio_addr & ~PAGE_MASK)) >> PAGE_SHIFT;
+
+	/* Donate MC MMIO pages to EL2 (unmaps from host stage-2) */
+	for (i = 0; i < nr_pages; i++) {
+		ret = ___pkvm_host_donate_hyp((page_base + (i << PAGE_SHIFT)) >> PAGE_SHIFT, 1, true);
+		if (ret) {
+			hyp_err("MC: Failed to donate page %u (ret=%d)\n", i, ret);
+			goto err_reclaim;
+		}
+	}
+
+	/* Map donated pages into EL2 address space */
+	tegra234_mc.base = hyp_phys_to_virt(mmio_addr);
+
+	/*
+	 * Since we donated the pages (not shared), they are now unmapped from
+	 * host stage-2. All host accesses will trap to EL2 via data abort,
+	 * allowing tegra234_mc_mmio_handler() to validate SID override writes.
+	 */
+	hyp_info("MC: Initialized at PA 0x%llx, size 0x%lx (%zu pages)",
+		 mmio_addr, mmio_size, nr_pages);
+
+	return 0;
+
+err_reclaim:
+	/* Return donated pages back to host */
+	for (; i > 0; i--)
+		__pkvm_hyp_donate_host((page_base + ((i - 1) << PAGE_SHIFT)) >> PAGE_SHIFT, 1);
+
+	return ret;
+}
+
 /*
- * Helper Functions
+ * Platform hooks for SMMU integration
+ */
+static const struct smmu_v2_platform_hooks tegra234_mc_hooks = {
+	.init = tegra234_mc_init,
+	.mmio_handler = tegra234_mc_mmio_handler,
+};
+
+/*
+ * Register Tegra MC platform hooks with SMMU driver
+ *
+ * Called by smmu_v2_global_init() via CONFIG_TEGRA_MC_PKVM ifdef.
+ * Registers MC MMIO handler for SID override validation.
+ */
+void tegra234_mc_register_hooks(void)
+{
+	smmu_v2_register_platform_hooks(&tegra234_mc_hooks);
+}
+
+/*
+ * SID Registration
  */
 
 /**
- * mc_get_client_name - Get human-readable name for a client
- * @client_id: MC client ID
+ * mc_register_sid_mapping - Register a SID→client mapping during early boot
+ * @client_id: MC client ID (TEGRA234_MEMORY_CLIENT_*)
+ * @sid: Stream ID extracted from device tree
  *
- * Returns: Client name string, or "unknown" if not found
+ * Called by MC driver during device tree enumeration (arch_initcall level)
+ * to register all SID assignments BEFORE devices probe.
+ *
+ * Returns: 0 on success, negative error code on failure
  */
-const char *mc_get_client_name(u32 client_id)
+int mc_register_sid_mapping(u32 client_id, u32 sid)
 {
+	struct sid_assignment *entry;
 	int i;
 
-	for (i = 0; i < tegra234_mc.num_clients; i++) {
-		if (tegra234_mc.clients[i].client_id == client_id)
-			return tegra234_mc.clients[i].name;
+	/* Validate SID range */
+	if (sid >= ARM_SMMU_MAX_SIDS) {
+		hyp_err("MC: Invalid SID %u (max %u)", sid, ARM_SMMU_MAX_SIDS);
+		return -EINVAL;
 	}
 
-	return "unknown";
+	entry = &sid_map[sid];
+
+	/*
+	 * Check if this client is already registered for this SID (idempotent).
+	 * Multiple clients can share the same SID (e.g., read/write pairs).
+	 */
+	for (i = 0; i < entry->num_clients; i++) {
+		if (entry->client_ids[i] == client_id)
+			return 0;  /* Already registered - idempotent */
+	}
+
+	/* Add new client to the list */
+	if (entry->num_clients >= MAX_CLIENTS_PER_SID) {
+		hyp_err("MC: SID %u client limit exceeded (%u clients)",
+			sid, MAX_CLIENTS_PER_SID);
+		return -ENOSPC;
+	}
+
+	entry->client_ids[entry->num_clients++] = client_id;
+	entry->sid = sid;
+	entry->active = true;
+	entry->domain_id = 0;  /* Will be set during device attachment */
+
+	/*
+	 * Note: cb_idx and smmu_id are populated later
+	 * during device attachment (smmu_v2_attach_dev).
+	 */
+
+	return 0;
 }

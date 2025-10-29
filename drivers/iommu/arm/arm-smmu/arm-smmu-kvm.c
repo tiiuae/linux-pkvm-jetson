@@ -208,6 +208,12 @@ static int __init kvm_arm_smmu_v2_register(void)
 	kvm_hyp_arm_smmu_v2_smmus = kvm_arm_smmu_v2_array;
 	kvm_hyp_arm_smmu_v2_count = kvm_arm_smmu_v2_count;
 
+	/*
+	 * Note: MC MMIO configuration is now handled by tegra-mc-kvm.c
+	 * in drivers/memory/tegra/. It runs at core_initcall level and
+	 * parses the MC device tree node to set hypervisor symbols.
+	 */
+
 	pr_info("arm-smmu-kvm: Registered %zu SMMUv2 instances with pKVM\n",
 		kvm_arm_smmu_v2_count);
 
