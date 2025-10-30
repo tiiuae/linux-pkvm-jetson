@@ -2524,6 +2524,10 @@ static void of_register_spi_devices(struct spi_controller *ctlr)
 	struct device_node *nc;
 
 	for_each_available_child_of_node(ctlr->dev.of_node, nc) {
+		/* Skip Tegra prod-settings nodes (NVIDIA-specific config data) */
+		if (!strcmp(nc->name, "prod-settings"))
+			continue;
+
 		if (of_node_test_and_set_flag(nc, OF_POPULATED))
 			continue;
 		spi = of_register_spi_device(ctlr, nc);
