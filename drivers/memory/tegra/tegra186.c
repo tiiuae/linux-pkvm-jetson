@@ -13,6 +13,13 @@
 
 #include <soc/tegra/mc.h>
 
+#if defined(CONFIG_ARM_SMMU_V2_PKVM)
+#include <linux/arm-smccc.h>
+#include <asm/kvm_asm.h>
+#include <asm/kvm_host.h>
+#include <asm/virt.h>
+#endif
+
 #if defined(CONFIG_ARCH_TEGRA_186_SOC)
 #include <dt-bindings/memory/tegra186-mc.h>
 #endif
@@ -22,6 +29,122 @@
 #define MC_SID_STREAMID_OVERRIDE_MASK GENMASK(7, 0)
 #define MC_SID_STREAMID_SECURITY_WRITE_ACCESS_DISABLED BIT(16)
 #define MC_SID_STREAMID_SECURITY_OVERRIDE BIT(8)
+
+#if defined(CONFIG_ARM_SMMU_V2_PKVM)
+/* MC instance stored for kvm_iommu_driver init_driver callback */
+static struct tegra_mc *sid_enum_mc;
+
+/**
+ * tegra186_mc_enumerate_sids() - Enumerate all Stream ID assignments from device tree
+ * @mc: Memory controller instance
+ *
+ * Walks the device tree to find all devices with both 'iommus' and 'interconnects'
+ * properties. For each device:
+ * 1. Extract Stream ID from iommus property
+ * 2. Extract MC client ID(s) from interconnects property
+ * 3. Register the SID→client mapping with EL2 hypervisor
+ *
+ * This ensures EL2 knows the complete SID assignment table before any devices
+ * attempt IOMMU attachment, eliminating race conditions with device probing.
+ *
+ * Returns: 0 on success, negative error code on failure
+ */
+static int tegra186_mc_enumerate_sids(struct tegra_mc *mc)
+{
+	struct device_node *np;
+	struct of_phandle_args iommu_args, ic_args;
+	const struct tegra_mc_client *client;
+	u32 sid;
+	int err, i;
+
+	dev_info(mc->dev, "MC: Enumerating Stream ID assignments for pKVM\n");
+
+	/* Walk all device tree nodes with "iommus" property */
+	for_each_node_with_property(np, "iommus") {
+		/* Skip if no interconnects property (not an MC client) */
+		if (!of_find_property(np, "interconnects", NULL))
+			continue;
+
+		/* Extract Stream ID from iommus property */
+		err = of_parse_phandle_with_args(np, "iommus", "#iommu-cells",
+						  0, &iommu_args);
+		if (err) {
+			dev_warn(mc->dev, "MC: Failed to parse iommus for %pOF: %d\n",
+				 np, err);
+			continue;
+		}
+
+		/* Stream ID is first argument */
+		sid = iommu_args.args[0];
+
+		/* Parse interconnects property to find MC client IDs */
+		i = 0;
+		while (!of_parse_phandle_with_args(np, "interconnects",
+						     "#interconnect-cells",
+						     i * 2, &ic_args)) {
+			u32 client_id = ic_args.args[0];
+			of_node_put(ic_args.np);
+
+			/* Find client in MC's client table */
+			for (client = mc->soc->clients;
+			     client < mc->soc->clients + mc->soc->num_clients;
+			     client++) {
+				if (client->id == client_id) {
+					struct arm_smccc_res res;
+
+					dev_info(mc->dev,
+						 "MC: Device %pOF: client %s (0x%x) -> SID 0x%x\n",
+						 np, client->name, client_id, sid);
+
+					/* Register with EL2 hypervisor via SMCCC */
+					arm_smccc_1_1_hvc(KVM_HOST_SMCCC_FUNC(__pkvm_mc_register_sid),
+							  client_id, sid, 0, 0, 0, 0, 0, &res);
+					err = (int)res.a1;
+					if (err) {
+						dev_err(mc->dev,
+							"MC: Failed to register SID mapping: %d\n",
+							err);
+						of_node_put(iommu_args.np);
+						return err;
+					}
+
+					break;
+				}
+			}
+
+			i++;
+		}
+
+		/* Release SMMU device node reference */
+		of_node_put(iommu_args.np);
+	}
+
+	dev_info(mc->dev, "MC: Stream ID enumeration complete\n");
+	return 0;
+}
+
+/**
+ * tegra186_mc_pkvm_init_driver() - kvm_iommu_driver init callback
+ *
+ * Called by kvm_iommu_init_driver() during finalize_pkvm(), BEFORE
+ * pkvm_drop_host_privileges(). This ensures SID mappings are registered
+ * with EL2 during the trust window when EL1 is still considered secure.
+ *
+ * Returns: 0 on success, negative error code on failure
+ */
+static int tegra186_mc_pkvm_init_driver(void)
+{
+	if (!sid_enum_mc)
+		return -ENODEV;
+
+	dev_info(sid_enum_mc->dev, "MC: Registering SID mappings with pKVM\n");
+	return tegra186_mc_enumerate_sids(sid_enum_mc);
+}
+
+static struct kvm_iommu_driver tegra186_mc_driver = {
+	.init_driver = tegra186_mc_pkvm_init_driver,
+};
+#endif /* CONFIG_ARM_SMMU_V2_PKVM */
 
 static int tegra186_mc_probe(struct tegra_mc *mc)
 {
@@ -72,6 +195,28 @@ populate:
 	err = of_platform_populate(mc->dev->of_node, NULL, NULL, mc->dev);
 	if (err < 0)
 		return err;
+
+#if defined(CONFIG_ARM_SMMU_V2_PKVM)
+	/*
+	 * Register with pKVM IOMMU framework. kvm_iommu_register_driver() just
+	 * adds the driver to a linked list - no hypercall is made here.
+	 *
+	 * The init_driver callback (tegra186_mc_pkvm_init_driver) will be called
+	 * by kvm_iommu_init_driver() during finalize_pkvm(), BEFORE
+	 * pkvm_drop_host_privileges(). This ensures SID mappings are registered
+	 * during the trust window when EL1 is still considered secure.
+	 */
+	if (is_protected_kvm_enabled()) {
+		sid_enum_mc = mc;
+		err = kvm_iommu_register_driver(&tegra186_mc_driver, 0);
+		if (err)
+			dev_warn(&pdev->dev,
+				 "MC: Failed to register with pKVM: %d\n", err);
+		else
+			dev_info(&pdev->dev,
+				 "MC: Registered with pKVM IOMMU framework\n");
+	}
+#endif
 
 	return 0;
 }
