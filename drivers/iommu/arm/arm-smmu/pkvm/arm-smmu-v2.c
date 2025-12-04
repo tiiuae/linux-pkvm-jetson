@@ -11,19 +11,48 @@
 
 #include <linux/io.h>
 #include <linux/iopoll.h>
+#include <linux/io-pgtable.h>
 #include <asm/kvm_hyp.h>
 #include <asm/kvm_mmu.h>
 #include <nvhe/iommu.h>
 #include <nvhe/memory.h>
+#include <nvhe/mem_protect.h>
 #include <nvhe/mm.h>
+#include <nvhe/trap_handler.h>
 
 #include "arm-smmu-v2.h"
+#include <nvhe/serial.h>
+#include "../../../io-pgtable-arm.h"
 
 /*
  * Global State
  */
-struct hyp_arm_smmu_v2_device *kvm_hyp_arm_smmu_v2_smmus[ARM_SMMU_MAX_INSTANCES];
+struct hyp_arm_smmu_v2_device *kvm_hyp_arm_smmu_v2_smmus;
+size_t kvm_hyp_arm_smmu_v2_count;
 struct sid_assignment sid_map[ARM_SMMU_MAX_SIDS];
+
+/*
+ * Memory Donation Helpers
+ */
+
+/* Transfer ownership of memory from host to hypervisor */
+static int smmu_take_pages(u64 phys, size_t size)
+{
+	if (!IS_ALIGNED(phys, PAGE_SIZE) || !IS_ALIGNED(size, PAGE_SIZE)) {
+		hyp_err("SMMU: smmu_take_pages called with unaligned address/size: phys=%llx size=%lx",
+			phys, size);
+		return -EINVAL;
+	}
+
+	return __pkvm_host_donate_hyp(phys >> PAGE_SHIFT, size >> PAGE_SHIFT);
+}
+
+/*
+ * Global identity-mapped page table (protected by host_mmu.lock from core code)
+ * All protected domains share this single Stage-2 page table that mirrors
+ * the host's CPU stage-2 mappings for DMA isolation.
+ */
+static struct io_pgtable *idmap_pgtable;
 
 /*
  * ARM SMMUv2 Register Definitions
@@ -234,6 +263,13 @@ struct sid_assignment sid_map[ARM_SMMU_MAX_SIDS];
 #define ARM_SMMU_CB_TLBSYNC		0x7f0
 #define ARM_SMMU_CB_TLBSTATUS		0x7f4
 
+/* Address Translation Service registers */
+#define ARM_SMMU_CB_PAR			0x50
+#define ARM_SMMU_CB_PAR_F		BIT(0)
+#define ARM_SMMU_CB_ATS1PR		0x800
+#define ARM_SMMU_CB_ATSR		0x8f0
+#define ARM_SMMU_CB_ATSR_ACTIVE		BIT(0)
+
 /* Timeouts */
 #define TLB_LOOP_TIMEOUT		1000000	/* 1s */
 
@@ -324,11 +360,24 @@ int smmu_v2_probe_device(struct hyp_arm_smmu_v2_device *smmu)
 		smmu->num_mapping_groups = 128;  /* Tegra234 has 128 */
 	}
 
-	/* ID1: Context banks and page size */
+	/* ID1: Context banks and page size (register layout, not translation) */
 	smmu->pgshift = (id1 & ARM_SMMU_ID1_PAGESIZE) ? 16 : 12;  /* 64KB or 4KB */
 
-	/* Tegra234 erratum: force 4KB pages due to walk cache bug */
-	smmu->pgshift = 12;
+	/*
+	 * Calculate numpage from ID1.NUMPAGENDXB.
+	 * This is the number of register pages for GR0+GR1. Context banks
+	 * start at page 'numpage' (not page 2 as ARM spec examples suggest).
+	 * Tegra234 with 16MB MMIO and 64KB pages: numpage = 128.
+	 */
+	smmu->numpage = 1 << (FIELD_GET(ARM_SMMU_ID1_NUMPAGENDXB, id1) + 1);
+	hyp_info("SMMU[%u]: numpage=%u (CB pages start at page %u)",
+		 smmu->id, smmu->numpage, smmu->numpage);
+
+	/*
+	 * Tegra234 erratum: force 4KB translation pages due to walk cache bug.
+	 * Note: This only affects the io-pgtable page size, NOT the SMMU register
+	 * layout which is determined by hardware (pgshift from ID1.PAGESIZE).
+	 */
 	smmu->pgsize_bitmap = SZ_4K;
 
 	/* Get number of context banks */
@@ -391,25 +440,36 @@ int smmu_v2_reset(struct hyp_arm_smmu_v2_device *smmu)
 
 	/*
 	 * 2. Reset stream mapping groups: Initial values mark all SMRn as
-	 * invalid and all S2CRn as fault unless overridden.
+	 * invalid and all S2CRn as bypass (not fault) to preserve bootloader
+	 * mappings. This is critical for Tegra234 where the bootloader leaves
+	 * devices like display active with ongoing DMA. Setting to FAULT mode
+	 * would cause these devices to fault immediately.
+	 *
+	 * When devices get properly attached to domains, their S2CR entries
+	 * will be updated to TRANS mode with proper context bank assignments.
 	 */
 	for (i = 0; i < smmu->num_mapping_groups; i++) {
 		/* Clear SMR (mark as invalid) */
 		smmu_writel(smmu, ARM_SMMU_GR0, ARM_SMMU_GR0_SMR(i), 0);
 
-		/* Set S2CR to FAULT type (deny unmapped streams) */
+		/*
+		 * Set S2CR to BYPASS type (allow unmapped streams to pass through).
+		 * This matches the behavior of the standard ARM SMMU driver which
+		 * preserves bootloader mappings for seamless handover (e.g., display
+		 * from firmware to kernel).
+		 */
 		smmu_writel(smmu, ARM_SMMU_GR0, ARM_SMMU_GR0_S2CR(i),
-			    FIELD_PREP(ARM_SMMU_S2CR_TYPE, S2CR_TYPE_FAULT));
+			    FIELD_PREP(ARM_SMMU_S2CR_TYPE, S2CR_TYPE_BYPASS));
 	}
 
 	/* 3. Make sure all context banks are disabled and clear CB_FSR */
 	for (i = 0; i < smmu->num_context_banks; i++) {
 		/* Disable context bank (clear SCTLR.M) */
-		smmu_writel(smmu, (i + 2) << smmu->pgshift,
+		smmu_writel(smmu, (i + smmu->numpage) << smmu->pgshift,
 			    ARM_SMMU_CB_SCTLR, 0);
 
 		/* Clear context bank fault status */
-		smmu_writel(smmu, (i + 2) << smmu->pgshift,
+		smmu_writel(smmu, (i + smmu->numpage) << smmu->pgshift,
 			    ARM_SMMU_CB_FSR, ARM_SMMU_CB_FSR_FAULT);
 	}
 
@@ -427,8 +487,13 @@ int smmu_v2_reset(struct hyp_arm_smmu_v2_device *smmu)
 	/* Disable TLB broadcasting, enable VMID partitioning */
 	scr0 |= ARM_SMMU_sCR0_VMIDPNE | ARM_SMMU_sCR0_PTM;
 
-	/* Handle unmatched streams (deny by default for security) */
-	scr0 |= ARM_SMMU_sCR0_USFCFG;
+	/*
+	 * Handle unmatched streams: clear USFCFG to allow bypass.
+	 * When USFCFG=0, undefined streams bypass the SMMU (no translation).
+	 * This helps during boot when not all devices are attached to domains.
+	 * Security note: attached devices still use proper translation.
+	 */
+	/* scr0 &= ~ARM_SMMU_sCR0_USFCFG; -- already 0, no action needed */
 
 	/* Disable forced broadcasting */
 	/* (FB bit is implicitly 0, no need to clear) */
@@ -454,6 +519,110 @@ int smmu_v2_reset(struct hyp_arm_smmu_v2_device *smmu)
 	return 0;
 }
 
+/*
+ * TLB Operations for io-pgtable Integration
+ */
+
+/**
+ * smmu_v2_tlb_flush_walk - Flush TLB after unmapping non-leaf PTEs
+ * @iova: I/O virtual address
+ * @size: Size of the range to invalidate
+ * @granule: Page granule size
+ * @cookie: SMMU device (unused - we invalidate all SMMUs)
+ *
+ * Called by io-pgtable when unmapping intermediate page table entries.
+ */
+static void smmu_v2_tlb_flush_walk(unsigned long iova, size_t size,
+				   size_t granule, void *cookie)
+{
+	struct hyp_arm_smmu_v2_device *smmu;
+	int i;
+
+	/* Invalidate on ALL SMMU instances (global identity mapping) */
+	for (i = 0; i < kvm_hyp_arm_smmu_v2_count; i++) {
+		smmu = &kvm_hyp_arm_smmu_v2_smmus[i];
+
+		/* Global TLB invalidation (all VMIDs) */
+		smmu_v2_tlb_inv_context(smmu, 0);  /* CB 0 - could be any CB */
+	}
+}
+
+/**
+ * smmu_v2_tlb_add_page - Add page to TLB invalidation gather
+ * @gather: TLB gather structure (unused for SMMUv2)
+ * @iova: I/O virtual address
+ * @granule: Page granule size
+ * @cookie: SMMU device (unused)
+ *
+ * Called by io-pgtable when unmapping leaf page table entries.
+ * SMMUv2 doesn't support gather/batch TLB invalidation, so we invalidate immediately.
+ */
+static void smmu_v2_tlb_add_page(struct iommu_iotlb_gather *gather,
+				 unsigned long iova, size_t granule, void *cookie)
+{
+	/* For now, just do a full context invalidation */
+	/* TODO: Implement range-based invalidation for better performance */
+	smmu_v2_tlb_flush_walk(iova, granule, granule, cookie);
+}
+
+static const struct iommu_flush_ops smmu_v2_tlb_ops = {
+	.tlb_flush_walk	= smmu_v2_tlb_flush_walk,
+	.tlb_add_page	= smmu_v2_tlb_add_page,
+};
+
+/**
+ * smmu_v2_init_pgt - Initialize global identity-mapped page table
+ *
+ * Creates a single Stage-2 page table shared by all protected domains.
+ * This table mirrors the host's CPU stage-2 mappings for DMA isolation.
+ *
+ * Returns: 0 on success, negative error code on failure
+ */
+static int smmu_v2_init_pgt(void)
+{
+	struct io_pgtable_cfg cfg = {
+		.tlb		= &smmu_v2_tlb_ops,
+		.ias		= 48,	/* Input address size */
+		.oas		= 48,	/* Output address size */
+		.coherent_walk	= true,
+		.pgsize_bitmap	= SZ_4K,  /* Tegra234: 4K only (walk cache erratum) */
+	};
+	struct hyp_arm_smmu_v2_device *smmu;
+	struct io_pgtable_ops *ops;
+	int i;
+
+	/* Determine common capabilities across all SMMU instances */
+	for (i = 0; i < kvm_hyp_arm_smmu_v2_count; i++) {
+		smmu = &kvm_hyp_arm_smmu_v2_smmus[i];
+
+		/* Use minimum IAS/OAS across all SMMUs */
+		if (smmu->ias < cfg.ias)
+			cfg.ias = smmu->ias;
+		if (smmu->oas < cfg.oas)
+			cfg.oas = smmu->oas;
+
+		/* AND together page size support (most restrictive) */
+		cfg.pgsize_bitmap &= smmu->pgsize_bitmap;
+
+		/* Coherent walk only if all SMMUs support it */
+		if (!(smmu->features & ARM_SMMU_FEAT_COHERENT_WALK))
+			cfg.coherent_walk = false;
+	}
+
+	/* Allocate Stage-2 page table */
+	ops = kvm_alloc_io_pgtable_ops(ARM_64_LPAE_S2, &cfg, NULL);
+	if (!ops)
+		return -ENOMEM;
+
+	idmap_pgtable = io_pgtable_ops_to_pgtable(ops);
+	if (!idmap_pgtable) {
+		/* This shouldn't happen, but handle it anyway */
+		return -ENOMEM;
+	}
+
+	return 0;
+}
+
 /**
  * smmu_v2_init - Initialize SMMU device at EL2
  * @smmu: SMMU device structure
@@ -468,11 +637,71 @@ int smmu_v2_reset(struct hyp_arm_smmu_v2_device *smmu)
 int smmu_v2_init(struct hyp_arm_smmu_v2_device *smmu)
 {
 	int ret, i;
+	size_t nr_pages, pg;
 
-	/* Validate that shadow arrays have been set up */
-	if (!smmu->smrs_shadow || !smmu->s2crs_shadow ||
-	    !smmu->smrs_hw || !smmu->s2crs_hw) {
-		return -EINVAL;  /* Shadow arrays not donated from EL1 */
+	/*
+	 * Note: UART debugging is provided by pKVM serial framework.
+	 * Ensure pkvm-pl011 module is loaded before this driver.
+	 */
+
+	hyp_info("running smmu_v2_init()");
+
+	/*
+	 * Shadow arrays are NULL initially (not allocated by EL1).
+	 * We'll allocate them from hyp memory pool after probing hardware.
+	 */
+
+	/* Skip invalid SMMU instances (not populated by EL1) */
+	if (!smmu->mmio_addr || !smmu->mmio_size) {
+		hyp_info("SMMU[%u]: Skipping - invalid configuration (PA=0x%llx, size=0x%zx)",
+			 smmu->id, smmu->mmio_addr, smmu->mmio_size);
+		return -ENODEV;
+	}
+
+	/* Validate MMIO address alignment */
+	if (!PAGE_ALIGNED(smmu->mmio_addr | smmu->mmio_size))
+		return -EINVAL;
+
+	/*
+	 * Donate SMMU MMIO pages to hypervisor.
+	 * This unmaps them from host stage-2, causing all host accesses to trap
+	 * to EL2 where they are handled by smmu_v2_dabt_handler().
+	 * This is the same approach used by SMMUv3 pKVM driver.
+	 */
+	nr_pages = smmu->mmio_size >> PAGE_SHIFT;
+	for (pg = 0; pg < nr_pages; pg++) {
+		u64 pfn = (smmu->mmio_addr >> PAGE_SHIFT) + pg;
+
+		ret = ___pkvm_host_donate_hyp(pfn, 1, true);
+		if (ret) {
+			hyp_err("SMMU[%u]: Failed to donate MMIO page %zu at pfn 0x%llx (ret=%d)",
+				smmu->id, pg, pfn, ret);
+			return ret;
+		}
+	}
+
+	/* Get EL2 VA from hyp linear map (pages already mapped after donation) */
+	smmu->base = hyp_phys_to_virt(smmu->mmio_addr);
+	hyp_info("SMMU[%u]: Donated MMIO: PA 0x%llx -> VA %p, size=0x%lx (%zu pages)",
+		 smmu->id, smmu->mmio_addr, smmu->base, smmu->mmio_size, nr_pages);
+
+	/* Donate secondary MMIO base if present (Tegra234 dual-base instances) */
+	if (smmu->has_secondary_base && smmu->mmio_addr_sec) {
+		nr_pages = smmu->mmio_size >> PAGE_SHIFT;
+		for (pg = 0; pg < nr_pages; pg++) {
+			u64 pfn = (smmu->mmio_addr_sec >> PAGE_SHIFT) + pg;
+
+			ret = ___pkvm_host_donate_hyp(pfn, 1, true);
+			if (ret) {
+				hyp_err("SMMU[%u]: Failed to donate secondary MMIO page %zu at pfn 0x%llx (ret=%d)",
+					smmu->id, pg, pfn, ret);
+				return ret;
+			}
+		}
+
+		smmu->base_sec = hyp_phys_to_virt(smmu->mmio_addr_sec);
+		hyp_info("SMMU[%u]: Donated secondary MMIO: PA 0x%llx -> VA %p",
+			 smmu->id, smmu->mmio_addr_sec, smmu->base_sec);
 	}
 
 	hyp_spin_lock_init(&smmu->lock);
@@ -481,6 +710,43 @@ int smmu_v2_init(struct hyp_arm_smmu_v2_device *smmu)
 	ret = smmu_v2_probe_device(smmu);
 	if (ret)
 		return ret;
+
+	/* Allocate shadow arrays from hyp memory pool (now that we know num_mapping_groups) */
+	{
+		size_t smr_size = smmu->num_mapping_groups * sizeof(struct arm_smmu_smr);
+		size_t s2cr_size = smmu->num_mapping_groups * sizeof(struct arm_smmu_s2cr);
+
+		smmu->smrs_shadow = kvm_iommu_donate_pages_atomic(get_order(smr_size));
+		if (!smmu->smrs_shadow) {
+			hyp_err("SMMU[%u]: Failed to allocate smrs_shadow (%zu bytes)",
+				smmu->id, smr_size);
+			return -ENOMEM;
+		}
+
+		smmu->s2crs_shadow = kvm_iommu_donate_pages_atomic(get_order(s2cr_size));
+		if (!smmu->s2crs_shadow) {
+			hyp_err("SMMU[%u]: Failed to allocate s2crs_shadow (%zu bytes)",
+				smmu->id, s2cr_size);
+			return -ENOMEM;
+		}
+
+		smmu->smrs_hw = kvm_iommu_donate_pages_atomic(get_order(smr_size));
+		if (!smmu->smrs_hw) {
+			hyp_err("SMMU[%u]: Failed to allocate smrs_hw (%zu bytes)",
+				smmu->id, smr_size);
+			return -ENOMEM;
+		}
+
+		smmu->s2crs_hw = kvm_iommu_donate_pages_atomic(get_order(s2cr_size));
+		if (!smmu->s2crs_hw) {
+			hyp_err("SMMU[%u]: Failed to allocate s2crs_hw (%zu bytes)",
+				smmu->id, s2cr_size);
+			return -ENOMEM;
+		}
+
+		hyp_info("SMMU[%u]: Allocated shadow arrays (%u entries, %zu bytes each)",
+			 smmu->id, smmu->num_mapping_groups, smr_size + s2cr_size);
+	}
 
 	/* Initialize context bank bitmap (all free initially) */
 	bitmap_zero(smmu->context_map, ARM_SMMU_MAX_CBS);
@@ -498,11 +764,15 @@ int smmu_v2_init(struct hyp_arm_smmu_v2_device *smmu)
 		smmu->smrs_shadow[i].id = 0;
 		smmu->smrs_shadow[i].mask = 0;
 
-		/* S2CR shadow: fault mode by default */
-		smmu->s2crs_shadow[i].type = S2CR_TYPE_FAULT;
+		/*
+		 * S2CR shadow: bypass mode by default to preserve bootloader mappings.
+		 * This allows devices initialized by firmware (display, etc.) to
+		 * continue working until they get properly attached to domains.
+		 */
+		smmu->s2crs_shadow[i].type = S2CR_TYPE_BYPASS;
 		smmu->s2crs_shadow[i].cbndx = 0;
 		smmu->s2crs_shadow[i].privcfg = 0;
-		smmu->s2crs_shadow[i].bypass = false;
+		smmu->s2crs_shadow[i].bypass = true;
 
 		/* Hardware state: initially same as shadow */
 		smmu->smrs_hw[i] = smmu->smrs_shadow[i];
