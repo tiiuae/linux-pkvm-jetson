@@ -38,6 +38,10 @@
 
 #include <linux/fsl/mc.h>
 
+#ifdef CONFIG_ARM64
+#include <asm/virt.h>
+#endif
+
 #include "arm-smmu.h"
 #include "../../dma-iommu.h"
 
@@ -2123,6 +2127,37 @@ static int arm_smmu_device_probe(struct platform_device *pdev)
 	int num_irqs, i, err;
 	u32 global_irqs, pmu_irqs;
 	irqreturn_t (*global_fault)(int irq, void *dev);
+
+#ifdef CONFIG_ARM64
+	/*
+	 * pKVM IOMMU virtualization: Defer probing until hypervisor is ready.
+	 *
+	 * When pKVM (protected KVM) virtualizes the IOMMU, the hypervisor must
+	 * "donate" IOMMU MMIO pages to itself before the EL1 driver probes.
+	 * This donation unmaps the IOMMU MMIO from the host's stage-2 page
+	 * tables, causing all subsequent IOMMU register accesses to trap to
+	 * EL2 for validation and emulation.
+	 *
+	 * The initialization order is:
+	 *   device_initcall     - IOMMU drivers probe here (too early!)
+	 *   device_initcall_sync - finalize_pkvm() donates MMIO, enables trapping
+	 *
+	 * Without this deferral, IOMMU register writes during probe go directly
+	 * to hardware, bypassing the hypervisor's security enforcement.
+	 *
+	 * See commit 87727ba2bb05 ("KVM: arm64: Ensure CPU PMU probes before
+	 * pKVM host de-privilege") which established this pattern and noted:
+	 * "This will also be needed in future when probing IOMMU devices"
+	 *
+	 * Future pKVM IOMMU implementations on other architectures (x86, RISC-V)
+	 * will likely need similar probe deferral to ensure the hypervisor owns
+	 * IOMMU hardware before the host driver initializes it.
+	 */
+	if (is_protected_kvm_enabled() && !is_pkvm_initialized()) {
+		dev_dbg(dev, "Deferring probe until pKVM is initialized\n");
+		return -EPROBE_DEFER;
+	}
+#endif
 
 	smmu = devm_kzalloc(dev, sizeof(*smmu), GFP_KERNEL);
 	if (!smmu) {

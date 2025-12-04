@@ -86,6 +86,7 @@ struct hyp_arm_smmu_v2_device {
 	u32			num_mapping_groups;
 	u32			num_context_banks;
 	u32			num_s2_context_banks;
+	u32			numpage;	/* Number of GR pages (CB pages start at numpage) */
 	u8			pgshift;	/* Page size shift */
 	u8			ias;		/* Input address size (bits) */
 	u8			oas;		/* Output address size (bits) */
