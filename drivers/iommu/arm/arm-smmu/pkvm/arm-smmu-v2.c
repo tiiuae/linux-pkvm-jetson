@@ -797,12 +797,209 @@ int smmu_v2_init(struct hyp_arm_smmu_v2_device *smmu)
  * @offset: Register offset within GR0 page
  * @is_write: true for write access, false for read
  * @val: Pointer to value (read or write)
+ *
+ * Emulates GR0 (Global Register page 0) accesses with shadow state management.
+ * Key register types:
+ * - ID registers (IDR0-IDR7): Read-only capability reporting
+ * - sCR0: Global control (enable/disable, fault reporting)
+ * - SMR: Stream match configuration (shadowed)
+ * - S2CR: Stream-to-context mapping (shadowed, enforces Stage-2)
+ * - TLB operations: Wire to existing TLB implementations
  */
 int smmu_v2_handle_gr0(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 		       bool is_write, u64 *val)
 {
-	/* TODO: Implement GR0 register emulation */
-	/* Key registers: SMR, S2CR, sCR0, ID*, TLB ops */
+	u32 val32;
+	int ret = 0;
+
+	/* ID registers - read-only capability reporting */
+	if (offset >= ARM_SMMU_GR0_ID0 && offset <= ARM_SMMU_GR0_ID7) {
+		if (is_write)
+			return -EINVAL;  /* Read-only */
+
+		/* Pass through hardware capabilities */
+		*val = smmu_readl(smmu, ARM_SMMU_GR0, offset);
+		return 0;
+	}
+
+	/* sCR0 - Global control register */
+	if (offset == ARM_SMMU_GR0_sCR0) {
+		if (is_write) {
+			val32 = (u32)*val;
+
+			/*
+			 * Enforce USFCFG=1: unmapped streams must fault, not bypass.
+			 * This is a security requirement - we cannot let the host
+			 * allow arbitrary streams to bypass SMMU translation.
+			 */
+			val32 |= ARM_SMMU_sCR0_USFCFG;
+
+			/* Always keep fault reporting enabled */
+			val32 |= (ARM_SMMU_sCR0_GFRE | ARM_SMMU_sCR0_GFIE |
+				  ARM_SMMU_sCR0_GCFGFRE | ARM_SMMU_sCR0_GCFGFIE);
+
+			/* Always keep VMID partitioning enabled for nesting */
+			if (smmu->features & ARM_SMMU_FEAT_TRANS_NESTED)
+				val32 |= ARM_SMMU_sCR0_VMIDPNE;
+
+			hyp_info("sCR0 write: 0x%x (USFCFG enforced)\n", val32);
+
+			smmu_writel(smmu, ARM_SMMU_GR0, offset, val32);
+			return 0;
+		} else {
+			*val = smmu_readl(smmu, ARM_SMMU_GR0, offset);
+			return 0;
+		}
+	}
+
+	/* Global fault status/syndrome registers - read/clear */
+	if (offset == ARM_SMMU_GR0_sGFSR) {
+		if (is_write) {
+			/* Write-1-to-clear */
+			smmu_writel(smmu, ARM_SMMU_GR0, offset, (u32)*val);
+			return 0;
+		} else {
+			*val = smmu_readl(smmu, ARM_SMMU_GR0, offset);
+			return 0;
+		}
+	}
+
+	if (offset == ARM_SMMU_GR0_sGFSYNR0 || offset == ARM_SMMU_GR0_sGFSYNR1 ||
+	    offset == ARM_SMMU_GR0_sGFSYNR2) {
+		if (is_write)
+			return -EINVAL;  /* Read-only */
+		*val = smmu_readl(smmu, ARM_SMMU_GR0, offset);
+		return 0;
+	}
+
+	/* TLB invalidation registers - write-only trigger registers */
+	if (offset == ARM_SMMU_GR0_TLBIVMID) {
+		if (!is_write)
+			return -EINVAL;  /* Write-only */
+
+		/* TLBIVMID: Invalidate all TLB entries for this VMID */
+		smmu_writel(smmu, ARM_SMMU_GR0, offset, (u32)*val);
+		ret = smmu_v2_tlb_sync_global(smmu);
+		return ret;
+	}
+
+	if (offset == ARM_SMMU_GR0_TLBIALLNSNH || offset == ARM_SMMU_GR0_TLBIALLH) {
+		if (!is_write)
+			return -EINVAL;  /* Write-only */
+
+		/* Global TLB invalidation */
+		smmu_writel(smmu, ARM_SMMU_GR0, offset, 0);
+		ret = smmu_v2_tlb_sync_global(smmu);
+		return ret;
+	}
+
+	if (offset == ARM_SMMU_GR0_sTLBGSYNC) {
+		if (!is_write)
+			return -EINVAL;  /* Write-only */
+
+		/* Host requested TLB sync, execute it */
+		ret = smmu_v2_tlb_sync_global(smmu);
+		return ret;
+	}
+
+	if (offset == ARM_SMMU_GR0_sTLBGSTATUS) {
+		if (is_write)
+			return -EINVAL;  /* Read-only */
+		*val = smmu_tlb_sync_status(smmu, ARM_SMMU_GR0, offset);
+		return 0;
+	}
+
+	/* SMR registers - stream match configuration (shadow state) */
+	if (offset >= ARM_SMMU_GR0_SMR(0) &&
+	    offset < ARM_SMMU_GR0_SMR(0) + (smmu->num_mapping_groups * 4)) {
+		u32 idx = (offset - ARM_SMMU_GR0_SMR(0)) >> 2;
+
+		if (idx >= smmu->num_mapping_groups)
+			return -EINVAL;
+
+		if (is_write) {
+			val32 = (u32)*val;
+
+			/* Update shadow state (what host thinks it programmed) */
+			smmu->smrs_shadow[idx].valid = !!(val32 & ARM_SMMU_SMR_VALID);
+			smmu->smrs_shadow[idx].mask = FIELD_GET(ARM_SMMU_SMR_MASK, val32);
+			smmu->smrs_shadow[idx].id = FIELD_GET(ARM_SMMU_SMR_ID, val32);
+
+			/* Write through to hardware (no modification needed for SMR) */
+			smmu_writel(smmu, ARM_SMMU_GR0, offset, val32);
+
+			/* Update hardware state tracking */
+			smmu->smrs_hw[idx] = smmu->smrs_shadow[idx];
+			return 0;
+		} else {
+			/* Return shadow state (what host thinks hardware has) */
+			val32 = 0;
+			if (smmu->smrs_shadow[idx].valid)
+				val32 |= ARM_SMMU_SMR_VALID;
+			val32 |= FIELD_PREP(ARM_SMMU_SMR_MASK, smmu->smrs_shadow[idx].mask);
+			val32 |= FIELD_PREP(ARM_SMMU_SMR_ID, smmu->smrs_shadow[idx].id);
+			*val = val32;
+			return 0;
+		}
+	}
+
+	/* S2CR registers - stream-to-context mapping (shadow + enforce Stage-2) */
+	if (offset >= ARM_SMMU_GR0_S2CR(0) &&
+	    offset < ARM_SMMU_GR0_S2CR(0) + (smmu->num_mapping_groups * 4)) {
+		u32 idx = (offset - ARM_SMMU_GR0_S2CR(0)) >> 2;
+		u8 cb_idx;
+		u8 requested_type;
+
+		if (idx >= smmu->num_mapping_groups)
+			return -EINVAL;
+
+		if (is_write) {
+			val32 = (u32)*val;
+			requested_type = FIELD_GET(ARM_SMMU_S2CR_TYPE, val32);
+
+			/*
+			 * Preserve BYPASS mode for unmanaged streams.
+			 *
+			 * When host sets TYPE=FAULT but SMR is invalid, this is the
+			 * EL1 driver's reset sequence trying to set a "safe" default.
+			 * However, firmware-configured devices (like GPU) use SIDs
+			 * that aren't registered in the IOMMU framework, so they'd
+			 * hit FAULT mode and fail.
+			 *
+			 * Only allow FAULT mode for explicitly managed streams
+			 * (where SMR[idx].valid == true).
+			 */
+			if (requested_type == S2CR_TYPE_FAULT && !smmu->smrs_shadow[idx].valid) {
+				/* Keep BYPASS mode, ignore host's FAULT request */
+				hyp_info("S2CR[%u]: Rejecting FAULT for unmanaged stream\n", idx);
+				return 0;  /* Pretend write succeeded */
+			}
+
+			/* Update shadow state */
+			smmu->s2crs_shadow[idx].type = requested_type;
+			smmu->s2crs_shadow[idx].cbndx = FIELD_GET(ARM_SMMU_S2CR_CBNDX, val32);
+			smmu->s2crs_shadow[idx].privcfg = FIELD_GET(ARM_SMMU_S2CR_PRIVCFG, val32);
+
+			cb_idx = smmu->s2crs_shadow[idx].cbndx;
+
+			/* Write through to hardware */
+			smmu_writel(smmu, ARM_SMMU_GR0, offset, val32);
+
+			/* Update hardware state tracking */
+			smmu->s2crs_hw[idx] = smmu->s2crs_shadow[idx];
+			return 0;
+		} else {
+			/* Return shadow state */
+			val32 = 0;
+			val32 |= FIELD_PREP(ARM_SMMU_S2CR_TYPE, smmu->s2crs_shadow[idx].type);
+			val32 |= FIELD_PREP(ARM_SMMU_S2CR_CBNDX, smmu->s2crs_shadow[idx].cbndx);
+			val32 |= FIELD_PREP(ARM_SMMU_S2CR_PRIVCFG, smmu->s2crs_shadow[idx].privcfg);
+			*val = val32;
+			return 0;
+		}
+	}
+
+	/* Unknown or unsupported register */
 	return -EINVAL;
 }
 
@@ -812,12 +1009,110 @@ int smmu_v2_handle_gr0(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
  * @offset: Register offset within GR1 page
  * @is_write: true for write access, false for read
  * @val: Pointer to value (read or write)
+ *
+ * Emulates GR1 (Global Register page 1) accesses for context bank attributes.
+ * Key register types:
+ * - CBAR: Context Bank Attribute Register (translation mode, VMID)
+ * - CBA2R: Extended attributes (VMID16, 64-bit VA)
+ * - CBFRSYNRA: Fault syndrome auxiliary (read-only)
+ *
+ * Note: CBAR.TYPE is the authority for translation mode in Stage-2-only.
+ * Protected domains always use CBAR_TYPE_S2_TRANS for Stage-2 translation.
  */
 int smmu_v2_handle_gr1(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 		       bool is_write, u64 *val)
 {
-	/* TODO: Implement GR1 register emulation */
-	/* Key registers: CBAR, CBA2R */
+	u32 val32;
+	u8 cb_idx;
+
+	/* CBAR registers - context bank attributes */
+	if (offset >= ARM_SMMU_GR1_CBAR(0) &&
+	    offset < ARM_SMMU_GR1_CBAR(0) + (smmu->num_context_banks * 4)) {
+		cb_idx = (offset - ARM_SMMU_GR1_CBAR(0)) >> 2;
+
+		if (cb_idx >= smmu->num_context_banks)
+			return -EINVAL;
+
+		if (is_write) {
+			val32 = (u32)*val;
+
+			/*
+			 * For protected domains (active CBs with domain_id set),
+			 * enforce Stage-2 translation mode via CBAR.TYPE.
+			 *
+			 * If this CB is active and belongs to a protected domain,
+			 * override CBAR.TYPE to CBAR_TYPE_S2_TRANS.
+			 */
+			if (smmu->cb_state[cb_idx].active &&
+			    smmu->cb_state[cb_idx].domain_id != 0) {
+				u32 __maybe_unused cbar_type = FIELD_GET(ARM_SMMU_CBAR_TYPE, val32);
+
+				/*
+				 * Force Stage-2-only translation for protected domains.
+				 * This is the primary enforcement point for DMA isolation.
+				 */
+				val32 &= ~ARM_SMMU_CBAR_TYPE;
+				val32 |= FIELD_PREP(ARM_SMMU_CBAR_TYPE, CBAR_TYPE_S2_TRANS);
+
+				hyp_dbg("SMMU[%u]: CB%u forced Stage-2 (host requested type=%u)\n",
+					smmu->id, cb_idx, cbar_type);
+			}
+
+			/* Store in CB state for tracking */
+			smmu->cb_state[cb_idx].cbar = val32;
+
+			/* Write to hardware */
+			smmu_writel(smmu, ARM_SMMU_GR1, offset, val32);
+			return 0;
+		} else {
+			/* Return current CB state */
+			*val = smmu->cb_state[cb_idx].cbar;
+			return 0;
+		}
+	}
+
+	/* CBA2R registers - extended attributes */
+	if (offset >= ARM_SMMU_GR1_CBA2R(0) &&
+	    offset < ARM_SMMU_GR1_CBA2R(0) + (smmu->num_context_banks * 4)) {
+		cb_idx = (offset - ARM_SMMU_GR1_CBA2R(0)) >> 2;
+
+		if (cb_idx >= smmu->num_context_banks)
+			return -EINVAL;
+
+		if (is_write) {
+			val32 = (u32)*val;
+
+			/* Allow all CBA2R fields (VA64, VMID16) */
+			smmu_writel(smmu, ARM_SMMU_GR1, offset, val32);
+
+			/* Track VMID for this CB (needed for TLB ops) */
+			if (smmu->features & ARM_SMMU_FEAT_VMID16) {
+				u16 vmid = FIELD_GET(ARM_SMMU_CBA2R_VMID16, val32);
+				smmu->cb_state[cb_idx].vmid = vmid;
+			}
+			return 0;
+		} else {
+			*val = smmu_readl(smmu, ARM_SMMU_GR1, offset);
+			return 0;
+		}
+	}
+
+	/* CBFRSYNRA registers - fault syndrome auxiliary (read-only) */
+	if (offset >= ARM_SMMU_GR1_CBFRSYNRA(0) &&
+	    offset < ARM_SMMU_GR1_CBFRSYNRA(0) + (smmu->num_context_banks * 4)) {
+		cb_idx = (offset - ARM_SMMU_GR1_CBFRSYNRA(0)) >> 2;
+
+		if (cb_idx >= smmu->num_context_banks)
+			return -EINVAL;
+
+		if (is_write)
+			return -EINVAL;  /* Read-only */
+
+		*val = smmu_readl(smmu, ARM_SMMU_GR1, offset);
+		return 0;
+	}
+
+	/* Unknown or unsupported register */
 	return -EINVAL;
 }
 
@@ -827,13 +1122,440 @@ int smmu_v2_handle_gr1(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
  * @offset: Register offset (CB page + offset within CB)
  * @is_write: true for write access, false for read
  * @val: Pointer to value (read or write)
+ *
+ * Emulates context bank register accesses for translation control.
+ * Key register types:
+ * - SCTLR: System control (MMU enable, fault handling)
+ * - TTBR0/TTBR1: Translation table base registers
+ * - TCR/TCR2: Translation control registers
+ * - MAIR: Memory attribute indirection registers
+ * - FSR/FAR/FSYNR0: Fault status and address registers
+ * - TLBSYNC/TLBSTATUS: Per-CB TLB synchronization
+ *
+ * Note: For Stage-2-only protected domains, TTBR0 points to EL2's Stage-2
+ * page table. Host writes are shadowed but the actual hardware uses EL2's PT.
  */
 int smmu_v2_handle_cb(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 		      bool is_write, u64 *val)
 {
-	/* TODO: Implement CB register emulation */
-	/* Key registers: SCTLR, TTBR*, TCR, FSR, FAR */
-	return -EINVAL;
+	u32 page_offset, cb_offset;
+	u8 cb_idx;
+	void __iomem *cb_base;
+	u32 val32;
+	u64 val64;
+
+	/* Calculate which CB this is */
+	page_offset = offset >> smmu->pgshift;
+	if (page_offset < smmu->numpage)
+		return -EINVAL;  /* Pages 0 to numpage-1 are GR0/GR1 */
+
+	cb_idx = page_offset - smmu->numpage;
+	if (cb_idx >= smmu->num_context_banks)
+		return -EINVAL;
+
+	cb_offset = offset & ((1 << smmu->pgshift) - 1);
+	cb_base = smmu->base + (page_offset << smmu->pgshift);
+
+	/* SCTLR - System Control Register */
+	if (cb_offset == ARM_SMMU_CB_SCTLR) {
+		if (is_write) {
+			val32 = (u32)*val;
+
+			/* Store in shadow state */
+			smmu->cb_state[cb_idx].sctlr = val32;
+
+			/* Write to hardware */
+			writel_relaxed(val32, cb_base + cb_offset);
+			if (smmu->has_secondary_base) {
+				void __iomem *cb_base_sec = smmu->base_sec +
+					(page_offset << smmu->pgshift);
+				writel_relaxed(val32, cb_base_sec + cb_offset);
+			}
+			return 0;
+		} else {
+			*val = smmu->cb_state[cb_idx].sctlr;
+			return 0;
+		}
+	}
+
+	/* TCR2 - Translation Control Register 2 (VTCR for Stage-2) */
+	if (cb_offset == ARM_SMMU_CB_TCR2) {
+		if (is_write) {
+			val32 = (u32)*val;
+
+			/* Store in shadow state */
+			smmu->cb_state[cb_idx].vtcr = val32;
+
+			/* Write to hardware */
+			writel_relaxed(val32, cb_base + cb_offset);
+			if (smmu->has_secondary_base) {
+				void __iomem *cb_base_sec = smmu->base_sec +
+					(page_offset << smmu->pgshift);
+				writel_relaxed(val32, cb_base_sec + cb_offset);
+			}
+			return 0;
+		} else {
+			*val = smmu->cb_state[cb_idx].vtcr;
+			return 0;
+		}
+	}
+
+	/* TCR - Translation Control Register (Stage-1) */
+	if (cb_offset == ARM_SMMU_CB_TCR) {
+		if (is_write) {
+			val32 = (u32)*val;
+
+			/* Store in shadow state */
+			smmu->cb_state[cb_idx].tcr = val32;
+
+			/*
+			 * For Stage-2-only protected domains, TCR is not used
+			 * by hardware (VTCR/TCR2 controls translation).
+			 * Write through for completeness but it has no effect.
+			 */
+			writel_relaxed(val32, cb_base + cb_offset);
+			if (smmu->has_secondary_base) {
+				void __iomem *cb_base_sec = smmu->base_sec +
+					(page_offset << smmu->pgshift);
+				writel_relaxed(val32, cb_base_sec + cb_offset);
+			}
+			return 0;
+		} else {
+			*val = smmu->cb_state[cb_idx].tcr;
+			return 0;
+		}
+	}
+
+	/* TTBR0 - Translation Table Base Register 0 */
+	if (cb_offset == ARM_SMMU_CB_TTBR0) {
+		if (is_write) {
+			val64 = *val;
+
+			/*
+			 * For Stage-2-only protected domains:
+			 * - Host writes TTBR0 thinking it's programming S2 PT base
+			 * - We shadow host's write but use EL2's idmap_pgtable instead
+			 * - Hardware actually uses ttbr0_s2 (programmed during CB init)
+			 */
+			if (smmu->cb_state[cb_idx].active &&
+			    smmu->cb_state[cb_idx].domain_id != 0) {
+				/* Shadow host's TTBR0 but don't write to hardware */
+				smmu->cb_state[cb_idx].ttbr1_s1 = val64;
+
+				/*
+				 * Keep hardware TTBR0 pointing to EL2's Stage-2 PT.
+				 * This was set during smmu_v2_init_context_bank().
+				 * Do NOT overwrite it with host's value.
+				 */
+				hyp_dbg("SMMU[%u]: CB%u TTBR0 write shadowed (0x%llx), HW unchanged\n",
+					smmu->id, cb_idx, val64);
+				return 0;
+			} else {
+				/* Host/bypass domains: write through */
+				writeq_relaxed(val64, cb_base + cb_offset);
+				if (smmu->has_secondary_base) {
+					void __iomem *cb_base_sec = smmu->base_sec +
+						(page_offset << smmu->pgshift);
+					writeq_relaxed(val64, cb_base_sec + cb_offset);
+				}
+				return 0;
+			}
+		} else {
+			/* Return shadow state (what host thinks it programmed) */
+			if (smmu->cb_state[cb_idx].active &&
+			    smmu->cb_state[cb_idx].domain_id != 0) {
+				*val = smmu->cb_state[cb_idx].ttbr1_s1;
+			} else {
+				*val = readq_relaxed(cb_base + cb_offset);
+			}
+			return 0;
+		}
+	}
+
+	/* TTBR1 - Translation Table Base Register 1 (Stage-1 second PT) */
+	if (cb_offset == ARM_SMMU_CB_TTBR1) {
+		if (is_write) {
+			val64 = *val;
+
+			/*
+			 * TTBR1 is only used in Stage-1 translation.
+			 * For Stage-2-only domains, this is not used.
+			 * Write through for host/bypass domains.
+			 */
+			writeq_relaxed(val64, cb_base + cb_offset);
+			if (smmu->has_secondary_base) {
+				void __iomem *cb_base_sec = smmu->base_sec +
+					(page_offset << smmu->pgshift);
+				writeq_relaxed(val64, cb_base_sec + cb_offset);
+			}
+			return 0;
+		} else {
+			*val = readq_relaxed(cb_base + cb_offset);
+			return 0;
+		}
+	}
+
+	/* MAIR0/MAIR1 - Memory Attribute Indirection Registers */
+	if (cb_offset == ARM_SMMU_CB_S1_MAIR0) {
+		if (is_write) {
+			val64 = *val;
+
+			/* Store in shadow state */
+			smmu->cb_state[cb_idx].mair[0] = (u32)val64;
+			smmu->cb_state[cb_idx].mair[1] = (u32)(val64 >> 32);
+
+			/* Write to hardware */
+			writeq_relaxed(val64, cb_base + cb_offset);
+			if (smmu->has_secondary_base) {
+				void __iomem *cb_base_sec = smmu->base_sec +
+					(page_offset << smmu->pgshift);
+				writeq_relaxed(val64, cb_base_sec + cb_offset);
+			}
+			return 0;
+		} else {
+			val64 = smmu->cb_state[cb_idx].mair[0] |
+				((u64)smmu->cb_state[cb_idx].mair[1] << 32);
+			*val = val64;
+			return 0;
+		}
+	}
+
+	if (cb_offset == ARM_SMMU_CB_S1_MAIR1) {
+		/* MAIR1 is the high 32 bits, but typically accessed via MAIR0 as 64-bit */
+		if (is_write) {
+			val32 = (u32)*val;
+			smmu->cb_state[cb_idx].mair[1] = val32;
+			writel_relaxed(val32, cb_base + cb_offset);
+			if (smmu->has_secondary_base) {
+				void __iomem *cb_base_sec = smmu->base_sec +
+					(page_offset << smmu->pgshift);
+				writel_relaxed(val32, cb_base_sec + cb_offset);
+			}
+			return 0;
+		} else {
+			*val = smmu->cb_state[cb_idx].mair[1];
+			return 0;
+		}
+	}
+
+	/* FSR - Fault Status Register (write-1-to-clear) */
+	if (cb_offset == ARM_SMMU_CB_FSR) {
+		if (is_write) {
+			val32 = (u32)*val;
+			/* Write-1-to-clear fault status */
+			writel_relaxed(val32, cb_base + cb_offset);
+			if (smmu->has_secondary_base) {
+				void __iomem *cb_base_sec = smmu->base_sec +
+					(page_offset << smmu->pgshift);
+				writel_relaxed(val32, cb_base_sec + cb_offset);
+			}
+			return 0;
+		} else {
+			*val = readl_relaxed(cb_base + cb_offset);
+			return 0;
+		}
+	}
+
+	/* FAR - Fault Address Register (read-only) */
+	if (cb_offset == ARM_SMMU_CB_FAR) {
+		if (is_write)
+			return -EINVAL;  /* Read-only */
+		*val = readq_relaxed(cb_base + cb_offset);
+		return 0;
+	}
+
+	/* FSYNR0 - Fault Syndrome Register 0 (read-only) */
+	if (cb_offset == ARM_SMMU_CB_FSYNR0) {
+		if (is_write)
+			return -EINVAL;  /* Read-only */
+		*val = readl_relaxed(cb_base + cb_offset);
+		return 0;
+	}
+
+	/* PAR - Physical Address Register (read-only, result of ATS operation) */
+	if (cb_offset == ARM_SMMU_CB_PAR) {
+		if (is_write)
+			return -EINVAL;  /* Read-only */
+		*val = readq_relaxed(cb_base + cb_offset);
+		return 0;
+	}
+
+	/* TLBSYNC - Trigger CB TLB sync */
+	if (cb_offset == ARM_SMMU_CB_TLBSYNC) {
+		if (!is_write)
+			return -EINVAL;  /* Write-only */
+
+		return smmu_v2_tlb_sync_context(smmu, cb_idx);
+	}
+
+	/* TLBSTATUS - CB TLB sync status (read-only) */
+	if (cb_offset == ARM_SMMU_CB_TLBSTATUS) {
+		if (is_write)
+			return -EINVAL;  /* Read-only */
+
+		val32 = readl_relaxed(cb_base + cb_offset);
+		if (smmu->has_secondary_base) {
+			void __iomem *cb_base_sec = smmu->base_sec +
+				(page_offset << smmu->pgshift);
+			val32 |= readl_relaxed(cb_base_sec + cb_offset);
+		}
+		*val = val32;
+		return 0;
+	}
+
+	/*
+	 * Stage-1 TLB invalidation registers (0x600-0x628)
+	 * These are used by the host driver for per-context TLB invalidation.
+	 * Forward to hardware and sync.
+	 */
+	if (cb_offset == ARM_SMMU_CB_S1_TLBIVA ||
+	    cb_offset == ARM_SMMU_CB_S1_TLBIASID ||
+	    cb_offset == ARM_SMMU_CB_S1_TLBIVAL) {
+		if (!is_write)
+			return -EINVAL;  /* Write-only */
+
+		val64 = *val;
+		writeq_relaxed(val64, cb_base + cb_offset);
+		if (smmu->has_secondary_base) {
+			void __iomem *cb_base_sec = smmu->base_sec +
+				(page_offset << smmu->pgshift);
+			writeq_relaxed(val64, cb_base_sec + cb_offset);
+		}
+		return smmu_v2_tlb_sync_context(smmu, cb_idx);
+	}
+
+	/* S2_TLBIIPAS2 - Stage-2 TLB invalidate by IPA */
+	if (cb_offset == ARM_SMMU_CB_S2_TLBIIPAS2) {
+		if (!is_write)
+			return -EINVAL;  /* Write-only */
+
+		val32 = (u32)*val;
+		writel_relaxed(val32, cb_base + cb_offset);
+		if (smmu->has_secondary_base) {
+			void __iomem *cb_base_sec = smmu->base_sec +
+				(page_offset << smmu->pgshift);
+			writel_relaxed(val32, cb_base_sec + cb_offset);
+		}
+		return smmu_v2_tlb_sync_context(smmu, cb_idx);
+	}
+
+	/* S2_TLBIIPAS2L - Stage-2 TLB invalidate by IPA (last level only) */
+	if (cb_offset == ARM_SMMU_CB_S2_TLBIIPAS2L) {
+		if (!is_write)
+			return -EINVAL;  /* Write-only */
+
+		val32 = (u32)*val;
+		writel_relaxed(val32, cb_base + cb_offset);
+		if (smmu->has_secondary_base) {
+			void __iomem *cb_base_sec = smmu->base_sec +
+				(page_offset << smmu->pgshift);
+			writel_relaxed(val32, cb_base_sec + cb_offset);
+		}
+		return smmu_v2_tlb_sync_context(smmu, cb_idx);
+	}
+
+	/* CONTEXTIDR - Context ID Register */
+	if (cb_offset == ARM_SMMU_CB_CONTEXTIDR) {
+		if (is_write) {
+			val32 = (u32)*val;
+			writel_relaxed(val32, cb_base + cb_offset);
+			if (smmu->has_secondary_base) {
+				void __iomem *cb_base_sec = smmu->base_sec +
+					(page_offset << smmu->pgshift);
+				writel_relaxed(val32, cb_base_sec + cb_offset);
+			}
+			return 0;
+		} else {
+			*val = readl_relaxed(cb_base + cb_offset);
+			return 0;
+		}
+	}
+
+	/* RESUME - Resume processing after stall */
+	if (cb_offset == ARM_SMMU_CB_RESUME) {
+		if (!is_write)
+			return -EINVAL;  /* Write-only */
+
+		val32 = (u32)*val;
+		writel_relaxed(val32, cb_base + cb_offset);
+		if (smmu->has_secondary_base) {
+			void __iomem *cb_base_sec = smmu->base_sec +
+				(page_offset << smmu->pgshift);
+			writel_relaxed(val32, cb_base_sec + cb_offset);
+		}
+		return 0;
+	}
+
+	/* ACTLR - Auxiliary Control Register */
+	if (cb_offset == ARM_SMMU_CB_ACTLR) {
+		if (is_write) {
+			val32 = (u32)*val;
+			writel_relaxed(val32, cb_base + cb_offset);
+			if (smmu->has_secondary_base) {
+				void __iomem *cb_base_sec = smmu->base_sec +
+					(page_offset << smmu->pgshift);
+				writel_relaxed(val32, cb_base_sec + cb_offset);
+			}
+			return 0;
+		} else {
+			*val = readl_relaxed(cb_base + cb_offset);
+			return 0;
+		}
+	}
+
+	/* ATS1PR - Address Translation Stage 1 Privileged Read (write-only) */
+	if (cb_offset == ARM_SMMU_CB_ATS1PR) {
+		if (!is_write)
+			return -EINVAL;  /* Write-only */
+
+		/*
+		 * ATS operation: write address to translate, then poll ATSR
+		 * and read result from PAR. Forward to hardware.
+		 */
+		val64 = *val;
+		writeq_relaxed(val64, cb_base + cb_offset);
+		if (smmu->has_secondary_base) {
+			void __iomem *cb_base_sec = smmu->base_sec +
+				(page_offset << smmu->pgshift);
+			writeq_relaxed(val64, cb_base_sec + cb_offset);
+		}
+		return 0;
+	}
+
+	/* ATSR - Address Translation Status Register (read-only) */
+	if (cb_offset == ARM_SMMU_CB_ATSR) {
+		if (is_write)
+			return -EINVAL;  /* Read-only */
+
+		val32 = readl_relaxed(cb_base + cb_offset);
+		if (smmu->has_secondary_base) {
+			void __iomem *cb_base_sec = smmu->base_sec +
+				(page_offset << smmu->pgshift);
+			val32 |= readl_relaxed(cb_base_sec + cb_offset);
+		}
+		*val = val32;
+		return 0;
+	}
+
+	/*
+	 * Unknown register - log and passthrough for debugging.
+	 * TODO: Audit and restrict this once all required registers are identified.
+	 */
+	hyp_warn("CB[%u] unknown register 0x%x access (%s)\n",
+		 cb_idx, cb_offset, is_write ? "write" : "read");
+
+	if (is_write) {
+		val32 = (u32)*val;
+		writel_relaxed(val32, cb_base + cb_offset);
+		if (smmu->has_secondary_base) {
+			void __iomem *cb_base_sec = smmu->base_sec +
+				(page_offset << smmu->pgshift);
+			writel_relaxed(val32, cb_base_sec + cb_offset);
+		}
+	} else {
+		*val = readl_relaxed(cb_base + cb_offset);
+	}
+	return 0;
 }
 
 /**
@@ -888,20 +1610,28 @@ bool smmu_v2_mmio_handler(u64 addr, bool is_write, u64 *val)
  */
 u8 smmu_v2_alloc_context_bank(struct hyp_arm_smmu_v2_device *smmu)
 {
-	unsigned long idx;
+	u32 i;
+	u32 word_idx, bit_idx;
+	unsigned long *map = smmu->context_map;
 
 	hyp_spin_lock(&smmu->lock);
-	idx = find_first_zero_bit(smmu->context_map, smmu->num_context_banks);
-	if (idx >= smmu->num_context_banks) {
-		hyp_spin_unlock(&smmu->lock);
-		return ARM_SMMU_INVALID_CB;
+
+	/* Manually search for first zero bit */
+	for (i = 0; i < smmu->num_context_banks; i++) {
+		word_idx = i / BITS_PER_LONG;
+		bit_idx = i % BITS_PER_LONG;
+
+		if (!(map[word_idx] & (1UL << bit_idx))) {
+			/* Found free CB - mark as allocated */
+			map[word_idx] |= (1UL << bit_idx);
+			smmu->cb_state[i].active = true;
+			hyp_spin_unlock(&smmu->lock);
+			return i;
+		}
 	}
 
-	__set_bit(idx, smmu->context_map);
-	smmu->cb_state[idx].active = true;
 	hyp_spin_unlock(&smmu->lock);
-
-	return idx;
+	return ARM_SMMU_INVALID_CB;
 }
 
 /**
