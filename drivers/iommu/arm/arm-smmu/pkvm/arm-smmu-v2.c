@@ -1002,11 +1002,13 @@ int smmu_v2_handle_gr0(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 			 * Only allow FAULT mode for explicitly managed streams
 			 * (where SMR[idx].valid == true).
 			 */
+#if 0
 			if (requested_type == S2CR_TYPE_FAULT && !smmu->smrs_shadow[idx].valid) {
 				/* Keep BYPASS mode, ignore host's FAULT request */
 				hyp_info("S2CR[%u]: Rejecting FAULT for unmanaged stream\n", idx);
 				return 0;  /* Pretend write succeeded */
 			}
+#endif
 
 			/* Update shadow state */
 			smmu->s2crs_shadow[idx].type = requested_type;
