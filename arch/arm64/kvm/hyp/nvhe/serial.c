@@ -71,6 +71,14 @@ int __pkvm_register_serial_driver(void (*cb)(char))
 	return cmpxchg_release(&__hyp_putc, NULL, cb) ? -EBUSY : 0;
 }
 
+int pkvm_serial_register_ops(struct kvm_serial_ops *ops)
+{
+	if (!ops || !ops->init)
+		return -ENODEV;
+
+	return ops->init();
+}
+
 /*
  * Print a 64-bit value in decimal
  */
