@@ -3,6 +3,10 @@
 #ifndef __ARM64_KVM_NVHE_SERIAL_H__
 #define __ARM64_KVM_NVHE_SERIAL_H__
 
+struct kvm_serial_ops {
+        int (*init)(void);
+};
+
 /* Basic output functions */
 void hyp_puts(const char *s);
 void hyp_putx64(u64 x);
@@ -31,6 +35,8 @@ void hyp_printf(const char *fmt, ...) __printf(1, 2);
 
 /* Driver registration */
 int __pkvm_register_serial_driver(void (*driver_cb)(char));
+
+int pkvm_serial_register_ops(struct kvm_serial_ops *ops);
 
 /*
  * Convenience macros for common debug patterns
