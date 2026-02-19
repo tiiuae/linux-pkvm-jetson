@@ -4,6 +4,12 @@
 #include <asm/kvm_pkvm_module.h>
 #include <asm/io.h>
 
+#ifndef MODULE
+#include <nvhe/mm.h>
+#endif
+
+#include "pl011-hyp.h"
+
 static unsigned long uart_addr;
 
 static inline unsigned int __hyp_readw(void *ioaddr)
@@ -35,10 +41,8 @@ static void pl011_hyp_putc(char c)
 	dmb(sy);
 }
 
-/* -Wmissing-prototypes */
-int pl011_hyp_init(const struct pkvm_module_ops *ops);
-
-int pl011_hyp_init(const struct pkvm_module_ops *ops)
+#ifdef MODULE
+int pl011_hyp_init_module(const struct pkvm_module_ops *ops)
 {
 	int ret;
 
@@ -52,6 +56,27 @@ int pl011_hyp_init(const struct pkvm_module_ops *ops)
 		return ret;
 
 	ops->puts("pKVM pl011 UART driver loaded");
-
 	return 0;
 }
+#else
+static int pl011_hyp_init(void)
+{
+	int ret;
+
+	ret = __pkvm_create_private_mapping(CONFIG_SERIAL_PKVM_PL011_BASE_PHYS, PAGE_SIZE,
+					    PAGE_HYP_DEVICE, &uart_addr);
+	if (ret)
+		return ret;
+
+	ret = __pkvm_register_serial_driver(pl011_hyp_putc);
+	if (ret)
+		return ret;
+
+	hyp_info("PL011: UART driver loaded");
+	return 0;
+}
+
+struct kvm_serial_ops pl011_ops = {
+	.init = pl011_hyp_init,
+};
+#endif
