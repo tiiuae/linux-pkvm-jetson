@@ -14,6 +14,8 @@ config SERIAL_EARLYCON
 	  the console before standard serial driver is probed. The console is
 	  enabled when early_param is processed.
 
+source "drivers/tty/serial/pkvm-pl011/Kconfig"
+
 source "drivers/tty/serial/8250/Kconfig"
 
 comment "Non-8250 serial port support"
@@ -1623,5 +1625,3 @@ endmenu
 
 config SERIAL_MCTRL_GPIO
 	tristate
-
-source "drivers/tty/serial/pkvm-pl011/Kconfig"

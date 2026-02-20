@@ -2,12 +2,13 @@
 
 config SERIAL_PKVM_PL011
 	tristate "Protected KVM PL011 UART"
-	depends on ARM64
-	depends on KVM
-	depends on m
+	depends on ARM64 && KVM
+	select SERIAL_CORE
+	help
+	  Enable UART in pKVM hypervisor.
 
 config SERIAL_PKVM_PL011_BASE_PHYS
-	hex
+	hex "PL011 base physical address"
 	depends on SERIAL_PKVM_PL011
 	default 0x09000000
 
@@ -24,9 +25,9 @@ config SERIAL_PKVM_PL011_UARTTX
 config SERIAL_PKVM_PL011_BUSY
 	hex
 	depends on SERIAL_PKVM_PL011
-	default 0x2
+	default 0x3
 
 config SERIAL_PKVM_PL011_FULL
 	hex
 	depends on SERIAL_PKVM_PL011
-	default 0x6
+	default 0x5

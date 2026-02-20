@@ -28,6 +28,7 @@
 #include <nvhe/trace.h>
 #include <nvhe/pviommu-host.h>
 #include <nvhe/trap_handler.h>
+#include <nvhe/serial.h>
 
 #include <linux/irqchip/arm-gic-v3.h>
 #include <uapi/linux/psci.h>
@@ -1703,6 +1704,13 @@ static void handle___pkvm_iommu_register_ops(struct kvm_cpu_context *host_ctxt)
 	cpu_reg(host_ctxt, 2) = drv_id;
 }
 
+static void handle___pkvm_serial_register_ops(struct kvm_cpu_context *host_ctxt)
+{
+	DECLARE_REG(struct kvm_serial_ops *, ops, host_ctxt, 1);
+
+	cpu_reg(host_ctxt, 1) = pkvm_serial_register_ops(ops);
+}
+
 static void handle___pkvm_devices_init(struct kvm_cpu_context *host_ctxt)
 {
 	/*
@@ -1935,6 +1943,7 @@ static const hcall_t host_hcall[] = {
 	HANDLE_FUNC(__pkvm_init_module),
 	HANDLE_FUNC(__pkvm_register_hcall),
 	HANDLE_FUNC(__pkvm_iommu_register_ops),
+	HANDLE_FUNC(__pkvm_serial_register_ops),
 	HANDLE_FUNC(__pkvm_devices_init),
 	HANDLE_FUNC(__pkvm_prot_finalize),
 
