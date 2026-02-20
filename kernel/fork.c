@@ -106,6 +106,7 @@
 #include <linux/pidfs.h>
 #include <linux/tick.h>
 #include <linux/unwind_deferred.h>
+#include <linux/android_vendor.h>
 
 #include <asm/pgalloc.h>
 #include <linux/uaccess.h>
@@ -960,6 +961,8 @@ static struct task_struct *dup_task_struct(struct task_struct *orig, int node)
 	tsk->mm_cid_active = 0;
 	tsk->migrate_from_cpu = -1;
 #endif
+	android_init_vendor_data(tsk, 1);
+	android_init_oem_data(tsk, 1);
 	return tsk;
 
 free_stack:

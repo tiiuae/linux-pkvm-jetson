@@ -3001,6 +3001,11 @@
 			max_snp_asid == min_sev_asid-1, will effectively make
 			SEV-ES unusable.
 
+	kvm-arm.hyp_lm_size_mb=
+			[KVM,ARM,EARLY] Maximum amount of contiguous memory mappable in
+			the pKVM hypervisor linear map, in MB. Any attempt to map more
+			memory than this into pKVM stage-1 at run-time may be fatal.
+
 	kvm-arm.mode=
 			[KVM,ARM,EARLY] Select one of KVM/arm64's modes of
 			operation.
@@ -3010,9 +3015,10 @@
 			nvhe: Standard nVHE-based mode, without support for
 			      protected guests.
 
-			protected: Mode with support for guests whose state is
-				   kept private from the host, using VHE or
-				   nVHE depending on HW support.
+			protected: nVHE-based mode with support for guests whose
+				   state is kept private from the host. See
+				   Documentation/virt/kvm/arm/pkvm.rst for more
+				   information about this mode of operation.
 
 			nested: VHE-based mode with support for nested
 				virtualization. Requires at least ARMv8.4
@@ -3025,6 +3031,17 @@
 			command-line.
 			"nested" is experimental and should be used with
 			extreme caution.
+
+	kvm-arm.protected_modules=
+			[KVM,ARM] List of pKVM modules to load before the host
+			is deprevileged.
+
+			This option only applies when booting with
+			kvm-arm.mode=protected.
+
+	kvm-arm.protected_prefault=
+			[KVM,ARM] Minimum order for each protected VM fault.
+			This range from 0 (default) to 9.
 
 	kvm-arm.vgic_v3_group0_trap=
 			[KVM,ARM,EARLY] Trap guest accesses to GICv3 group-0
@@ -3059,6 +3076,10 @@
 			trap: set WFI instruction trap
 
 			notrap: clear WFI instruction trap
+	kvm-arm.hyp_iommu_pages=
+			[KVM, ARM, EARLY]
+			Number of pages allocated for the IOMMU pool from the
+			KVM carveout when running in protected mode.
 
 	kvm_cma_resv_ratio=n [PPC,EARLY]
 			Reserves given percentage from system memory area for

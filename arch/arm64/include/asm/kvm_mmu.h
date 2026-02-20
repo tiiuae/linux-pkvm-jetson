@@ -99,13 +99,14 @@ alternative_cb_end
 #include <asm/kvm_emulate.h>
 #include <asm/kvm_host.h>
 #include <asm/kvm_nested.h>
+#include <asm/kvm_pkvm_module.h>
 
 void kvm_update_va_mask(struct alt_instr *alt,
 			__le32 *origptr, __le32 *updptr, int nr_inst);
+void kvm_patch_physvirt_offset(struct alt_instr *alt, __le32 *origptr,
+			       __le32 *updptr, int nr_inst);
 void kvm_compute_layout(void);
 void kvm_apply_hyp_relocations(void);
-
-#define __hyp_pa(x) (((phys_addr_t)(x)) + hyp_physvirt_offset)
 
 /*
  * Convert a kernel VA into a HYP VA.
@@ -125,6 +126,9 @@ static __always_inline unsigned long __kern_hyp_va(unsigned long v)
  * replace the instructions with `nop`s.
  */
 #ifndef __KVM_VHE_HYPERVISOR__
+	if (!is_ttbr1_addr(v))
+		return v;
+
 	asm volatile(ALTERNATIVE_CB("and %0, %0, #1\n"         /* mask with va_mask */
 				    "ror %0, %0, #1\n"         /* rotate to the first tag bit */
 				    "add %0, %0, #0\n"         /* insert the low 12 bits of the tag */
@@ -138,6 +142,64 @@ static __always_inline unsigned long __kern_hyp_va(unsigned long v)
 }
 
 #define kern_hyp_va(v) 	((typeof(v))(__kern_hyp_va((unsigned long)(v))))
+
+/*
+ * Convert a PA into a HYP VA.
+ *
+ * Can be called from hyp or non-hyp context.
+ *
+ * The actual code generation takes place in kvm_patch_physvirt_offset(),
+ * and the instructions below are only there to reserve the space and
+ * perform the register allocation (kvm_patch_physvirt_offset() uses the
+ * specific registers encoded in the instructions).
+ */
+static __always_inline void *hyp_phys_to_virt(phys_addr_t v)
+{
+	long offset = 0;
+
+	asm volatile (ALTERNATIVE_CB("movz  %1, #0\n\t"
+				     "nop\n\t"
+				     "nop\n\t"
+				     "nop\n\t"
+				     "sub  %0, %0, %1",
+				     ARM64_ALWAYS_SYSTEM,
+				     kvm_patch_physvirt_offset)
+		      : "+r" (v),
+			"=&r" (offset));
+
+	return (void *)v;
+}
+
+#define __hyp_va(v) hyp_phys_to_virt((phys_addr_t)v)
+
+/*
+ * Convert a HYP VA into a PA.
+ *
+ * Can be called from hyp or non-hyp context.
+ *
+ * The actual code generation takes place in kvm_patch_physvirt_offset(),
+ * and the instructions below are only there to reserve the space and
+ * perform the register allocation (kvm_patch_physvirt_offset() uses the
+ * specific registers encoded in the instructions).
+ */
+static __always_inline phys_addr_t hyp_virt_to_phys(void *v)
+{
+	long offset = 0;
+
+	asm volatile (ALTERNATIVE_CB("movz  %1, #0\n\t"
+				     "nop\n\t"
+				     "nop\n\t"
+				     "nop\n\t"
+				     "add  %0, %0, %1",
+				     ARM64_ALWAYS_SYSTEM,
+				     kvm_patch_physvirt_offset)
+		      : "+r" (v),
+			"=&r" (offset));
+
+	return (phys_addr_t)v;
+}
+
+#define __hyp_pa(v) hyp_virt_to_phys((void *)v)
 
 extern u32 __hyp_va_bits;
 
@@ -182,6 +244,8 @@ int kvm_phys_addr_ioremap(struct kvm *kvm, phys_addr_t guest_ipa,
 
 int kvm_handle_guest_sea(struct kvm_vcpu *vcpu);
 int kvm_handle_guest_abort(struct kvm_vcpu *vcpu);
+int pkvm_mem_abort_range(struct kvm_vcpu *vcpu, phys_addr_t fault_ipa, size_t size);
+int __pkvm_pgtable_stage2_split(struct kvm_vcpu *vcpu, phys_addr_t ipa, size_t size);
 
 phys_addr_t kvm_mmu_get_httbr(void);
 phys_addr_t kvm_get_idmap_vector(void);
@@ -197,8 +261,13 @@ static inline void *__kvm_vector_slot2addr(void *base,
 
 struct kvm;
 
-#define kvm_flush_dcache_to_poc(a,l)	\
-	dcache_clean_inval_poc((unsigned long)(a), (unsigned long)(a)+(l))
+#define kvm_flush_dcache_to_poc(a, l)	do {			\
+	unsigned long __a = (unsigned long)(a);			\
+	unsigned long __l = (unsigned long)(l);			\
+								\
+	if (__l)						\
+		dcache_clean_inval_poc(__a, __a + __l);		\
+} while (0)
 
 static inline bool vcpu_has_cache_enabled(struct kvm_vcpu *vcpu)
 {
@@ -392,8 +461,10 @@ static inline bool kvm_supports_cacheable_pfnmap(void)
 
 #ifdef CONFIG_PTDUMP_STAGE2_DEBUGFS
 void kvm_s2_ptdump_create_debugfs(struct kvm *kvm);
+void kvm_s2_ptdump_host_create_debugfs(void);
 #else
 static inline void kvm_s2_ptdump_create_debugfs(struct kvm *kvm) {}
+static inline void kvm_s2_ptdump_host_create_debugfs(void) {}
 #endif /* CONFIG_PTDUMP_STAGE2_DEBUGFS */
 
 #endif /* __ASSEMBLY__ */
