@@ -1838,7 +1838,7 @@ static int smmu_v2_early_uart_init(void)
  *
  * Returns: 0 on success, negative error code on failure
  */
-int smmu_v2_global_init(void)
+int smmu_v2_global_init(pkvm_handle_t drv_id)
 {
 	struct hyp_arm_smmu_v2_device *smmu;
 	int i, ret;
