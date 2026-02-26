@@ -1769,65 +1769,6 @@ int smmu_v2_init_context_bank(struct hyp_arm_smmu_v2_device *smmu,
 	return 0;
 }
 
-/*
- * Early UART initialization for debugging before pkvm-pl011 module loads.
- * This creates a proper EL2 private mapping of the UART MMIO region.
- */
-static void __iomem *early_uart_base;
-
-#define EARLY_UART_BASE_PHYS	0x31d0000   /* Tegra234 UARTI */
-#define EARLY_UARTDR		0x00
-#define EARLY_UARTFR		0x18
-#define EARLY_UARTFR_TXFF	(1 << 5)
-#define EARLY_UARTFR_BUSY	(1 << 3)
-
-static void early_uart_putc(char c)
-{
-	if (!early_uart_base)
-		return;
-
-	/* Wait until TX FIFO not full */
-	while (readl_relaxed(early_uart_base + EARLY_UARTFR) & EARLY_UARTFR_TXFF)
-		;
-
-	writel_relaxed(c, early_uart_base + EARLY_UARTDR);
-
-	/* Wait until UART not busy */
-	while (readl_relaxed(early_uart_base + EARLY_UARTFR) & EARLY_UARTFR_BUSY)
-		;
-}
-
-static int smmu_v2_early_uart_init(void)
-{
-	unsigned long va = 0;
-	int ret;
-
-	/*
-	 * Create EL2 private mapping for UART MMIO.
-	 * __pkvm_create_private_mapping() allocates VA and creates mapping.
-	 */
-	ret = __pkvm_create_private_mapping(EARLY_UART_BASE_PHYS, PAGE_SIZE,
-					    PAGE_HYP_DEVICE, &va);
-	if (ret)
-		return ret;
-
-	early_uart_base = (void __iomem *)va;
-
-	/* Register as serial driver for pKVM framework */
-	ret = __pkvm_register_serial_driver(early_uart_putc);
-	if (ret) {
-		/*
-		 * Someone else already registered (e.g., pkvm-pl011 module).
-		 * That's fine - just clear our pointer and return error.
-		 * Note: VA ranges cannot be freed in pKVM (they grow monotonically).
-		 */
-		early_uart_base = NULL;
-		return ret;
-	}
-
-	return 0;
-}
-
 /**
  * smmu_v2_global_init - Global initialization for all SMMU instances
  *
@@ -1842,16 +1783,6 @@ int smmu_v2_global_init(pkvm_handle_t drv_id)
 {
 	struct hyp_arm_smmu_v2_device *smmu;
 	int i, ret;
-
-	/*
-	 * Initialize early UART for debugging (before pkvm-pl011 module loads).
-	 * This creates a proper EL2 private mapping of the UART MMIO.
-	 * Non-fatal if it fails - we'll just have no early debug output.
-	 */
-	ret = smmu_v2_early_uart_init();
-	if (ret) {
-		/* Continue without UART - debug output will be silent */
-	}
 
 #ifdef CONFIG_TEGRA_MC_PKVM
 	/* Register Tegra MC platform hooks for SID override validation */
