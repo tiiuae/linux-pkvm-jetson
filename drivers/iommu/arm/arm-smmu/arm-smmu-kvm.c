@@ -133,6 +133,7 @@ static int kvm_arm_smmu_v2_array_alloc(void)
 				goto out_err;
 			}
 
+			kvm_arm_smmu_v2_array[i].id = i;
 			kvm_arm_smmu_v2_array[i].mmio_addr = res.start;
 			kvm_arm_smmu_v2_array[i].mmio_size = resource_size(&res);
 
