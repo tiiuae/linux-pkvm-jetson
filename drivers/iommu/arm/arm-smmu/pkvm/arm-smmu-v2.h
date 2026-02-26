@@ -138,7 +138,7 @@ extern struct kvm_iommu_ops smmu_v2_ops;
 int smmu_v2_init(struct hyp_arm_smmu_v2_device *smmu);
 int smmu_v2_probe_device(struct hyp_arm_smmu_v2_device *smmu);
 int smmu_v2_reset(struct hyp_arm_smmu_v2_device *smmu);
-int smmu_v2_global_init(void);
+int smmu_v2_global_init(pkvm_handle_t drv_id);
 
 /* MMIO emulation */
 bool smmu_v2_mmio_handler(u64 addr, bool is_write, u64 *val);
