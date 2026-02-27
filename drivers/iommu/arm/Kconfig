@@ -89,6 +89,18 @@ config ARM_SMMU_V2_PKVM
 	  Say Y here if you intend to enable KVM in protected mode on Tegra234
 	  and want to pass through devices like GPU to protected guest VMs.
 
+config ARM_SMMU_V2_PKVM_DEBUGFS
+	bool "Expose various SMMU information to debugfs"
+	depends on ARM_SMMU_V2_PKVM
+	depends on DEBUG_KERNEL
+	depends on DEBUG_FS
+	default n
+	help
+	  Expose various SMMU information to debugfs. This is only meant for
+	  debugging.
+
+	  If unsure, say N.
+
 config ARM_SMMU_V3
 	tristate "ARM Ltd. System MMU Version 3 (SMMUv3) Support"
 	depends on ARM64

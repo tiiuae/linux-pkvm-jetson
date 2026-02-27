@@ -1000,3 +1000,15 @@ int kvm_iommu_request_hyp_alloc(void)
 	req->mem.nr_pages = nr_pages;
 	return 0;
 }
+
+#ifdef CONFIG_ARM_SMMU_V2_PKVM_DEBUGFS
+int kvm_iommu_debug(pkvm_handle_t drv_id, pkvm_handle_t smmu_id, enum kvm_iommu_debug_ops op,
+		    void *out, size_t out_sz)
+{
+	struct kvm_iommu_ops *kvm_iommu_ops = get_drv(drv_id);
+
+	if (!kvm_iommu_ops || !kvm_iommu_ops->debug)
+		return -ENODEV;
+	return kvm_iommu_ops->debug(smmu_id, op, out, out_sz);
+}
+#endif
