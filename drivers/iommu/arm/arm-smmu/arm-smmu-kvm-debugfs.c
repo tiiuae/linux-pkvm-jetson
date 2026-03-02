@@ -5,6 +5,10 @@
 #include <asm/kvm_pkvm.h>
 
 #include "arm-smmu-kvm-debugfs.h"
+#include "pkvm/arm-smmu-v2.h"
+
+#define TABLE_INDENT "  "
+#define tbl_printf(m, fmt, ...) seq_printf(m, TABLE_INDENT fmt, ##__VA_ARGS__)
 
 static int kvm_iommu_debug(pkvm_handle_t drv_id, pkvm_handle_t smmu_id,
 	                   enum kvm_iommu_debug_ops op, void *out, size_t out_sz)
@@ -13,6 +17,116 @@ static int kvm_iommu_debug(pkvm_handle_t drv_id, pkvm_handle_t smmu_id,
 
 	res = kvm_call_hyp_nvhe_smccc(__pkvm_host_iommu_debug, drv_id, smmu_id, op, out, out_sz);
 	return res.a1;
+}
+
+static int kvm_smmu_export_dev(pkvm_handle_t hyp_drv_id, pkvm_handle_t smmu_id,
+			       struct hyp_arm_smmu_v2_device *smmu)
+{
+	int ret;
+
+	ret = kvm_share_hyp(smmu, smmu + 1);
+	if (ret)
+		return ret;
+
+	ret = kvm_iommu_debug(hyp_drv_id, smmu_id, PKVM_IOMMU_DEBUG_EXPORT_DEVICE, smmu,
+			      sizeof(*smmu));
+
+	kvm_unshare_hyp(smmu, smmu + 1);
+
+	return ret;
+}
+
+static int kvm_smmu_export_smt(pkvm_handle_t hyp_drv_id, pkvm_handle_t smmu_id, void *out,
+			       size_t out_sz)
+{
+	int ret;
+
+	ret = kvm_share_hyp(out, (u8 *)out + out_sz);
+	if (ret)
+		return ret;
+
+	ret = kvm_iommu_debug(hyp_drv_id, smmu_id, PKVM_IOMMU_DEBUG_EXPORT_SMT, out, out_sz);
+
+	kvm_unshare_hyp(out, (u8 *)out + out_sz);
+
+	return ret;
+}
+
+static void kvm_smmu_dump_cbs(struct seq_file *m, struct hyp_arm_smmu_v2_device *smmu)
+{
+	int i;
+	int cnt_same;
+
+	tbl_printf(m, "    | domain_id |     cbar |      tcr |     vtcr |         ttbr0_s2 |         ttbr1_s1 |    sctlr |  mair[0] |  mair[1] | vmid | active\n");
+	tbl_printf(m, "====|===========|==========|==========|==========|==================|==================|==========|==========|==========|======|=======\n");
+
+	for (i = 0, cnt_same = 0; i < smmu->num_context_banks; i++) {
+		if (i > 0 && memcmp(&smmu->cb_state[i],
+				    &smmu->cb_state[i-1],
+				    sizeof(smmu->cb_state[i])) == 0) {
+			cnt_same++;
+			continue;
+		} else if (cnt_same) {
+			tbl_printf(m, "  : | < repeats %d times >\n", cnt_same);
+			cnt_same = 0;
+		}
+
+		tbl_printf(m, "%3u |%10u |%9x |%9x |%9x |%17llx |%17llx |%9x |%9x |%9x |%5x | %u\n",
+			   i,
+			   smmu->cb_state[i].domain_id,
+			   smmu->cb_state[i].cbar,
+			   smmu->cb_state[i].tcr,
+			   smmu->cb_state[i].vtcr,
+			   smmu->cb_state[i].ttbr0_s2,
+			   smmu->cb_state[i].ttbr1_s1,
+			   smmu->cb_state[i].sctlr,
+			   smmu->cb_state[i].mair[0],
+			   smmu->cb_state[i].mair[1],
+			   smmu->cb_state[i].vmid,
+			   smmu->cb_state[i].active
+			  );
+	}
+
+	if (cnt_same)
+		tbl_printf(m, "  : | < repeats %d times >\n", cnt_same);
+}
+
+static void kvm_smmu_dump_smt(struct seq_file *m, struct arm_smmu_smr *smrs,
+			      struct arm_smmu_s2cr *s2crs, u32 num_groups)
+{
+	int i;
+	int cnt_same;
+
+	tbl_printf(m, "    |        SMR          |              S2CR\n");
+	tbl_printf(m, "    |------|------|-------|------|-------|---------|-------\n");
+	tbl_printf(m, "    | mask |   id | valid | type | cbndx | privcfg | bypass\n");
+	tbl_printf(m, "====|======|======|=======|======|=======|=========|=======\n");
+
+	for (i = 0, cnt_same = 0; i < num_groups; i++) {
+		if (i > 0 &&
+		    memcmp(&smrs[i], &smrs[i-1], sizeof(smrs[i])) == 0 &&
+		    memcmp(&s2crs[i], &s2crs[i-1], sizeof(s2crs[i])) == 0) {
+			cnt_same++;
+			continue;
+		} else if (cnt_same) {
+			seq_printf(m, "  : | < repeats %d times >\n", cnt_same);
+			cnt_same = 0;
+		}
+
+		tbl_printf(m, "%3u |%5x |%5x |%6u |%5x |%6u |%8x |%7u\n",
+			   i,
+			   smrs[i].mask,
+			   smrs[i].id,
+			   smrs[i].valid,
+			   s2crs[i].type,
+			   s2crs[i].cbndx,
+			   s2crs[i].privcfg,
+			   s2crs[i].bypass
+			  );
+	}
+
+	if (cnt_same)
+		tbl_printf(m, "  : | < repeats %d times >\n", cnt_same);
 }
 
 static int kvm_smmu_host_device_show(struct seq_file *m, void *unused)
@@ -27,7 +141,9 @@ static int kvm_smmu_host_device_show(struct seq_file *m, void *unused)
 	struct hyp_arm_smmu_v2_device *smmu;
 	size_t smmu_size = sizeof(*smmu);
 	int smmu_order = get_order(smmu_size);
-	int i;
+	/* stream mapping table: size of {smrs/s2crs}_{shadow,hw} arrays */
+	size_t smt_size;
+	int smt_order;
 
 	smmu = (void *)__get_free_pages(GFP_KERNEL | __GFP_ZERO, smmu_order);
 	if (smmu == NULL) {
@@ -35,19 +151,33 @@ static int kvm_smmu_host_device_show(struct seq_file *m, void *unused)
 		return -ENOMEM;
 	}
 
-	ret = kvm_share_hyp(smmu, smmu + 1);
+	ret = kvm_smmu_export_dev(hyp_drv_id, smmu_id, smmu);
 	if (ret) {
-		seq_printf(m, "<Error %d sharing memory with the hypervisor>\n", ret);
+		seq_printf(m, "<Error %d exporting device structure>\n", ret);
 		goto exit_with_pages;
 	}
 
-	ret = kvm_iommu_debug(hyp_drv_id, smmu_id, PKVM_IOMMU_DEBUG_EXPORT_DEVICE, smmu, smmu_size);
+	/* allocate memory for the stream mapping table(s) */
+	smt_size = smmu->num_mapping_groups * sizeof(smmu->smrs_shadow[0]);
+	smt_size += smmu->num_mapping_groups * sizeof(smmu->s2crs_shadow[0]);
+	smt_size += smmu->num_mapping_groups * sizeof(smmu->smrs_hw[0]);
+	smt_size += smmu->num_mapping_groups * sizeof(smmu->s2crs_hw[0]);
+	smt_order = get_order(smt_size);
 
-	/* won't be sharing this again */
-	kvm_unshare_hyp(smmu, smmu + 1);
+	smmu->smrs_shadow = (void *)__get_free_pages(GFP_KERNEL | __GFP_ZERO, smt_order);
+	if (smmu->smrs_shadow == NULL) {
+		ret = -ENOMEM;
+		seq_printf(m, "<Out of memory allocating pages for stream mapping table>\n");
+		goto exit_with_pages;
+	}
 
+	smmu->s2crs_shadow = (void *)(smmu->smrs_shadow + smmu->num_mapping_groups);
+	smmu->smrs_hw = (void *)(smmu->s2crs_shadow + smmu->num_mapping_groups);
+	smmu->s2crs_hw = (void *)(smmu->smrs_hw + smmu->num_mapping_groups);
+
+	ret = kvm_smmu_export_smt(hyp_drv_id, smmu_id, smmu->smrs_shadow, smt_size);
 	if (ret) {
-		seq_printf(m, "<Error %d exporting device structure>\n", ret);
+		seq_printf(m, "<Error %d exporting stream mapping table>\n", ret);
 		goto exit_with_pages;
 	}
 
@@ -71,31 +201,21 @@ static int kvm_smmu_host_device_show(struct seq_file *m, void *unused)
 	seq_printf(m, "context_map[0]: %lx\n", smmu->context_map[0]);
 	seq_printf(m, "context_map[1]: %lx\n", smmu->context_map[1]);
 	seq_printf(m, "cb_state:\n");
-	seq_printf(m, "    | domain_id |     cbar |      tcr |     vtcr |         ttbr0_s2 |         ttbr1_s1 |    sctlr |  mair[0] |  mair[1] | vmid | active\n");
-	seq_printf(m, "====|===========|==========|==========|==========|==================|==================|==========|==========|==========|======|=======\n");
+	kvm_smmu_dump_cbs(m, smmu);
 
-	for (i = 0; i < smmu->num_context_banks; i++)
-	{
-		if (!smmu->cb_state[i].cbar)
-			continue;
+	seq_printf(m, "Stream mapping table (shadow):\n");
+	kvm_smmu_dump_smt(m, smmu->smrs_shadow, smmu->s2crs_shadow, smmu->num_mapping_groups);
 
-		seq_printf(m, "%3u |%10u |%9x |%9x |%9x |%17llx |%17llx |%9x |%9x |%9x |%5x | %u\n",
-			   i,
-			   smmu->cb_state[i].domain_id,
-			   smmu->cb_state[i].cbar,
-			   smmu->cb_state[i].tcr,
-			   smmu->cb_state[i].vtcr,
-			   smmu->cb_state[i].ttbr0_s2,
-			   smmu->cb_state[i].ttbr1_s1,
-			   smmu->cb_state[i].sctlr,
-			   smmu->cb_state[i].mair[0],
-			   smmu->cb_state[i].mair[1],
-			   smmu->cb_state[i].vmid,
-			   smmu->cb_state[i].active
-			  );
-	}
+	seq_printf(m, "Stream mapping table (hw):\n");
+	if (memcmp(smmu->smrs_shadow, smmu->smrs_hw,
+		   smmu->num_mapping_groups *
+			(sizeof(smmu->smrs_shadow[0]) + sizeof(smmu->s2crs_shadow[0]))) == 0)
+		tbl_printf(m, " < same as shadow >\n");
+	else
+		kvm_smmu_dump_smt(m, smmu->smrs_hw, smmu->s2crs_hw, smmu->num_mapping_groups);
 
 exit_with_pages:
+	free_pages((unsigned long)smmu->smrs_shadow, smt_order);
 	free_pages((unsigned long)smmu, smmu_order);
 	return ret;
 }
@@ -136,8 +256,7 @@ void kvm_smmu_host_create_debugfs(pkvm_handle_t hyp_drv_id, struct hyp_arm_smmu_
 
 	drv_dir->d_inode->i_private = (void *)(uintptr_t)hyp_drv_id;
 
-	for (i = 0; i < smmu_count; i++)
-	{
+	for (i = 0; i < smmu_count; i++) {
 		snprintf(dirname, sizeof(dirname), "%llx.smmu", smmus[i].mmio_addr);
 		smmu_dir = debugfs_create_dir(dirname, drv_dir);
 		if (IS_ERR_OR_NULL(drv_dir))
