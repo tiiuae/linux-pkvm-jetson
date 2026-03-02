@@ -2852,6 +2852,8 @@ static int smmu_v2_debug(pkvm_handle_t smmu_id, enum kvm_iommu_debug_ops op, voi
 			 size_t out_sz)
 {
 	struct hyp_arm_smmu_v2_device *smmu;
+	size_t smt_size, array_size;
+	u8 *outp = out;
 	int ret;
 
 	if (smmu_id >= kvm_hyp_arm_smmu_v2_count) {
@@ -2877,6 +2879,33 @@ static int smmu_v2_debug(pkvm_handle_t smmu_id, enum kvm_iommu_debug_ops op, voi
 		}
 
 		memcpy(out, smmu, offsetof(struct hyp_arm_smmu_v2_device, smrs_shadow));
+		break;
+	case PKVM_IOMMU_DEBUG_EXPORT_SMT:
+		smt_size = smmu->num_mapping_groups * sizeof(smmu->smrs_shadow[0]);
+		smt_size += smmu->num_mapping_groups * sizeof(smmu->s2crs_shadow[0]);
+		smt_size += smmu->num_mapping_groups * sizeof(smmu->smrs_hw[0]);
+		smt_size += smmu->num_mapping_groups * sizeof(smmu->s2crs_hw[0]);
+
+		if (out_sz < smt_size) {
+			ret = -ENOMEM;
+			break;
+		}
+
+		array_size = smmu->num_mapping_groups * sizeof(smmu->smrs_shadow[0]);
+		memcpy(outp, smmu->smrs_shadow, array_size);
+		outp += array_size;
+
+		array_size = smmu->num_mapping_groups * sizeof(smmu->s2crs_shadow[0]);
+		memcpy(outp, smmu->s2crs_shadow, array_size);
+		outp += array_size;
+
+		array_size = smmu->num_mapping_groups * sizeof(smmu->smrs_hw[0]);
+		memcpy(outp, smmu->smrs_hw, array_size);
+		outp += array_size;
+
+		array_size = smmu->num_mapping_groups * sizeof(smmu->s2crs_hw[0]);
+		memcpy(outp, smmu->s2crs_hw, array_size);
+		outp += array_size;
 		break;
 	default:
 		ret = -EOPNOTSUPP;
