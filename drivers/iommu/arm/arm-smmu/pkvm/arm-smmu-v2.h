@@ -90,16 +90,6 @@ struct sid_assignment {
 };
 
 /*
- * Domain Private State
- * Per-domain state for SMMUv2 IOMMU domains
- */
-struct smmu_v2_domain {
-	struct hyp_arm_smmu_v2_device	*smmu;	/* SMMU instance */
-	u8				cb_idx;	/* Context bank index */
-	struct io_pgtable_ops		*pgtbl_ops; /* Page table operations */
-};
-
-/*
  * Note: struct hyp_arm_smmu_v2_device is now defined in arm-smmu-v2-shared.h
  * to ensure EL1/EL2 compatibility.
  */
@@ -150,32 +140,7 @@ int smmu_v2_handle_cb(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 		      bool is_write, u64 *val);
 
 /* Context bank management */
-u8 smmu_v2_alloc_context_bank(struct hyp_arm_smmu_v2_device *smmu);
-void smmu_v2_free_context_bank(struct hyp_arm_smmu_v2_device *smmu, u8 idx);
-int smmu_v2_init_context_bank(struct hyp_arm_smmu_v2_device *smmu,
-			       struct kvm_hyp_iommu_domain *domain, u8 cb_idx);
-
-/* Stream mapping */
-int smmu_v2_map_stream(struct hyp_arm_smmu_v2_device *smmu, u32 sid, u8 cb_idx);
-int smmu_v2_unmap_stream(struct hyp_arm_smmu_v2_device *smmu, u32 sid);
-
-/* Domain operations */
-int smmu_v2_alloc_domain(pkvm_handle_t iommu_id, struct kvm_hyp_iommu_domain *domain, int type);
-void smmu_v2_free_domain(struct kvm_hyp_iommu_domain *domain);
-
-/* Device lifecycle */
-int smmu_v2_attach_dev(pkvm_handle_t iommu_id, struct kvm_hyp_iommu_domain *domain,
-		       pkvm_handle_t endpoint_id, u32 pasid, u32 pasid_bits, unsigned long flags);
-int smmu_v2_detach_dev(pkvm_handle_t iommu_id, struct kvm_hyp_iommu_domain *domain,
-		       pkvm_handle_t endpoint_id, u32 pasid);
-
-/* Page table operations */
-int smmu_v2_map_pages(struct kvm_hyp_iommu_domain *domain, unsigned long iova,
-		      phys_addr_t paddr, size_t pgsize, size_t pgcount, int prot, size_t *total_mapped);
-size_t smmu_v2_unmap_pages(struct kvm_hyp_iommu_domain *domain, unsigned long iova,
-			   size_t pgsize, size_t pgcount, struct iommu_iotlb_gather *gather);
-phys_addr_t smmu_v2_iova_to_phys(struct kvm_hyp_iommu_domain *domain, unsigned long iova);
-void smmu_v2_iotlb_sync(struct kvm_hyp_iommu_domain *domain, struct iommu_iotlb_gather *gather);
+int smmu_v2_init_s2_context_bank(struct hyp_arm_smmu_v2_device *smmu, u8 cb_idx);
 
 /* TLB operations */
 void smmu_v2_tlb_inv_context(struct hyp_arm_smmu_v2_device *smmu, u8 cb_idx);
@@ -183,6 +148,9 @@ void smmu_v2_tlb_inv_range(struct hyp_arm_smmu_v2_device *smmu, u8 cb_idx,
 			   unsigned long iova, size_t size, size_t granule);
 int smmu_v2_tlb_sync_global(struct hyp_arm_smmu_v2_device *smmu);
 int smmu_v2_tlb_sync_context(struct hyp_arm_smmu_v2_device *smmu, u8 cb_idx);
+
+/* SID tracking */
+struct sid_assignment *smmu_v2_lookup_sid(u32 sid);
 
 /* Dual-base operations (Tegra234 niso0/niso1) */
 static inline void smmu_writel(struct hyp_arm_smmu_v2_device *smmu,
@@ -212,52 +180,4 @@ static inline u64 smmu_readq(struct hyp_arm_smmu_v2_device *smmu,
 {
 	return readq_relaxed(smmu->base + page + offset);
 }
-
-/* Read TLB sync status from all bases (OR together for niso0/niso1) */
-static inline u32 smmu_tlb_sync_status(struct hyp_arm_smmu_v2_device *smmu,
-					u32 page, u32 offset)
-{
-	u32 val = readl_relaxed(smmu->base + page + offset);
-	if (smmu->has_secondary_base)
-		val |= readl_relaxed(smmu->base_sec + page + offset);
-	return val;
-}
-
-/* SID tracking */
-int smmu_v2_assign_sid(u32 smmu_id, u32 sid, u32 client_id, pkvm_handle_t domain_id);
-int smmu_v2_release_sid(u32 smmu_id, u32 sid);
-struct sid_assignment *smmu_v2_lookup_sid(u32 sid);
-
-/*
- * MC integration
- *
- * MC functions have been moved to drivers/memory/tegra/pkvm/tegra234-mc.h.
- * The MC module registers with SMMU via platform hooks (smmu-platform.h).
- */
-
-/* Helper functions */
-static inline struct hyp_arm_smmu_v2_device *smmu_v2_find_by_mmio_addr(u64 addr)
-{
-	int i;
-	for (i = 0; i < kvm_hyp_arm_smmu_v2_count; i++) {
-		struct hyp_arm_smmu_v2_device *smmu = &kvm_hyp_arm_smmu_v2_smmus[i];
-
-		/* Check primary base */
-		if (addr >= smmu->mmio_addr && addr < smmu->mmio_addr + smmu->mmio_size)
-			return smmu;
-
-		/* Check secondary base if present */
-		if (smmu->has_secondary_base &&
-		    addr >= smmu->mmio_addr_sec && addr < smmu->mmio_addr_sec + smmu->mmio_size)
-			return smmu;
-	}
-	return NULL;
-}
-
-static inline u8 smmu_v2_cb_offset_to_idx(struct hyp_arm_smmu_v2_device *smmu, u32 offset)
-{
-	/* CB pages start after GR0 (page 0) and GR1 (page 1) */
-	return (offset >> smmu->pgshift) - 2;
-}
-
 #endif /* __ARM_SMMU_V2_HYP_H */
