@@ -24,7 +24,7 @@ void hyp_putc(char c);
  *   %lld/%llu - 64-bit decimal (long long)
  *   %zu/%zd - size_t/ssize_t (decimal)
  *   %zx  - size_t (hex)
- *   %p   - pointer (hex with 0x prefix)
+ *   %p   - pointer (hex without prefix)
  *   %c   - character
  *   %%   - literal %
  */
