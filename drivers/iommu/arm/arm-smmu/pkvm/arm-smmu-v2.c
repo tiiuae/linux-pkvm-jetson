@@ -2847,6 +2847,76 @@ static bool smmu_v2_dabt_handler(struct user_pt_regs *regs, u64 esr, u64 addr)
 	return handled;
 }
 
+#ifdef CONFIG_ARM_SMMU_V2_PKVM_DEBUGFS
+static int smmu_v2_debug(pkvm_handle_t smmu_id, enum kvm_iommu_debug_ops op, void *out,
+			 size_t out_sz)
+{
+	struct hyp_arm_smmu_v2_device *smmu;
+	size_t smt_size, array_size;
+	u8 *outp = out;
+	int ret;
+
+	if (smmu_id >= kvm_hyp_arm_smmu_v2_count) {
+		hyp_err("SMMU: Invalid smmu_id %u (max %zu)\n", smmu_id,
+			kvm_hyp_arm_smmu_v2_count - 1);
+		return -EINVAL;
+	}
+
+	smmu = &kvm_hyp_arm_smmu_v2_smmus[smmu_id];
+
+	ret = hyp_pin_shared_mem(out, out + out_sz);
+	if (ret) {
+		hyp_err("SMMU: Failed to pin shared memory\n");
+		return ret;
+	}
+
+	switch(op)
+	{
+	case PKVM_IOMMU_DEBUG_EXPORT_DEVICE:
+		if (out_sz < sizeof(*smmu)) {
+			ret = -ENOMEM;
+			break;
+		}
+
+		memcpy(out, smmu, offsetof(struct hyp_arm_smmu_v2_device, smrs_shadow));
+		break;
+	case PKVM_IOMMU_DEBUG_EXPORT_SMT:
+		smt_size = smmu->num_mapping_groups * sizeof(smmu->smrs_shadow[0]);
+		smt_size += smmu->num_mapping_groups * sizeof(smmu->s2crs_shadow[0]);
+		smt_size += smmu->num_mapping_groups * sizeof(smmu->smrs_hw[0]);
+		smt_size += smmu->num_mapping_groups * sizeof(smmu->s2crs_hw[0]);
+
+		if (out_sz < smt_size) {
+			ret = -ENOMEM;
+			break;
+		}
+
+		array_size = smmu->num_mapping_groups * sizeof(smmu->smrs_shadow[0]);
+		memcpy(outp, smmu->smrs_shadow, array_size);
+		outp += array_size;
+
+		array_size = smmu->num_mapping_groups * sizeof(smmu->s2crs_shadow[0]);
+		memcpy(outp, smmu->s2crs_shadow, array_size);
+		outp += array_size;
+
+		array_size = smmu->num_mapping_groups * sizeof(smmu->smrs_hw[0]);
+		memcpy(outp, smmu->smrs_hw, array_size);
+		outp += array_size;
+
+		array_size = smmu->num_mapping_groups * sizeof(smmu->s2crs_hw[0]);
+		memcpy(outp, smmu->s2crs_hw, array_size);
+		outp += array_size;
+		break;
+	default:
+		ret = -EOPNOTSUPP;
+		break;
+	}
+
+	hyp_unpin_shared_mem(out, out + out_sz);
+	return ret;
+}
+#endif
+
 /*
  * IOMMU Operations Structure
  *
@@ -2861,4 +2931,7 @@ struct kvm_iommu_ops smmu_v2_ops = {
 	.init			= smmu_v2_global_init,
 	.host_stage2_idmap	= smmu_v2_host_stage2_idmap,
 	.dabt_handler		= smmu_v2_dabt_handler,
+#ifdef CONFIG_ARM_SMMU_V2_PKVM_DEBUGFS
+	.debug			= smmu_v2_debug,
+#endif
 };

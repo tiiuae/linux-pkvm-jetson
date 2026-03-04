@@ -1934,6 +1934,21 @@ static void handle___pkvm_mc_register_sid(struct kvm_cpu_context *host_ctxt)
 }
 #endif
 
+#ifdef CONFIG_ARM_SMMU_V2_PKVM_DEBUGFS
+static void handle___pkvm_host_iommu_debug(struct kvm_cpu_context *host_ctxt)
+{
+	int ret;
+	DECLARE_REG(pkvm_handle_t, drv_id, host_ctxt, 1);
+	DECLARE_REG(pkvm_handle_t, smmu_id, host_ctxt, 2);
+	DECLARE_REG(enum kvm_iommu_debug_ops, op, host_ctxt, 3);
+	DECLARE_REG(void *, out, host_ctxt, 4);
+	DECLARE_REG(size_t, out_sz, host_ctxt, 5);
+
+	ret = kvm_iommu_debug(drv_id, smmu_id, op, kern_hyp_va(out), out_sz);
+	hyp_reqs_smccc_encode(ret, host_ctxt, this_cpu_ptr(&host_hyp_reqs));
+}
+#endif
+
 typedef void (*hcall_t)(struct kvm_cpu_context *);
 
 #define HANDLE_FUNC(x)	[__KVM_HOST_SMCCC_FUNC_##x] = (hcall_t)handle_##x
@@ -2023,6 +2038,9 @@ static const hcall_t host_hcall[] = {
 	HANDLE_FUNC(__pkvm_pviommu_add_vsid),
 #ifdef CONFIG_ARM_SMMU_V2_PKVM
 	HANDLE_FUNC(__pkvm_mc_register_sid),
+#endif
+#ifdef CONFIG_ARM_SMMU_V2_PKVM_DEBUGFS
+	HANDLE_FUNC(__pkvm_host_iommu_debug),
 #endif
 };
 
