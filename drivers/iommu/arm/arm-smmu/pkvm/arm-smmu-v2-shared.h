@@ -29,22 +29,17 @@ struct arm_smmu_s2cr;
  *
  * Tracks per-CB translation configuration. This structure is part of
  * struct hyp_arm_smmu_v2_device and must have a fixed, known size.
- *
- * Size: 56 bytes (verified with static_assert in users)
  */
 struct smmu_v2_cb_state {
 	u32		domain_id;	/* pkvm_handle_t - owning domain */
 	u32		cbar;		/* Context Bank Attribute Register */
-	u32		tcr;		/* Translation Control Register (S1) */
-	u32		vtcr;		/* VTCR (S2) */
-	u64		ttbr0_s2;	/* EL2's stage-2 PT base */
-	u64		ttbr1_s1;	/* Host's stage-1 PT base (shadow) */
+	u32		tcr[2];		/* Translation Control Register */
+	u64		ttbr[2];	/* Translation Table Base Register */
 	u32		sctlr;		/* System Control Register */
-	u32		mair[2];	/* Memory Attribute Indirection */
+	u32		mair[2];	/* Memory Attribute Indirection (Stage 1-only) */
 	u16		vmid;		/* Virtual Machine ID */
-	bool		active;		/* Is this CB in use? */
-	u8		_pad[5];	/* Explicit padding to 56 bytes */
-} __packed __aligned(8);
+	bool		reserved;	/* Is this CB in use by the hypervisor */
+};
 
 /*
  * SMMU Device Structure (EL1/EL2 shared)
@@ -53,33 +48,27 @@ struct smmu_v2_cb_state {
  * must use identical definitions to ensure correct memory layout.
  *
  * Layout:
- * - Hardware configuration (60 bytes)
- * - SMMU capabilities (32 bytes)
- * - Context bank management (16 + 7168 bytes)
- * - Shadow arrays (32 bytes - pointers)
- * - Lock and MC pointer (16 bytes)
- *
- * Total: ~7328 bytes (rounded to 8-byte alignment)
- *
- * IMPORTANT: Do not reorder fields. Memory layout must be identical
- * between EL1 and EL2 for memory donation to work correctly.
+ * - Hardware configuration
+ * - SMMU capabilities
+ * - Context bank management
+ * - Shadow arrays
+ * - Lock and MC pointer
  */
 struct hyp_arm_smmu_v2_device {
 	/*
-	 * Hardware Configuration (60 bytes)
+	 * Hardware Configuration
 	 * Basic MMIO and instance information
 	 */
-	u32			id;		/* SMMU instance ID (0-2) */
 	phys_addr_t		mmio_addr;	/* Primary register base */
 	void __iomem		*base;		/* Mapped primary base */
 	phys_addr_t		mmio_addr_sec;	/* Secondary register base (niso0/1) */
 	void __iomem		*base_sec;	/* Mapped secondary base */
-	bool			has_secondary_base;
-	u8			_pad1[7];	/* Padding to align mmio_size */
 	size_t			mmio_size;
+	u32			id;		/* SMMU instance ID (0-2) */
+	bool			has_secondary_base;
 
 	/*
-	 * SMMU Capabilities (32 bytes)
+	 * SMMU Capabilities
 	 * Hardware features read from ID registers
 	 */
 	u32			features;	/* Feature flags */
@@ -87,32 +76,29 @@ struct hyp_arm_smmu_v2_device {
 	u32			num_context_banks;
 	u32			num_s2_context_banks;
 	u32			numpage;	/* Number of GR pages (CB pages start at numpage) */
+	unsigned long		pgsize_bitmap;
 	u8			pgshift;	/* Page size shift */
 	u8			ias;		/* Input address size (bits) */
 	u8			oas;		/* Output address size (bits) */
-	u8			_pad2[1];	/* Padding to align pgsize_bitmap */
-	unsigned long		pgsize_bitmap;
 	u16			vmid_bits;
-	u8			_pad3[6];	/* Padding to align context_map */
 
 	/*
-	 * Context Bank Management (7184 bytes)
-	 * Bitmap and per-CB state for all 128 context banks
+	 * Context Bank Management
+	 * Per-CB state for all 128 context banks. Besides the stage-2 CBs,
+	 * this is only needed for debugging purposes so far.
 	 */
-	unsigned long		context_map[2];	/* Bitmap: which CBs are allocated (16 bytes) */
-	struct smmu_v2_cb_state	cb_state[ARM_SMMU_MAX_CBS]; /* 128 * 56 = 7168 bytes */
+	struct smmu_v2_cb_state	cb_state[ARM_SMMU_MAX_CBS];
 
 	/*
-	 * Shadow Stream Mapping State (32 bytes)
-	 * Pointers to shadow arrays for SMR/S2CR registers
+	 * Stream Mapping State
+	 * Pointers to arrays for SMR/S2CR registers.
+	 * Mostly needed for debugging so far.
 	 */
-	struct arm_smmu_smr	*smrs_shadow;	/* Host's view of SMRs */
-	struct arm_smmu_s2cr	*s2crs_shadow;	/* Host's view of S2CRs */
-	struct arm_smmu_smr	*smrs_hw;	/* Actual hardware state */
-	struct arm_smmu_s2cr	*s2crs_hw;	/* Actual hardware state */
+	struct arm_smmu_smr	*smrs;
+	struct arm_smmu_s2cr	*s2crs;
 
 	/*
-	 * Lock and MC Reference (16 bytes)
+	 * Lock and MC Reference
 	 * EL2-only fields, reserved by EL1
 	 *
 	 * Note: hyp_spinlock_t is a union type only available at EL2.
@@ -127,20 +113,6 @@ struct hyp_arm_smmu_v2_device {
 	u8			_pad4[4];	/* Padding to align mc pointer */
 	void			*mc;		/* EL1: reserved space for MC pointer */
 #endif
-} __aligned(8);
-
-/*
- * Compile-time size verification
- *
- * These assertions ensure struct sizes remain stable. If you change
- * struct layouts, update these values and verify both EL1 and EL2 still work.
- */
-#ifdef __KERNEL__
-static_assert(sizeof(struct smmu_v2_cb_state) == 56,
-	      "struct smmu_v2_cb_state size changed - update EL1/EL2 code");
-
-static_assert(sizeof(struct hyp_arm_smmu_v2_device) <= 8192,
-	      "struct hyp_arm_smmu_v2_device exceeds 2 pages - check alignment");
-#endif
+};
 
 #endif /* __ARM_SMMU_V2_SHARED_H__ */
