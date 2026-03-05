@@ -562,7 +562,6 @@ int smmu_v2_reset(struct hyp_arm_smmu_v2_device *smmu)
 
 	/* 7. Write final sCR0 value to enable SMMU */
 	smmu_writel(smmu, ARM_SMMU_GR0, ARM_SMMU_GR0_sCR0, scr0);
-
 	return 0;
 }
 
@@ -769,63 +768,43 @@ int smmu_v2_init(struct hyp_arm_smmu_v2_device *smmu)
 		size_t smr_size = smmu->num_mapping_groups * sizeof(struct arm_smmu_smr);
 		size_t s2cr_size = smmu->num_mapping_groups * sizeof(struct arm_smmu_s2cr);
 
-		smmu->smrs_shadow = kvm_iommu_donate_pages_atomic(get_order(smr_size));
-		if (!smmu->smrs_shadow) {
-			smmu_err(smmu, "Failed to allocate smrs_shadow (%zu bytes)", smr_size);
+		smmu->smrs = kvm_iommu_donate_pages_atomic(get_order(smr_size));
+		if (!smmu->smrs) {
+			smmu_err(smmu, "Failed to allocate smrs (%zu bytes)", smr_size);
 			return -ENOMEM;
 		}
 
-		smmu->s2crs_shadow = kvm_iommu_donate_pages_atomic(get_order(s2cr_size));
-		if (!smmu->s2crs_shadow) {
-			smmu_err(smmu, "Failed to allocate s2crs_shadow (%zu bytes)", s2cr_size);
+		smmu->s2crs = kvm_iommu_donate_pages_atomic(get_order(s2cr_size));
+		if (!smmu->s2crs) {
+			smmu_err(smmu, "Failed to allocate s2crs (%zu bytes)", s2cr_size);
 			return -ENOMEM;
 		}
 
-		smmu->smrs_hw = kvm_iommu_donate_pages_atomic(get_order(smr_size));
-		if (!smmu->smrs_hw) {
-			smmu_err(smmu, "Failed to allocate smrs_hw (%zu bytes)", smr_size);
-			return -ENOMEM;
-		}
-
-		smmu->s2crs_hw = kvm_iommu_donate_pages_atomic(get_order(s2cr_size));
-		if (!smmu->s2crs_hw) {
-			smmu_err(smmu, "Failed to allocate s2crs_hw (%zu bytes)", s2cr_size);
-			return -ENOMEM;
-		}
-
-		smmu_info(smmu, "Allocated shadow arrays (%u entries, %zu bytes each)",
+		smmu_info(smmu, "Allocated stream mapping arrays (%u entries, %zu bytes each)",
 			  smmu->num_mapping_groups, smr_size + s2cr_size);
 	}
 
-	/* Initialize context bank bitmap (all free initially) */
-	bitmap_zero(smmu->context_map, ARM_SMMU_MAX_CBS);
-
 	/* Initialize context bank state (all inactive) */
 	for (i = 0; i < ARM_SMMU_MAX_CBS; i++) {
-		smmu->cb_state[i].active = false;
+		smmu->cb_state[i].reserved = false;
 		smmu->cb_state[i].domain_id = 0;
 	}
 
-	/* Initialize shadow SMR arrays to invalid/fault state */
+	/* Initialize stream mapping arrays to invalid/fault state */
 	for (i = 0; i < smmu->num_mapping_groups; i++) {
-		/* Shadow state: what host thinks is programmed */
-		smmu->smrs_shadow[i].valid = false;
-		smmu->smrs_shadow[i].id = 0;
-		smmu->smrs_shadow[i].mask = 0;
+		smmu->smrs[i].valid = false;
+		smmu->smrs[i].id = 0;
+		smmu->smrs[i].mask = 0;
 
 		/*
-		 * S2CR shadow: bypass mode by default to preserve bootloader mappings.
+		 * Bypass mode by default to preserve bootloader mappings.
 		 * This allows devices initialized by firmware (display, etc.) to
 		 * continue working until they get properly attached to domains.
 		 */
-		smmu->s2crs_shadow[i].type = S2CR_TYPE_BYPASS;
-		smmu->s2crs_shadow[i].cbndx = 0;
-		smmu->s2crs_shadow[i].privcfg = 0;
-		smmu->s2crs_shadow[i].bypass = true;
-
-		/* Hardware state: initially same as shadow */
-		smmu->smrs_hw[i] = smmu->smrs_shadow[i];
-		smmu->s2crs_hw[i] = smmu->s2crs_shadow[i];
+		smmu->s2crs[i].type = S2CR_TYPE_BYPASS;
+		smmu->s2crs[i].cbndx = 0;
+		smmu->s2crs[i].privcfg = 0;
+		smmu->s2crs[i].bypass = true;
 	}
 
 	/* Reset and configure hardware */
@@ -851,8 +830,8 @@ int smmu_v2_init(struct hyp_arm_smmu_v2_device *smmu)
  * Key register types:
  * - ID registers (IDR0-IDR7): Read-only capability reporting
  * - sCR0: Global control (enable/disable, fault reporting)
- * - SMR: Stream match configuration (shadowed)
- * - S2CR: Stream-to-context mapping (shadowed, enforces Stage-2)
+ * - SMR: Stream match configuration
+ * - S2CR: Stream-to-context mapping (enforces Stage-2)
  * - TLB operations: Wire to existing TLB implementations
  */
 int smmu_v2_handle_gr0(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
@@ -981,24 +960,21 @@ int smmu_v2_handle_gr0(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 		if (is_write) {
 			val32 = (u32)*val;
 
-			/* Update shadow state (what host thinks it programmed) */
-			smmu->smrs_shadow[idx].valid = !!(val32 & ARM_SMMU_SMR_VALID);
-			smmu->smrs_shadow[idx].mask = FIELD_GET(ARM_SMMU_SMR_MASK, val32);
-			smmu->smrs_shadow[idx].id = FIELD_GET(ARM_SMMU_SMR_ID, val32);
+			/* Update shadow state */
+			smmu->smrs[idx].valid = !!(val32 & ARM_SMMU_SMR_VALID);
+			smmu->smrs[idx].mask = FIELD_GET(ARM_SMMU_SMR_MASK, val32);
+			smmu->smrs[idx].id = FIELD_GET(ARM_SMMU_SMR_ID, val32);
 
 			/* Write through to hardware (no modification needed for SMR) */
 			smmu_writel(smmu, ARM_SMMU_GR0, offset, val32);
-
-			/* Update hardware state tracking */
-			smmu->smrs_hw[idx] = smmu->smrs_shadow[idx];
 			return 0;
 		} else {
-			/* Return shadow state (what host thinks hardware has) */
+			/* Return shadow state */
 			val32 = 0;
-			if (smmu->smrs_shadow[idx].valid)
+			if (smmu->smrs[idx].valid)
 				val32 |= ARM_SMMU_SMR_VALID;
-			val32 |= FIELD_PREP(ARM_SMMU_SMR_MASK, smmu->smrs_shadow[idx].mask);
-			val32 |= FIELD_PREP(ARM_SMMU_SMR_ID, smmu->smrs_shadow[idx].id);
+			val32 |= FIELD_PREP(ARM_SMMU_SMR_MASK, smmu->smrs[idx].mask);
+			val32 |= FIELD_PREP(ARM_SMMU_SMR_ID, smmu->smrs[idx].id);
 			*val = val32;
 			return 0;
 		}
@@ -1008,32 +984,39 @@ int smmu_v2_handle_gr0(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 	if (offset >= ARM_SMMU_GR0_S2CR(0) &&
 	    offset < ARM_SMMU_GR0_S2CR(0) + (smmu->num_mapping_groups * 4)) {
 		u32 idx = (offset - ARM_SMMU_GR0_S2CR(0)) >> 2;
-		u8 requested_type;
-
 		if (idx >= smmu->num_mapping_groups)
 			return -EINVAL;
 
 		if (is_write) {
 			val32 = (u32)*val;
-			requested_type = FIELD_GET(ARM_SMMU_S2CR_TYPE, val32);
 
 			/* Update shadow state */
-			smmu->s2crs_shadow[idx].type = requested_type;
-			smmu->s2crs_shadow[idx].cbndx = FIELD_GET(ARM_SMMU_S2CR_CBNDX, val32);
-			smmu->s2crs_shadow[idx].privcfg = FIELD_GET(ARM_SMMU_S2CR_PRIVCFG, val32);
-			smmu->s2crs_shadow[idx].bypass = (requested_type == S2CR_TYPE_BYPASS);
+			smmu->s2crs[idx].type = FIELD_GET(ARM_SMMU_S2CR_TYPE, val32);
+			smmu->s2crs[idx].cbndx = FIELD_GET(ARM_SMMU_S2CR_CBNDX, val32);
+			smmu->s2crs[idx].privcfg = FIELD_GET(ARM_SMMU_S2CR_PRIVCFG, val32);
+			smmu->s2crs[idx].bypass = (smmu->s2crs[idx].type == S2CR_TYPE_BYPASS);
+
+			/* We don't allow bypass */
+			if (smmu->s2crs[idx].type == S2CR_TYPE_BYPASS) {
+				val32 &= ~ARM_SMMU_S2CR_TYPE;
+				val32 |= FIELD_PREP(ARM_SMMU_S2CR_TYPE, S2CR_TYPE_FAULT);
+
+				/* And let .bypass indicate that we modified this */
+				smmu->s2crs[idx].type = FIELD_GET(ARM_SMMU_S2CR_TYPE, val32);
+			}
 
 			/* Write through to hardware */
 			smmu_writel(smmu, ARM_SMMU_GR0, offset, val32);
-
-			/* Update hardware state tracking */
-			smmu->s2crs_hw[idx] = smmu->s2crs_shadow[idx];
 			return 0;
 		} else {
-			/* Return shadow state */
-			val32 = FIELD_PREP(ARM_SMMU_S2CR_TYPE, smmu->s2crs_shadow[idx].type);
-			val32 |= FIELD_PREP(ARM_SMMU_S2CR_CBNDX, smmu->s2crs_shadow[idx].cbndx);
-			val32 |= FIELD_PREP(ARM_SMMU_S2CR_PRIVCFG, smmu->s2crs_shadow[idx].privcfg);
+			/* Return shadow state; let the host think this is set to bypass */
+			if (smmu->s2crs[idx].bypass)
+				val32 = FIELD_PREP(ARM_SMMU_S2CR_TYPE, S2CR_TYPE_BYPASS);
+			else
+				val32 = FIELD_PREP(ARM_SMMU_S2CR_TYPE, smmu->s2crs[idx].type);
+
+			val32 |= FIELD_PREP(ARM_SMMU_S2CR_CBNDX, smmu->s2crs[idx].cbndx);
+			val32 |= FIELD_PREP(ARM_SMMU_S2CR_PRIVCFG, smmu->s2crs[idx].privcfg);
 			*val = val32;
 			return 0;
 		}
@@ -1075,7 +1058,7 @@ int smmu_v2_handle_gr1(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 			return -EINVAL;
 
 		/* Deny access to S2-only CBs; we can probably also return -EINVAL here */
-		if (cb_idx < NUMS2CB || smmu->cb_state[cb_idx].active) {
+		if (cb_idx < NUMS2CB || smmu->cb_state[cb_idx].reserved) {
 			*val = 0;
 			return 0;
 		}
@@ -1091,7 +1074,7 @@ int smmu_v2_handle_gr1(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 			}
 
 			/* Force it through a stage 2 translation */
-			if (smmu->cb_state[S2CBNDX].active &&
+			if (smmu->cb_state[S2CBNDX].reserved &&
 			    cbar_type == CBAR_TYPE_S1_TRANS_S2_BYPASS) {
 				val32 &= ~ARM_SMMU_CBAR_TYPE;
 				val32 |= FIELD_PREP(ARM_SMMU_CBAR_TYPE, CBAR_TYPE_S1_TRANS_S2_TRANS);
@@ -1178,7 +1161,7 @@ int smmu_v2_handle_gr1(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
  * Emulates context bank register accesses for translation control.
  * Key register types:
  * - SCTLR: System control (MMU enable, fault handling)
- * - TTBR0/TTBR1: Translation table base registers
+ * - TTBR: Translation table base registers
  * - TCR/TCR2: Translation control registers
  * - MAIR: Memory attribute indirection registers
  * - FSR/FAR/FSYNR0: Fault status and address registers
@@ -1209,7 +1192,7 @@ int smmu_v2_handle_cb(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 	 * so just ingore and return 0. The kernel shouldn't be trying to configure
 	 * them anyway (even though it does).
 	 */
-	if (cb_idx < NUMS2CB || smmu->cb_state[cb_idx].active) {
+	if (cb_idx < NUMS2CB || smmu->cb_state[cb_idx].reserved) {
 		*val = 0;
 		return 0;
 	}
@@ -1237,7 +1220,7 @@ int smmu_v2_handle_cb(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 			val32 = (u32)*val;
 
 			/* Store in shadow state */
-			smmu->cb_state[cb_idx].tcr = val32;
+			smmu->cb_state[cb_idx].tcr[0] = val32;
 
 			/* Write to hardware */
 			smmu_writel(smmu, cb_base, cb_offset, val32);
@@ -1253,9 +1236,8 @@ int smmu_v2_handle_cb(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 		if (is_write) {
 			val32 = (u32)*val;
 
-			/* TODO: rename to tcr2 */
 			/* Store in shadow state */
-			smmu->cb_state[cb_idx].vtcr = val32;
+			smmu->cb_state[cb_idx].tcr[1] = val32;
 
 			/*
 			 * For Stage-2-only context banks, TCR2 is not used.
@@ -1274,8 +1256,7 @@ int smmu_v2_handle_cb(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 		if (is_write) {
 			val64 = *val;
 
-			/* TODO: rename to ttbr[] */
-			smmu->cb_state[cb_idx].ttbr0_s2 = val64;
+			smmu->cb_state[cb_idx].ttbr[0] = val64;
 
 			/* Host/bypass domains: write through */
 			smmu_writeq(smmu, cb_base, cb_offset, val64);
@@ -1291,7 +1272,7 @@ int smmu_v2_handle_cb(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 		if (is_write) {
 			val64 = *val;
 
-			smmu->cb_state[cb_idx].ttbr1_s1 = val64;
+			smmu->cb_state[cb_idx].ttbr[1] = val64;
 
 			/*
 			 * TTBR1 is only used in Stage-1 translation.
@@ -1555,7 +1536,7 @@ int smmu_v2_init_s2_context_bank(struct hyp_arm_smmu_v2_device *smmu, u8 cb_idx)
 	struct smmu_v2_cb_state *cb;
 	struct io_pgtable_cfg *pgt_cfg;
 	u32 cbar, tcr, sctlr, cb_page;
-	u64 ttbr0;
+	u64 ttbr;
 
 	if (WARN_ON(!idmap_pgtable))
 		return -EINVAL;
@@ -1589,9 +1570,9 @@ int smmu_v2_init_s2_context_bank(struct hyp_arm_smmu_v2_device *smmu, u8 cb_idx)
 	      FIELD_PREP(ARM_SMMU_VTCR_T0SZ, pgt_cfg->arm_lpae_s2_cfg.vtcr.tsz);
 	smmu_writel(smmu, cb_page, ARM_SMMU_CB_TCR, tcr);
 
-	/* 3. Write TTBR0 with Stage-2 page table base address */
-	ttbr0 = pgt_cfg->arm_lpae_s2_cfg.vttbr;
-	smmu_writeq(smmu, cb_page, ARM_SMMU_CB_TTBR0, ttbr0);
+	/* 3. Write TTBR with Stage-2 page table base address */
+	ttbr = pgt_cfg->arm_lpae_s2_cfg.vttbr;
+	smmu_writeq(smmu, cb_page, ARM_SMMU_CB_TTBR0, ttbr);
 
 	/* 4. Enable translation by setting SCTLR.M bit */
 	sctlr = ARM_SMMU_SCTLR_M;        /* Enable MMU */
@@ -1604,11 +1585,11 @@ int smmu_v2_init_s2_context_bank(struct hyp_arm_smmu_v2_device *smmu, u8 cb_idx)
 	/* Update CB state tracking */
 	cb->domain_id = 0; /* Not used atm */
 	cb->cbar = cbar;
-	cb->tcr = tcr;
-	cb->ttbr0_s2 = ttbr0;
+	cb->tcr[0] = tcr;
+	cb->ttbr[0] = ttbr;
 	cb->sctlr = sctlr;
 	cb->vmid = 0; /* Not used atm */
-	cb->active = true;
+	cb->reserved = true;
 	return 0;
 }
 
@@ -2000,33 +1981,23 @@ static int smmu_v2_debug(pkvm_handle_t smmu_id, enum kvm_iommu_debug_ops op, voi
 			break;
 		}
 
-		memcpy(out, smmu, offsetof(struct hyp_arm_smmu_v2_device, smrs_shadow));
+		memcpy(out, smmu, offsetof(struct hyp_arm_smmu_v2_device, smrs));
 		break;
 	case PKVM_IOMMU_DEBUG_EXPORT_SMT:
-		smt_size = smmu->num_mapping_groups * sizeof(smmu->smrs_shadow[0]);
-		smt_size += smmu->num_mapping_groups * sizeof(smmu->s2crs_shadow[0]);
-		smt_size += smmu->num_mapping_groups * sizeof(smmu->smrs_hw[0]);
-		smt_size += smmu->num_mapping_groups * sizeof(smmu->s2crs_hw[0]);
+		smt_size = smmu->num_mapping_groups * sizeof(smmu->smrs[0]);
+		smt_size += smmu->num_mapping_groups * sizeof(smmu->s2crs[0]);
 
 		if (out_sz < smt_size) {
 			ret = -ENOMEM;
 			break;
 		}
 
-		array_size = smmu->num_mapping_groups * sizeof(smmu->smrs_shadow[0]);
-		memcpy(outp, smmu->smrs_shadow, array_size);
+		array_size = smmu->num_mapping_groups * sizeof(smmu->smrs[0]);
+		memcpy(outp, smmu->smrs, array_size);
 		outp += array_size;
 
-		array_size = smmu->num_mapping_groups * sizeof(smmu->s2crs_shadow[0]);
-		memcpy(outp, smmu->s2crs_shadow, array_size);
-		outp += array_size;
-
-		array_size = smmu->num_mapping_groups * sizeof(smmu->smrs_hw[0]);
-		memcpy(outp, smmu->smrs_hw, array_size);
-		outp += array_size;
-
-		array_size = smmu->num_mapping_groups * sizeof(smmu->s2crs_hw[0]);
-		memcpy(outp, smmu->s2crs_hw, array_size);
+		array_size = smmu->num_mapping_groups * sizeof(smmu->s2crs[0]);
+		memcpy(outp, smmu->s2crs, array_size);
 		outp += array_size;
 		break;
 	default:
