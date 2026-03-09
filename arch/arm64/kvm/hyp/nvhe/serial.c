@@ -116,7 +116,7 @@ void hyp_hex(u64 val)
 	if (!hyp_serial_enabled())
 		return;
 
-	for (i = 60; i >= 0 && ((val >> i) & 0xf) == 0; i -= 4);
+	for (i = 60; i >= 4 && ((val >> i) & 0xf) == 0; i -= 4);
 
 	for (; i >= 0; i -= 4) {
 		u8 digit = (val >> i) & 0xf;
@@ -134,7 +134,7 @@ void hyp_hex32(u32 val)
 	if (!hyp_serial_enabled())
 		return;
 
-	for (i = 28; i >= 0 && ((val >> i) & 0xf) == 0; i -= 4);
+	for (i = 28; i >= 4 && ((val >> i) & 0xf) == 0; i -= 4);
 
 	for (; i >= 0; i -= 4) {
 		u8 digit = (val >> i) & 0xf;
