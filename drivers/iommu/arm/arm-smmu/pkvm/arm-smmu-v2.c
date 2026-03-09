@@ -12,6 +12,7 @@
 #include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/io-pgtable.h>
+#include <linux/find.h>
 #include <asm/kvm_hyp.h>
 #include <asm/kvm_mmu.h>
 #include <nvhe/iommu.h>
@@ -61,9 +62,10 @@ struct sid_assignment sid_map[ARM_SMMU_MAX_SIDS];
 #define smmu_warn(smmu, fmt, ...) \
 	hyp_warn(DRV_PREFIX " %llx.smmu: " fmt, (smmu)->mmio_addr, ##__VA_ARGS__)
 
-/* CB 0 is used exclusively by hyp for stage 2 translation */
-#define S2CBNDX 0
-#define NUMS2CB 1
+/* CB 0 is used exclusively by hyp for host stage 2 translation */
+#define HOST_S2_CBNDX 0
+/* Statically reserved CBs for the hypervisor (so far only host stage 2) */
+#define NUM_RESERVED_CB 1
 
 /*
  * Platform Hooks
@@ -109,6 +111,7 @@ static struct io_pgtable *idmap_pgtable;
 /* GR0 Configuration Registers */
 #define ARM_SMMU_GR0_sCR0		0x0
 #define ARM_SMMU_sCR0_VMID16EN		BIT(31)
+#define ARM_SMMU_sCR0_SMCFCFG		BIT(21)
 #define ARM_SMMU_sCR0_BSU		GENMASK(15, 14)
 #define ARM_SMMU_sCR0_FB		BIT(13)
 #define ARM_SMMU_sCR0_PTM		BIT(12)
@@ -326,10 +329,10 @@ static struct io_pgtable *idmap_pgtable;
  */
 
 /**
- * arm_smmu_id_size_to_bits - Convert ID register size field to actual bits
+ * arm_smmu_id_size_to_bits() - Convert ID register size field to actual bits
  * @size: Size field from ID register (0-7)
  *
- * Returns: Actual address size in bits
+ * Return: Actual address size in bits
  */
 static int arm_smmu_id_size_to_bits(int size)
 {
@@ -356,13 +359,13 @@ static int arm_smmu_id_size_to_bits(int size)
  */
 
 /**
- * smmu_v2_probe_device - Read SMMU capabilities from hardware
+ * smmu_v2_probe_device() - Read SMMU capabilities from hardware
  * @smmu: SMMU device to probe
  *
  * Reads IDR registers to determine capabilities (number of context banks,
  * stream mapping groups, page sizes, coherent walk support, etc.)
  *
- * Returns: 0 on success, negative error code on failure
+ * Return: 0 on success, negative error code on failure
  */
 int smmu_v2_probe_device(struct hyp_arm_smmu_v2_device *smmu)
 {
@@ -436,6 +439,14 @@ int smmu_v2_probe_device(struct hyp_arm_smmu_v2_device *smmu)
 		return -ENODEV;
 	}
 
+	if (smmu->num_context_banks > ARM_SMMU_MAX_CBS) {
+		/*
+		 * Can't support that right now; we could make cb-related fields
+		 * dynamically allocated if we wanted to.
+		 */
+		return -ENODEV;
+	}
+
 	/* ID2: Address sizes and VMID support */
 	size = arm_smmu_id_size_to_bits(FIELD_GET(ARM_SMMU_ID2_IAS, id2));
 	smmu->ias = size;  /* Input Address Size (IPA) */
@@ -470,7 +481,7 @@ int smmu_v2_probe_device(struct hyp_arm_smmu_v2_device *smmu)
 }
 
 /**
- * smmu_v2_reset - Reset and initialize SMMU hardware
+ * smmu_v2_reset() - Reset and initialize SMMU hardware
  * @smmu: SMMU device to reset
  *
  * Configures global registers and prepares hardware for operation.
@@ -570,7 +581,7 @@ int smmu_v2_reset(struct hyp_arm_smmu_v2_device *smmu)
  */
 
 /**
- * smmu_v2_tlb_flush_walk - Flush TLB after unmapping non-leaf PTEs
+ * smmu_v2_tlb_flush_walk() - Flush TLB after unmapping non-leaf PTEs
  * @iova: I/O virtual address
  * @size: Size of the range to invalidate
  * @granule: Page granule size
@@ -586,12 +597,12 @@ static void smmu_v2_tlb_flush_walk(unsigned long iova, size_t size,
 	/* Invalidate on ALL SMMU instances (global identity mapping) */
 	for_each_smmu(smmu) {
 		/* Global TLB invalidation (all VMIDs) */
-		smmu_v2_tlb_inv_context(smmu, S2CBNDX);
+		smmu_v2_tlb_inv_context(smmu, HOST_S2_CBNDX);
 	}
 }
 
 /**
- * smmu_v2_tlb_add_page - Add page to TLB invalidation gather
+ * smmu_v2_tlb_add_page() - Add page to TLB invalidation gather
  * @gather: TLB gather structure (unused for SMMUv2)
  * @iova: I/O virtual address
  * @granule: Page granule size
@@ -614,12 +625,12 @@ static const struct iommu_flush_ops smmu_v2_tlb_ops = {
 };
 
 /**
- * smmu_v2_init_pgt - Initialize global identity-mapped page table
+ * smmu_v2_init_pgt() - Initialize global identity-mapped page table
  *
  * Creates a single Stage-2 page table shared by all protected domains.
  * This table mirrors the host's CPU stage-2 mappings for DMA isolation.
  *
- * Returns: 0 on success, negative error code on failure
+ * Return: 0 on success, negative error code on failure
  */
 static int smmu_v2_init_pgt(void)
 {
@@ -666,16 +677,15 @@ static int smmu_v2_init_pgt(void)
 	}
 
 	idmap_pgtable = io_pgtable_ops_to_pgtable(ops);
-	if (!idmap_pgtable) {
+	if (!idmap_pgtable)
 		/* This shouldn't happen, but handle it anyway */
 		return -ENOMEM;
-	}
 
 	return 0;
 }
 
 /**
- * smmu_v2_init - Initialize SMMU device at EL2
+ * smmu_v2_init() - Initialize SMMU device at EL2
  * @smmu: SMMU device structure
  *
  * Assumes that shadow arrays have already been allocated and donated from EL1.
@@ -784,11 +794,14 @@ int smmu_v2_init(struct hyp_arm_smmu_v2_device *smmu)
 			  smmu->num_mapping_groups, smr_size + s2cr_size);
 	}
 
+	bitmap_zero(smmu->cb_bitmap, ARM_SMMU_MAX_CBS);
+
+	/* Pre-allocate hyp-reserved CBs; we know for sure we'll need them */
+	bitmap_set(smmu->cb_bitmap, 0, NUM_RESERVED_CB);
+
 	/* Initialize context bank state (all inactive) */
-	for (i = 0; i < ARM_SMMU_MAX_CBS; i++) {
-		smmu->cb_state[i].reserved = false;
-		smmu->cb_state[i].domain_id = 0;
-	}
+	memset(smmu->cb_state, 0, sizeof(smmu->cb_state));
+	memset(smmu->host_cbndx_map, ARM_SMMU_INVALID_CB, sizeof(smmu->host_cbndx_map));
 
 	/* Initialize stream mapping arrays to invalid/fault state */
 	for (i = 0; i < smmu->num_mapping_groups; i++) {
@@ -816,11 +829,202 @@ int smmu_v2_init(struct hyp_arm_smmu_v2_device *smmu)
 }
 
 /*
+ * Context Bank Management
+ */
+
+/**
+ * smmu_v2_alloc_cb() - Allocate a free context bank
+ * @smmu: SMMU device
+ *
+ * Return: Context bank index, or ARM_SMMU_INVALID_CB if none available
+ */
+static u8 smmu_v2_alloc_cb(struct hyp_arm_smmu_v2_device *smmu)
+{
+	u32 cb_idx;
+
+	hyp_spin_lock(&smmu->lock);
+
+	cb_idx = find_next_zero_bit(smmu->cb_bitmap, smmu->num_context_banks, NUM_RESERVED_CB);
+	if (cb_idx == smmu->num_context_banks)
+		cb_idx = ARM_SMMU_INVALID_CB;
+	else
+		bitmap_set(smmu->cb_bitmap, cb_idx, 1);
+
+	hyp_spin_unlock(&smmu->lock);
+	return cb_idx;
+}
+
+/**
+ * smmu_v2_free_cb() - Free a context bank
+ * @smmu: SMMU device
+ * @cb_idx: Actual hardware context bank index
+ */
+static void smmu_v2_free_cb(struct hyp_arm_smmu_v2_device *smmu, u8 cb_idx)
+{
+	if (cb_idx < NUM_RESERVED_CB || cb_idx >= smmu->num_context_banks)
+		return;
+
+	hyp_spin_lock(&smmu->lock);
+	bitmap_clear(smmu->cb_bitmap, cb_idx, 1);
+	hyp_spin_unlock(&smmu->lock);
+}
+
+/**
+ * smmu_v2_map_host_cb() - Get or allocate a new context bank for the host
+ * @smmu: SMMU device
+ * @cb_idx_host: The index that the host thinks this context bank will be in.
+ *
+ * Return: Actual hardware context bank index, or ARM_SMMU_INVALID_CB if none available
+ *         or invalid @cb_idx_host argument was provided.
+ */
+static u8 smmu_v2_map_host_cb(struct hyp_arm_smmu_v2_device *smmu, u8 cb_idx_host)
+{
+	u8 cb_idx;
+
+	if (cb_idx_host >= smmu->num_context_banks)
+		return ARM_SMMU_INVALID_CB;
+
+	cb_idx = smmu->host_cbndx_map[cb_idx_host];
+	if (cb_idx == ARM_SMMU_INVALID_CB) {
+		cb_idx = smmu_v2_alloc_cb(smmu);
+		if (cb_idx != ARM_SMMU_INVALID_CB)
+			smmu->host_cbndx_map[cb_idx_host] = cb_idx;
+	}
+
+	return cb_idx;
+}
+
+/**
+ * smmu_v2_unmap_host_cb() - Unmap and free a context bank of the host
+ * @smmu: SMMU device
+ * @cb_idx_host: Context bank index used by the
+ */
+static void smmu_v2_unmap_host_cb(struct hyp_arm_smmu_v2_device *smmu, u8 cb_idx_host)
+{
+	u8 cb_idx;
+
+	if (cb_idx_host >= smmu->num_context_banks)
+		return;
+
+	cb_idx = smmu->host_cbndx_map[cb_idx_host];
+	smmu->host_cbndx_map[cb_idx_host] = ARM_SMMU_INVALID_CB;
+	smmu_v2_free_cb(smmu, cb_idx);
+}
+
+/**
+ * smmu_v2_find_host_cb_idx() - Given a hardware CB index, find the host index
+ * @smmu: SMMU device
+ * @cb_idx: The index that the host thinks this context bank will be in.
+ *
+ * Return: Host context bank index, or ARM_SMMU_INVALID_CB if not found.
+ */
+static u8 smmu_v2_find_host_cb_idx(struct hyp_arm_smmu_v2_device *smmu, u8 cb_idx)
+{
+	u8 cb_idx_host;
+
+	for (cb_idx_host = 0; cb_idx_host < smmu->num_context_banks; cb_idx_host++) {
+		if (smmu->host_cbndx_map[cb_idx_host] == cb_idx)
+			return cb_idx_host;
+	}
+
+	return ARM_SMMU_INVALID_CB;
+}
+
+/**
+ * smmu_v2_cleanup_host_cbs() - Finds unused CBs by host, and unmaps thems
+ * @smmu: SMMU device
+ */
+static void smmu_v2_cleanup_host_cbs(struct hyp_arm_smmu_v2_device *smmu)
+{
+	u8 cb_idx, cb_idx_host;
+
+	for (cb_idx_host = 0; cb_idx_host < smmu->num_context_banks; cb_idx_host++) {
+		cb_idx = smmu->host_cbndx_map[cb_idx_host];
+		if (cb_idx == ARM_SMMU_INVALID_CB || smmu->cb_state[cb_idx].sctlr)
+			continue;
+
+		smmu_v2_unmap_host_cb(smmu, cb_idx_host);
+	}
+}
+
+/**
+ * smmu_v2_init_s2_cb() - Configure a stage 2 context bank for a domain
+ * @smmu: SMMU device
+ * @pgt: Stage-2 page table to use
+ * @cb_idx: Context bank index
+ *
+ * Programs CBAR, TTBR, TCR, and other CB registers for Stage-2 translation.
+ * Uses the specified stage 2 page table. Does not check context bank
+ * availability (cb_bitmap) or reserved status; context bank should be allocated
+ * before calling this function.
+ */
+static int smmu_v2_init_s2_cb(struct hyp_arm_smmu_v2_device *smmu, struct io_pgtable *pgt,
+			      u8 cb_idx)
+{
+	struct smmu_v2_cb_state *cb;
+	struct io_pgtable_cfg *pgt_cfg;
+	u32 cbar, tcr, sctlr, cb_page;
+	u64 ttbr;
+
+	if (WARN_ON(!pgt))
+		return -EINVAL;
+
+	pgt_cfg = &pgt->cfg;
+
+	if (cb_idx >= smmu->num_context_banks)
+		return -EINVAL;
+
+	cb = &smmu->cb_state[cb_idx];
+
+	/* Calculate CB page offset: context banks start at page numpage */
+	cb_page = (cb_idx + smmu->numpage) << smmu->pgshift;
+
+	/* 1. Configure CBAR (Context Bank Attribute Register) for Stage-2 only */
+	cbar = FIELD_PREP(ARM_SMMU_CBAR_TYPE, CBAR_TYPE_S2_TRANS);
+	cbar |= FIELD_PREP(ARM_SMMU_CBAR_VMID, 0);  /* VMID = 0 (global identity mapping) */
+	smmu_writel(smmu, ARM_SMMU_GR1, ARM_SMMU_GR1_CBAR(cb_idx), cbar);
+
+	/* Configure CBA2R (extended attributes) for 64-bit addressing */
+	smmu_writel(smmu, ARM_SMMU_GR1, ARM_SMMU_GR1_CBA2R(cb_idx), ARM_SMMU_CBA2R_VA64);
+
+	/* 2. Program TCR via VTCR provided by Stage-2 page table */
+	tcr = FIELD_PREP(ARM_SMMU_VTCR_PS, pgt_cfg->arm_lpae_s2_cfg.vtcr.ps) |
+	      FIELD_PREP(ARM_SMMU_VTCR_TG0, pgt_cfg->arm_lpae_s2_cfg.vtcr.tg) |
+	      FIELD_PREP(ARM_SMMU_VTCR_SH0, pgt_cfg->arm_lpae_s2_cfg.vtcr.sh) |
+	      FIELD_PREP(ARM_SMMU_VTCR_ORGN0, pgt_cfg->arm_lpae_s2_cfg.vtcr.orgn) |
+	      FIELD_PREP(ARM_SMMU_VTCR_IRGN0, pgt_cfg->arm_lpae_s2_cfg.vtcr.irgn) |
+	      FIELD_PREP(ARM_SMMU_VTCR_SL0, pgt_cfg->arm_lpae_s2_cfg.vtcr.sl) |
+	      FIELD_PREP(ARM_SMMU_VTCR_T0SZ, pgt_cfg->arm_lpae_s2_cfg.vtcr.tsz);
+	smmu_writel(smmu, cb_page, ARM_SMMU_CB_TCR, tcr);
+
+	/* 3. Write TTBR with Stage-2 page table base address */
+	ttbr = pgt_cfg->arm_lpae_s2_cfg.vttbr;
+	smmu_writeq(smmu, cb_page, ARM_SMMU_CB_TTBR0, ttbr);
+
+	/* 4. Enable translation by setting SCTLR.M bit */
+	sctlr = ARM_SMMU_SCTLR_M;        /* Enable MMU */
+	sctlr |= ARM_SMMU_SCTLR_TRE;     /* TEX remap enable */
+	sctlr |= ARM_SMMU_SCTLR_AFE;     /* Access flag enable */
+	sctlr |= ARM_SMMU_SCTLR_CFIE;    /* Context fault interrupt enable */
+	sctlr |= ARM_SMMU_SCTLR_CFRE;    /* Context fault report enable */
+	smmu_writel(smmu, cb_page, ARM_SMMU_CB_SCTLR, sctlr);
+
+	/* Update CB state tracking */
+	cb->domain_id = 0; /* Not used atm */
+	cb->cbar = cbar;
+	cb->tcr[0] = tcr;
+	cb->ttbr[0] = ttbr;
+	cb->sctlr = sctlr;
+	cb->vmid = 0; /* Not used atm */
+	return 0;
+}
+
+/*
  * MMIO Emulation
  */
 
 /**
- * smmu_v2_handle_gr0 - Handle GR0 register access
+ * smmu_v2_handle_gr0() - Handle GR0 register access
  * @smmu: SMMU device
  * @offset: Register offset within GR0 page
  * @is_write: true for write access, false for read
@@ -838,13 +1042,14 @@ int smmu_v2_handle_gr0(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 		       bool is_write, u64 *val)
 {
 	u32 val32;
+	u8 cb_idx, cb_idx_host;
 
 	/* ID registers - read-only capability reporting */
 	if (offset >= ARM_SMMU_GR0_ID0 && offset <= ARM_SMMU_GR0_ID7) {
 		if (is_write)
 			return -EINVAL;  /* Read-only */
 
-		/* Pass through hardware capabilities */
+		/* Pass through most of the hardware capabilities */
 		*val = smmu_readl(smmu, ARM_SMMU_GR0, offset);
 
 		if (offset == ARM_SMMU_GR0_ID0) {
@@ -853,15 +1058,16 @@ int smmu_v2_handle_gr0(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 			/* Don't advertise stage-2 or nesting capabilities */
 			val32 &= ~(ARM_SMMU_ID0_S2TS | ARM_SMMU_ID0_NTS);
 			*val = val32;
-		} else if (offset == ARM_SMMU_GR0_ID1 && smmu->num_s2_context_banks < NUMS2CB) {
+		} else if (offset == ARM_SMMU_GR0_ID1) {
 			val32 = (u32)*val;
 
 			/*
-			 * Fake the existence of at least <NUMS2CB> stage 2-only CBs.
+			 * Subtract the reserved context banks from NUMCB.
 			 * These will be owned by the hypervisor
 			 */
-			val32 &= ~ARM_SMMU_ID1_NUMS2CB;
-			val32 |= FIELD_PREP(ARM_SMMU_ID1_NUMS2CB, NUMS2CB);
+			val32 &= ~ARM_SMMU_ID1_NUMCB;
+			val32 |= FIELD_PREP(ARM_SMMU_ID1_NUMCB,
+				            smmu->num_context_banks - NUM_RESERVED_CB);
 			*val = val32;
 		}
 		return 0;
@@ -872,12 +1078,30 @@ int smmu_v2_handle_gr0(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 		if (is_write) {
 			val32 = (u32)*val;
 
+			if (val32 & ARM_SMMU_sCR0_CLIENTPD) {
+				/* Can't let host bypass translation globally */
+				val32 &= ~ARM_SMMU_sCR0_CLIENTPD;
+			} else {
+				/*
+				 * Writing to sCR0 is the epilogue of the reset sequence. Right
+				 * before that (also part of the reset sequence), the host accesses
+				 * all CBs' SCTLR (writes 0). This causes our host_cb_map to be
+				 * fully populated. Clean up here.
+				 */
+				smmu_v2_cleanup_host_cbs(smmu);
+			}
+
 			/*
 			 * Enforce USFCFG=1: unmapped streams must fault, not bypass.
 			 * This is a security requirement - we cannot let the host
 			 * allow arbitrary streams to bypass SMMU translation.
 			 */
 			val32 |= ARM_SMMU_sCR0_USFCFG;
+
+			/*
+			 * Do not let conflicting matches bypass the SMMU
+			 */
+			val32 |= ARM_SMMU_sCR0_SMCFCFG;
 
 			/* Always keep fault reporting enabled */
 			val32 |= (ARM_SMMU_sCR0_GFRE | ARM_SMMU_sCR0_GFIE |
@@ -888,11 +1112,10 @@ int smmu_v2_handle_gr0(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 				val32 |= ARM_SMMU_sCR0_VMIDPNE;
 
 			smmu_writel(smmu, ARM_SMMU_GR0, offset, val32);
-			return 0;
 		} else {
 			*val = smmu_readl(smmu, ARM_SMMU_GR0, offset);
-			return 0;
 		}
+		return 0;
 	}
 
 	/* Global fault status/syndrome registers - read/clear */
@@ -900,11 +1123,10 @@ int smmu_v2_handle_gr0(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 		if (is_write) {
 			/* Write-1-to-clear */
 			smmu_writel(smmu, ARM_SMMU_GR0, offset, (u32)*val);
-			return 0;
 		} else {
 			*val = smmu_readl(smmu, ARM_SMMU_GR0, offset);
-			return 0;
 		}
+		return 0;
 	}
 
 	if (offset == ARM_SMMU_GR0_sGFSYNR0 || offset == ARM_SMMU_GR0_sGFSYNR1 ||
@@ -967,7 +1189,6 @@ int smmu_v2_handle_gr0(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 
 			/* Write through to hardware (no modification needed for SMR) */
 			smmu_writel(smmu, ARM_SMMU_GR0, offset, val32);
-			return 0;
 		} else {
 			/* Return shadow state */
 			val32 = 0;
@@ -976,8 +1197,8 @@ int smmu_v2_handle_gr0(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 			val32 |= FIELD_PREP(ARM_SMMU_SMR_MASK, smmu->smrs[idx].mask);
 			val32 |= FIELD_PREP(ARM_SMMU_SMR_ID, smmu->smrs[idx].id);
 			*val = val32;
-			return 0;
 		}
+		return 0;
 	}
 
 	/* S2CR registers - stream-to-context mapping (shadow + enforce Stage-2) */
@@ -990,6 +1211,17 @@ int smmu_v2_handle_gr0(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 		if (is_write) {
 			val32 = (u32)*val;
 
+			/* Map the context bank index to actual hardware CB */
+			cb_idx_host = FIELD_GET(ARM_SMMU_S2CR_CBNDX, val32);
+			cb_idx = smmu_v2_map_host_cb(smmu, cb_idx_host);
+			if (cb_idx == ARM_SMMU_INVALID_CB)
+				/* Means we ran out of CBs */
+				return -EINVAL;
+
+			/* Correct it in S2CR */
+			val32 &= ~ARM_SMMU_S2CR_CBNDX;
+			val32 |= FIELD_PREP(ARM_SMMU_S2CR_CBNDX, cb_idx);
+
 			/* Update shadow state */
 			smmu->s2crs[idx].type = FIELD_GET(ARM_SMMU_S2CR_TYPE, val32);
 			smmu->s2crs[idx].cbndx = FIELD_GET(ARM_SMMU_S2CR_CBNDX, val32);
@@ -1001,13 +1233,12 @@ int smmu_v2_handle_gr0(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 				val32 &= ~ARM_SMMU_S2CR_TYPE;
 				val32 |= FIELD_PREP(ARM_SMMU_S2CR_TYPE, S2CR_TYPE_FAULT);
 
-				/* And let .bypass indicate that we modified this */
+				/* And let s2crs[idx].bypass indicate that we modified this */
 				smmu->s2crs[idx].type = FIELD_GET(ARM_SMMU_S2CR_TYPE, val32);
 			}
 
-			/* Write through to hardware */
+			/* Write to hardware */
 			smmu_writel(smmu, ARM_SMMU_GR0, offset, val32);
-			return 0;
 		} else {
 			/* Return shadow state; let the host think this is set to bypass */
 			if (smmu->s2crs[idx].bypass)
@@ -1015,11 +1246,15 @@ int smmu_v2_handle_gr0(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 			else
 				val32 = FIELD_PREP(ARM_SMMU_S2CR_TYPE, smmu->s2crs[idx].type);
 
-			val32 |= FIELD_PREP(ARM_SMMU_S2CR_CBNDX, smmu->s2crs[idx].cbndx);
+			/* Map actual hardware CB index back to host index */
+			cb_idx = FIELD_PREP(ARM_SMMU_S2CR_CBNDX, smmu->s2crs[idx].cbndx);
+			cb_idx_host = smmu_v2_find_host_cb_idx(smmu, cb_idx);
+
+			val32 |= FIELD_PREP(ARM_SMMU_S2CR_CBNDX, cb_idx_host);
 			val32 |= FIELD_PREP(ARM_SMMU_S2CR_PRIVCFG, smmu->s2crs[idx].privcfg);
 			*val = val32;
-			return 0;
 		}
+		return 0;
 	}
 
 	/* Unknown or unsupported register */
@@ -1027,7 +1262,7 @@ int smmu_v2_handle_gr0(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 }
 
 /**
- * smmu_v2_handle_gr1 - Handle GR1 register access
+ * smmu_v2_handle_gr1() - Handle GR1 register access
  * @smmu: SMMU device
  * @offset: Register offset within GR1 page
  * @is_write: true for write access, false for read
@@ -1047,41 +1282,55 @@ int smmu_v2_handle_gr1(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 {
 	u32 val32;
 	u8 cbar_type;
-	u8 cb_idx;
+	u8 cb_idx_host, cb_idx;
+	int cbreg_idx; /* 0: CBAR, 1: CBA2R, 2: FSYNRA */
+	u32 cbreg_base[3] = {
+		ARM_SMMU_GR1_CBAR(0),
+		ARM_SMMU_GR1_CBA2R(0),
+		ARM_SMMU_GR1_CBFRSYNRA(0)
+	};
 
-	/* CBAR registers - context bank attributes */
-	if (offset >= ARM_SMMU_GR1_CBAR(0) &&
-	    offset < ARM_SMMU_GR1_CBAR(0) + (smmu->num_context_banks * 4)) {
-		cb_idx = (offset - ARM_SMMU_GR1_CBAR(0)) >> 2;
+	/* Find out which CB register it's trying to access */
+	for (cbreg_idx = 0; cbreg_idx < 3; cbreg_idx++) {
+		if (offset < cbreg_base[cbreg_idx] ||
+		    offset >= cbreg_base[cbreg_idx] + smmu->num_context_banks * 4)
+			continue;
 
-		if (cb_idx >= smmu->num_context_banks)
+		cb_idx_host = (offset - cbreg_base[cbreg_idx]) >> 2;
+		if (cb_idx_host >= smmu->num_context_banks)
 			return -EINVAL;
 
-		/* Deny access to S2-only CBs; we can probably also return -EINVAL here */
-		if (cb_idx < NUMS2CB || smmu->cb_state[cb_idx].reserved) {
+		cb_idx = smmu_v2_map_host_cb(smmu, cb_idx_host);
+
+		/* Ran out of CBs; not sure what's best here, -EINVAL or 0 */
+		if (cb_idx == ARM_SMMU_INVALID_CB) {
 			*val = 0;
 			return 0;
 		}
 
+		offset = cbreg_base[cbreg_idx] + cb_idx * 4;
+		break;
+	}
+
+	if (cbreg_idx == 0) {
+		/* CBAR registers - context bank attributes */
 		if (is_write) {
 			val32 = (u32)*val;
 			cbar_type = FIELD_GET(ARM_SMMU_CBAR_TYPE, val32);
 
 			/* We don't allow or advertise support for this; bail out */
 			if (cbar_type == CBAR_TYPE_S2_TRANS ||
-			    cbar_type == CBAR_TYPE_S1_TRANS_S2_TRANS) {
+			    cbar_type == CBAR_TYPE_S1_TRANS_S2_TRANS)
 				return -EINVAL;
-			}
 
 			/* Force it through a stage 2 translation */
-			if (smmu->cb_state[S2CBNDX].reserved &&
-			    cbar_type == CBAR_TYPE_S1_TRANS_S2_BYPASS) {
+			if (cbar_type == CBAR_TYPE_S1_TRANS_S2_BYPASS) {
 				val32 &= ~ARM_SMMU_CBAR_TYPE;
 				val32 |= FIELD_PREP(ARM_SMMU_CBAR_TYPE, CBAR_TYPE_S1_TRANS_S2_TRANS);
 
 				/* masks the MemAttr too; should be ok */
 				val32 &= ~ARM_SMMU_CBAR_S1_CBNDX;
-				val32 |= FIELD_PREP(ARM_SMMU_CBAR_S1_CBNDX, S2CBNDX);
+				val32 |= FIELD_PREP(ARM_SMMU_CBAR_S1_CBNDX, HOST_S2_CBNDX);
 			}
 
 			/* Store in CB state for tracking */
@@ -1089,7 +1338,6 @@ int smmu_v2_handle_gr1(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 
 			/* Write to hardware */
 			smmu_writel(smmu, ARM_SMMU_GR1, offset, val32);
-			return 0;
 		} else {
 			/* Return current CB state */
 			val32 = smmu_readl(smmu, ARM_SMMU_GR1, offset);
@@ -1102,18 +1350,10 @@ int smmu_v2_handle_gr1(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 			}
 
 			*val = val32;
-			return 0;
 		}
-	}
-
-	/* CBA2R registers - extended attributes */
-	if (offset >= ARM_SMMU_GR1_CBA2R(0) &&
-	    offset < ARM_SMMU_GR1_CBA2R(0) + (smmu->num_context_banks * 4)) {
-		cb_idx = (offset - ARM_SMMU_GR1_CBA2R(0)) >> 2;
-
-		if (cb_idx >= smmu->num_context_banks)
-			return -EINVAL;
-
+		return 0;
+	} else if (cbreg_idx == 1) {
+		/* CBA2R registers - extended attributes */
 		if (is_write) {
 			val32 = (u32)*val;
 
@@ -1125,21 +1365,12 @@ int smmu_v2_handle_gr1(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 				u16 vmid = FIELD_GET(ARM_SMMU_CBA2R_VMID16, val32);
 				smmu->cb_state[cb_idx].vmid = vmid;
 			}
-			return 0;
 		} else {
 			*val = smmu_readl(smmu, ARM_SMMU_GR1, offset);
-			return 0;
 		}
-	}
-
-	/* CBFRSYNRA registers - fault syndrome auxiliary (read-only) */
-	if (offset >= ARM_SMMU_GR1_CBFRSYNRA(0) &&
-	    offset < ARM_SMMU_GR1_CBFRSYNRA(0) + (smmu->num_context_banks * 4)) {
-		cb_idx = (offset - ARM_SMMU_GR1_CBFRSYNRA(0)) >> 2;
-
-		if (cb_idx >= smmu->num_context_banks)
-			return -EINVAL;
-
+		return 0;
+	} else if (cbreg_idx == 2) {
+		/* CBFRSYNRA registers - fault syndrome auxiliary (read-only) */
 		if (is_write)
 			return -EINVAL;  /* Read-only */
 
@@ -1152,7 +1383,7 @@ int smmu_v2_handle_gr1(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 }
 
 /**
- * smmu_v2_handle_cb - Handle context bank register access
+ * smmu_v2_handle_cb() - Handle context bank register access
  * @smmu: SMMU device
  * @offset: Register offset (CB page + offset within CB)
  * @is_write: true for write access, false for read
@@ -1171,7 +1402,7 @@ int smmu_v2_handle_cb(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 		      bool is_write, u64 *val)
 {
 	u32 page_offset, cb_base, cb_offset;
-	u8 cb_idx;
+	u8 cb_idx_host, cb_idx;
 	u32 val32;
 	u64 val64;
 
@@ -1180,38 +1411,47 @@ int smmu_v2_handle_cb(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 	if (page_offset < smmu->numpage)
 		return -EINVAL;  /* Pages 0 to numpage-1 are GR0/GR1 */
 
-	cb_idx = page_offset - smmu->numpage;
-	if (cb_idx >= smmu->num_context_banks)
+	cb_idx_host = page_offset - smmu->numpage;
+	if (cb_idx_host >= smmu->num_context_banks)
 		return -EINVAL;
 
-	cb_offset = offset & ((1 << smmu->pgshift) - 1);
-	cb_base = page_offset << smmu->pgshift;
+	cb_idx = smmu_v2_map_host_cb(smmu, cb_idx_host);
 
-	/*
-	 * Silently deny access to S2-only CBs. Returning -EINVAL crashes the kernel,
-	 * so just ingore and return 0. The kernel shouldn't be trying to configure
-	 * them anyway (even though it does).
-	 */
-	if (cb_idx < NUMS2CB || smmu->cb_state[cb_idx].reserved) {
+	/* Ran out of CBs; not sure what's best here, -EINVAL or 0 */
+	if (cb_idx == ARM_SMMU_INVALID_CB) {
 		*val = 0;
 		return 0;
 	}
+
+	/* Map these back to actual hardware */
+	page_offset = cb_idx + smmu->numpage;
+	cb_offset = offset & ((1 << smmu->pgshift) - 1);
+	cb_base = page_offset << smmu->pgshift;
+	offset = cb_base | cb_offset;
 
 	/* SCTLR - System Control Register */
 	if (cb_offset == ARM_SMMU_CB_SCTLR) {
 		if (is_write) {
 			val32 = (u32)*val;
 
+			if (!val32 && smmu->cb_state[cb_idx].sctlr) {
+				/*
+				 * Host is destroying a context; unmap it. Checking for !val32
+				 * alone is not sufficient as the host writes 0 also during
+				 * reset (when our shadow sctlr is also 0).
+				 */
+				smmu_v2_unmap_host_cb(smmu, cb_idx_host);
+			}
+
 			/* Store in shadow state */
 			smmu->cb_state[cb_idx].sctlr = val32;
 
 			/* Write to hardware */
 			smmu_writel(smmu, cb_base, cb_offset, val32);
-			return 0;
 		} else {
 			*val = smmu_readl(smmu, cb_base, cb_offset);
-			return 0;
 		}
+		return 0;
 	}
 
 	/* TCR - Translation Control Register (Stage-1) */
@@ -1224,11 +1464,10 @@ int smmu_v2_handle_cb(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 
 			/* Write to hardware */
 			smmu_writel(smmu, cb_base, cb_offset, val32);
-			return 0;
 		} else {
 			*val = smmu_readl(smmu, cb_base, cb_offset);
-			return 0;
 		}
+		return 0;
 	}
 
 	/* TCR2 - Translation Control Register 2 */
@@ -1244,11 +1483,10 @@ int smmu_v2_handle_cb(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 			 * Write through to hardware
 			 */
 			smmu_writel(smmu, cb_base, cb_offset, val32);
-			return 0;
 		} else {
 			*val = smmu_readl(smmu, cb_base, cb_offset);
-			return 0;
 		}
+		return 0;
 	}
 
 	/* TTBR0 - Translation Table Base Register 0 */
@@ -1260,11 +1498,10 @@ int smmu_v2_handle_cb(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 
 			/* Host/bypass domains: write through */
 			smmu_writeq(smmu, cb_base, cb_offset, val64);
-			return 0;
 		} else {
 			*val = smmu_readq(smmu, cb_base, cb_offset);
-			return 0;
 		}
+		return 0;
 	}
 
 	/* TTBR1 - Translation Table Base Register 1 (Stage-1 second PT) */
@@ -1280,11 +1517,10 @@ int smmu_v2_handle_cb(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 			 * Write through for host/bypass domains.
 			 */
 			smmu_writeq(smmu, cb_base, cb_offset, val64);
-			return 0;
 		} else {
 			*val = smmu_readq(smmu, cb_base, cb_offset);
-			return 0;
 		}
+		return 0;
 	}
 
 	/* MAIR0 - Memory Attribute Indirection Registers */
@@ -1293,11 +1529,10 @@ int smmu_v2_handle_cb(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 			val32 = (u32)*val;
 			smmu->cb_state[cb_idx].mair[0] = val32;
 			smmu_writel(smmu, cb_base, cb_offset, val32);
-			return 0;
 		} else {
 			*val = smmu_readl(smmu, cb_base, cb_offset);
-			return 0;
 		}
+		return 0;
 	}
 
 	/* MAIR1 - Memory Attribute Indirection Registers */
@@ -1306,11 +1541,10 @@ int smmu_v2_handle_cb(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 			val32 = (u32)*val;
 			smmu->cb_state[cb_idx].mair[1] = val32;
 			smmu_writel(smmu, cb_base, cb_offset, val32);
-			return 0;
 		} else {
 			*val = smmu_readl(smmu, cb_base, cb_offset);
-			return 0;
 		}
+		return 0;
 	}
 
 	/* FSR - Fault Status Register (write-1-to-clear) */
@@ -1319,11 +1553,10 @@ int smmu_v2_handle_cb(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 			val32 = (u32)*val;
 			/* Write-1-to-clear fault status */
 			smmu_writel(smmu, cb_base, cb_offset, val32);
-			return 0;
 		} else {
 			*val = smmu_readl(smmu, cb_base, cb_offset);
-			return 0;
 		}
+		return 0;
 	}
 
 	/* FAR - Fault Address Register (read-only) */
@@ -1408,11 +1641,10 @@ int smmu_v2_handle_cb(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 		if (is_write) {
 			val32 = (u32)*val;
 			smmu_writel(smmu, cb_base, cb_offset, val32);
-			return 0;
 		} else {
 			*val = smmu_readl(smmu, cb_base, cb_offset);
-			return 0;
 		}
+		return 0;
 	}
 
 	/* RESUME - Resume processing after stall */
@@ -1430,11 +1662,10 @@ int smmu_v2_handle_cb(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 		if (is_write) {
 			val32 = (u32)*val;
 			smmu_writel(smmu, cb_base, cb_offset, val32);
-			return 0;
 		} else {
 			*val = smmu_readl(smmu, cb_base, cb_offset);
-			return 0;
 		}
+		return 0;
 	}
 
 	/* ATS1PR - Address Translation Stage 1 Privileged Read (write-only) */
@@ -1460,24 +1691,14 @@ int smmu_v2_handle_cb(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 		return 0;
 	}
 
-	/*
-	 * Unknown register - log and passthrough for debugging.
-	 * TODO: Audit and restrict this once all required registers are identified.
-	 */
+	/* Unknown register - log in case we can emulate it */
 	drv_warn("CB[%u] unknown register 0x%x access (%s)",
 		 cb_idx, cb_offset, is_write ? "write" : "read");
-
-	if (is_write) {
-		val32 = (u32)*val;
-		smmu_writel(smmu, cb_base, cb_offset, val32);
-	} else {
-		*val = smmu_readl(smmu, cb_base, cb_offset);
-	}
-	return 0;
+	return -EINVAL;
 }
 
 /**
- * smmu_v2_mmio_handler - Main MMIO trap handler
+ * smmu_v2_mmio_handler() - Main MMIO trap handler
  * @addr: Physical address being accessed
  * @is_write: true for write access, false for read
  * @val: Pointer to value (read or write)
@@ -1523,85 +1744,14 @@ bool smmu_v2_mmio_handler(u64 addr, bool is_write, u64 *val)
 }
 
 /**
- * smmu_v2_init_s2_context_bank - Configure a context bank for a domain
- * @smmu: SMMU device
- * @cb_idx: Context bank index
- *
- * Programs CBAR, TTBR, TCR, and other CB registers for Stage-2 translation.
- * Uses the global identity-mapped page table (idmap_pgtable) which mirrors
- * the host's CPU stage-2 mappings.
- */
-int smmu_v2_init_s2_context_bank(struct hyp_arm_smmu_v2_device *smmu, u8 cb_idx)
-{
-	struct smmu_v2_cb_state *cb;
-	struct io_pgtable_cfg *pgt_cfg;
-	u32 cbar, tcr, sctlr, cb_page;
-	u64 ttbr;
-
-	if (WARN_ON(!idmap_pgtable))
-		return -EINVAL;
-
-	pgt_cfg = &idmap_pgtable->cfg;
-
-	if (cb_idx >= smmu->num_context_banks)
-		return -EINVAL;
-
-	cb = &smmu->cb_state[cb_idx];
-
-	/* Calculate CB page offset: context banks start at page numpage */
-	cb_page = (cb_idx + smmu->numpage) << smmu->pgshift;
-
-	/* 1. Configure CBAR (Context Bank Attribute Register) for Stage-2 only */
-	cbar = FIELD_PREP(ARM_SMMU_CBAR_TYPE, CBAR_TYPE_S2_TRANS);
-	cbar |= FIELD_PREP(ARM_SMMU_CBAR_VMID, 0);  /* VMID = 0 (global identity mapping) */
-	smmu_writel(smmu, ARM_SMMU_GR1, ARM_SMMU_GR1_CBAR(cb_idx), cbar);
-
-	/* Configure CBA2R (extended attributes) for 64-bit addressing */
-	smmu_writel(smmu, ARM_SMMU_GR1, ARM_SMMU_GR1_CBA2R(cb_idx),
-		    ARM_SMMU_CBA2R_VA64);
-
-	/* 2. Program TCR via VTCR provided by Stage-2 page table */
-	tcr = FIELD_PREP(ARM_SMMU_VTCR_PS, pgt_cfg->arm_lpae_s2_cfg.vtcr.ps) |
-	      FIELD_PREP(ARM_SMMU_VTCR_TG0, pgt_cfg->arm_lpae_s2_cfg.vtcr.tg) |
-	      FIELD_PREP(ARM_SMMU_VTCR_SH0, pgt_cfg->arm_lpae_s2_cfg.vtcr.sh) |
-	      FIELD_PREP(ARM_SMMU_VTCR_ORGN0, pgt_cfg->arm_lpae_s2_cfg.vtcr.orgn) |
-	      FIELD_PREP(ARM_SMMU_VTCR_IRGN0, pgt_cfg->arm_lpae_s2_cfg.vtcr.irgn) |
-	      FIELD_PREP(ARM_SMMU_VTCR_SL0, pgt_cfg->arm_lpae_s2_cfg.vtcr.sl) |
-	      FIELD_PREP(ARM_SMMU_VTCR_T0SZ, pgt_cfg->arm_lpae_s2_cfg.vtcr.tsz);
-	smmu_writel(smmu, cb_page, ARM_SMMU_CB_TCR, tcr);
-
-	/* 3. Write TTBR with Stage-2 page table base address */
-	ttbr = pgt_cfg->arm_lpae_s2_cfg.vttbr;
-	smmu_writeq(smmu, cb_page, ARM_SMMU_CB_TTBR0, ttbr);
-
-	/* 4. Enable translation by setting SCTLR.M bit */
-	sctlr = ARM_SMMU_SCTLR_M;        /* Enable MMU */
-	sctlr |= ARM_SMMU_SCTLR_TRE;     /* TEX remap enable */
-	sctlr |= ARM_SMMU_SCTLR_AFE;     /* Access flag enable */
-	sctlr |= ARM_SMMU_SCTLR_CFIE;    /* Context fault interrupt enable */
-	sctlr |= ARM_SMMU_SCTLR_CFRE;    /* Context fault report enable */
-	smmu_writel(smmu, cb_page, ARM_SMMU_CB_SCTLR, sctlr);
-
-	/* Update CB state tracking */
-	cb->domain_id = 0; /* Not used atm */
-	cb->cbar = cbar;
-	cb->tcr[0] = tcr;
-	cb->ttbr[0] = ttbr;
-	cb->sctlr = sctlr;
-	cb->vmid = 0; /* Not used atm */
-	cb->reserved = true;
-	return 0;
-}
-
-/**
- * smmu_v2_global_init - Global initialization for all SMMU instances
+ * smmu_v2_global_init() - Global initialization for all SMMU instances
  *
  * Called once during hypervisor initialization to set up all SMMU devices
  * and create the global identity-mapped page table.
  *
  * This should be called from the kvm_iommu_ops->init() callback.
  *
- * Returns: 0 on success, negative error code on failure
+ * Return: 0 on success, negative error code on failure
  */
 int smmu_v2_global_init(pkvm_handle_t drv_id)
 {
@@ -1669,9 +1819,9 @@ int smmu_v2_global_init(pkvm_handle_t drv_id)
 	if (WARN_ON(ret))
 		return ret;
 
-	/* Initialize our stage 2 context bank */
+	/* Initialize our host stage 2 context bank */
 	for_each_smmu(smmu) {
-		ret = smmu_v2_init_s2_context_bank(smmu, S2CBNDX);
+		ret = smmu_v2_init_s2_cb(smmu, idmap_pgtable, HOST_S2_CBNDX);
 		if (WARN_ON(ret)) {
 			smmu_err(smmu, "Failed to initialize stage 2 context bank (ret=%d)", ret);
 			return ret;
@@ -1687,10 +1837,10 @@ int smmu_v2_global_init(pkvm_handle_t drv_id)
  */
 
 /**
- * smmu_v2_tlb_sync_global - Wait for global TLB sync to complete
+ * smmu_v2_tlb_sync_global() - Wait for global TLB sync to complete
  * @smmu: SMMU device
  *
- * Returns: 0 on success, -ETIMEDOUT on timeout
+ * Return: 0 on success, -ETIMEDOUT on timeout
  */
 int smmu_v2_tlb_sync_global(struct hyp_arm_smmu_v2_device *smmu)
 {
@@ -1713,11 +1863,11 @@ int smmu_v2_tlb_sync_global(struct hyp_arm_smmu_v2_device *smmu)
 }
 
 /**
- * smmu_v2_tlb_sync_context - Wait for context TLB sync to complete
+ * smmu_v2_tlb_sync_context() - Wait for context TLB sync to complete
  * @smmu: SMMU device
  * @cb_idx: Context bank index
  *
- * Returns: 0 on success, -ETIMEDOUT on timeout
+ * Return: 0 on success, -ETIMEDOUT on timeout
  */
 int smmu_v2_tlb_sync_context(struct hyp_arm_smmu_v2_device *smmu, u8 cb_idx)
 {
@@ -1736,9 +1886,7 @@ int smmu_v2_tlb_sync_context(struct hyp_arm_smmu_v2_device *smmu, u8 cb_idx)
 		val = smmu_readl(smmu, cb_base, ARM_SMMU_CB_TLBSTATUS);
 		if (!(val & BIT(0)))  /* SACTIVE bit */
 			return 0;
-
-		timeout--;
-	} while (timeout);
+	} while (timeout--);
 
 	/* Timeout - hardware error */
 	smmu_err(smmu, "Context bank %u TLB sync timeout (SACTIVE still set)", cb_idx);
@@ -1746,7 +1894,7 @@ int smmu_v2_tlb_sync_context(struct hyp_arm_smmu_v2_device *smmu, u8 cb_idx)
 }
 
 /**
- * smmu_v2_tlb_inv_context - Invalidate all TLB entries for a context
+ * smmu_v2_tlb_inv_context() - Invalidate all TLB entries for a context
  * @smmu: SMMU device
  * @cb_idx: Context bank index
  *
@@ -1769,7 +1917,7 @@ void smmu_v2_tlb_inv_context(struct hyp_arm_smmu_v2_device *smmu, u8 cb_idx)
 }
 
 /**
- * smmu_v2_tlb_inv_range - Invalidate TLB entries for an IOVA range
+ * smmu_v2_tlb_inv_range() - Invalidate TLB entries for an IOVA range
  * @smmu: SMMU device
  * @cb_idx: Context bank index
  * @iova: Starting IOVA
@@ -1906,7 +2054,7 @@ static void smmu_v2_host_stage2_idmap(phys_addr_t start, phys_addr_t end, int pr
 }
 
 /**
- * smmu_v2_dabt_handler - Data abort handler for SMMU MMIO accesses
+ * smmu_v2_dabt_handler() - Data abort handler for SMMU MMIO accesses
  * @regs: CPU register state
  * @esr: Exception Syndrome Register value
  * @addr: Faulting address
@@ -1914,7 +2062,7 @@ static void smmu_v2_host_stage2_idmap(phys_addr_t start, phys_addr_t end, int pr
  * Wrapper around smmu_v2_mmio_handler that matches the kvm_iommu_ops signature.
  * Handles MMIO emulation for host accesses to SMMU registers.
  *
- * Returns: true if handled, false otherwise
+ * Return: true if handled, false otherwise
  */
 static bool smmu_v2_dabt_handler(struct user_pt_regs *regs, u64 esr, u64 addr)
 {
