@@ -7,5 +7,7 @@
 #
 subdir-ccflags-y += -I$(srctree)/arch/arm64/kvm/hyp/include/
 subdir-ccflags-y += -DMODULE
-hyp-obj-y := arm-smmu-v2.o ../../../io-pgtable-arm.o
+hyp-obj-y := arm-smmu-v2.o \
+	     ../../../io-pgtable-arm.o \
+	     ../../../../../drivers/firmware/efi/libstub/find.o
 include $(srctree)/arch/arm64/kvm/hyp/nvhe/Makefile.module

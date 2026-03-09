@@ -13,6 +13,7 @@
 #ifndef __ARM_SMMU_V2_SHARED_H__
 #define __ARM_SMMU_V2_SHARED_H__
 
+#include <linux/bitmap.h>
 #include <linux/types.h>
 #include <linux/io.h>
 
@@ -88,6 +89,16 @@ struct hyp_arm_smmu_v2_device {
 	 * this is only needed for debugging purposes so far.
 	 */
 	struct smmu_v2_cb_state	cb_state[ARM_SMMU_MAX_CBS];
+
+	/* Whether a context bank is in use or not, by anyone */
+	DECLARE_BITMAP(cb_bitmap, ARM_SMMU_MAX_CBS);
+
+	/*
+	 * The CB index mapping array for the host. Indexed by what the host
+	 * thinks is configuring, and having values the actual CB indices.
+	 * Reserved/Unused entries have a value of ARM_SMMU_INVALID_CB.
+	 */
+	u8 host_cbndx_map[ARM_SMMU_MAX_CBS];
 
 	/*
 	 * Stream Mapping State

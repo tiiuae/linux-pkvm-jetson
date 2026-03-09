@@ -57,8 +57,8 @@ static void kvm_smmu_dump_cbs(struct seq_file *m, struct hyp_arm_smmu_v2_device 
 	int i;
 	int cnt_same;
 
-	tbl_printf(m, "    | domain_id |     cbar |   tcr[0] |   tcr[1] |          ttbr[0] |          ttbr[1] |    sctlr |  mair[0] |  mair[1] | vmid | rsvd\n");
-	tbl_printf(m, "====|===========|==========|==========|==========|==================|==================|==========|==========|==========|======|=====\n");
+	tbl_printf(m, "    | domain_id |     cbar |   tcr[0] |   tcr[1] |          ttbr[0] |          ttbr[1] |    sctlr |  mair[0] |  mair[1] | vmid \n");
+	tbl_printf(m, "====|===========|==========|==========|==========|==================|==================|==========|==========|==========|======\n");
 
 	for (i = 0, cnt_same = 0; i < smmu->num_context_banks; i++) {
 		if (i > 0 && memcmp(&smmu->cb_state[i],
@@ -71,7 +71,7 @@ static void kvm_smmu_dump_cbs(struct seq_file *m, struct hyp_arm_smmu_v2_device 
 			cnt_same = 0;
 		}
 
-		tbl_printf(m, "%3u |%10u |%9x |%9x |%9x |%17llx |%17llx |%9x |%9x |%9x |%5x | %u\n",
+		tbl_printf(m, "%3u |%10u |%9x |%9x |%9x |%17llx |%17llx |%9x |%9x |%9x |%5x\n",
 			   i,
 			   smmu->cb_state[i].domain_id,
 			   smmu->cb_state[i].cbar,
@@ -82,8 +82,7 @@ static void kvm_smmu_dump_cbs(struct seq_file *m, struct hyp_arm_smmu_v2_device 
 			   smmu->cb_state[i].sctlr,
 			   smmu->cb_state[i].mair[0],
 			   smmu->cb_state[i].mair[1],
-			   smmu->cb_state[i].vmid,
-			   smmu->cb_state[i].reserved
+			   smmu->cb_state[i].vmid
 			  );
 	}
 
@@ -144,6 +143,7 @@ static int kvm_smmu_host_device_show(struct seq_file *m, void *unused)
 	/* stream mapping table: size of smrs + s2crs arrays */
 	size_t smt_size;
 	int smt_order;
+	int i;
 
 	smmu = (void *)__get_free_pages(GFP_KERNEL | __GFP_ZERO, smmu_order);
 	if (smmu == NULL) {
@@ -194,8 +194,15 @@ static int kvm_smmu_host_device_show(struct seq_file *m, void *unused)
 	seq_printf(m, "oas: %u\n", smmu->oas);
 	seq_printf(m, "pgsize_bitmap: %lx\n", smmu->pgsize_bitmap);
 	seq_printf(m, "vmid_bits: %u\n", smmu->vmid_bits);
+	seq_printf(m, "cb_bitmap: %*pbl\n", ARM_SMMU_MAX_CBS, smmu->cb_bitmap);
+
 	seq_printf(m, "cb_state:\n");
 	kvm_smmu_dump_cbs(m, smmu);
+
+	seq_printf(m, "host_cbndx_map (host -> actual):\n");
+	for (i = 0; i < ARM_SMMU_MAX_CBS; i++)
+		if (smmu->host_cbndx_map[i] != ARM_SMMU_INVALID_CB)
+			tbl_printf(m, "%u -> %u\n", i, smmu->host_cbndx_map[i]);
 
 	seq_printf(m, "Stream mapping table:\n");
 	kvm_smmu_dump_smt(m, smmu->smrs, smmu->s2crs, smmu->num_mapping_groups);
