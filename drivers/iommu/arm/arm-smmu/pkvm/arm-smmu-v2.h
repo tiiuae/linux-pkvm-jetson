@@ -27,9 +27,6 @@
 /* Maximum number of SMMU instances on Tegra234 */
 #define ARM_SMMU_MAX_INSTANCES		3
 
-/* Maximum stream mapping groups */
-#define ARM_SMMU_MAX_SMRS		128
-
 /* Page shift for SMMU register pages */
 #define ARM_SMMU_PGSHIFT		16
 
@@ -125,9 +122,9 @@ extern struct kvm_iommu_ops smmu_v2_ops;
  */
 
 /* Device initialization */
-int smmu_v2_init(struct hyp_arm_smmu_v2_device *smmu);
 int smmu_v2_probe_device(struct hyp_arm_smmu_v2_device *smmu);
 int smmu_v2_reset(struct hyp_arm_smmu_v2_device *smmu);
+int smmu_v2_init(struct hyp_arm_smmu_v2_device *smmu);
 int smmu_v2_global_init(pkvm_handle_t drv_id);
 
 /* MMIO emulation */
@@ -138,9 +135,6 @@ int smmu_v2_handle_gr1(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 		       bool is_write, u64 *val);
 int smmu_v2_handle_cb(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 		      bool is_write, u64 *val);
-
-/* Context bank management */
-int smmu_v2_init_s2_context_bank(struct hyp_arm_smmu_v2_device *smmu, u8 cb_idx);
 
 /* TLB operations */
 void smmu_v2_tlb_inv_context(struct hyp_arm_smmu_v2_device *smmu, u8 cb_idx);

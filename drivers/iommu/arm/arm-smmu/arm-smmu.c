@@ -1278,6 +1278,10 @@ static int arm_smmu_map_pages(struct iommu_domain *domain, unsigned long iova,
 	if (!ops)
 		return -ENODEV;
 
+	// if (to_smmu_domain(domain)->cfg.cbndx == 5 && smmu->ioaddr == (phys_addr_t)0x8000000)
+	// 	dev_info(smmu->dev, "Mapping 0x%016lx -> 0x%016llx, domain type: %x, cbndx: %u\n",
+	// 		 iova, paddr, domain->type, to_smmu_domain(domain)->cfg.cbndx);
+
 	arm_smmu_rpm_get(smmu);
 	ret = ops->map_pages(ops, iova, paddr, pgsize, pgcount, prot, gfp, mapped);
 	arm_smmu_rpm_put(smmu);
@@ -1295,6 +1299,10 @@ static size_t arm_smmu_unmap_pages(struct iommu_domain *domain, unsigned long io
 
 	if (!ops)
 		return 0;
+
+	// if (to_smmu_domain(domain)->cfg.cbndx == 5 && smmu->ioaddr == (phys_addr_t)0x8000000)
+	// 	dev_info(smmu->dev, "Unmapping 0x%016lx, domain type: %x, cbndx: %u\n",
+	// 		 iova, domain->type, to_smmu_domain(domain)->cfg.cbndx);
 
 	arm_smmu_rpm_get(smmu);
 	ret = ops->unmap_pages(ops, iova, pgsize, pgcount, iotlb_gather);
