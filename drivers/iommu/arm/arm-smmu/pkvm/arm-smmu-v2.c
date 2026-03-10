@@ -439,11 +439,8 @@ int smmu_v2_probe_device(struct hyp_arm_smmu_v2_device *smmu)
 		return -ENODEV;
 	}
 
-	if (smmu->num_context_banks > ARM_SMMU_MAX_CBS) {
-		/*
-		 * Can't support that right now; we could make cb-related fields
-		 * dynamically allocated if we wanted to.
-		 */
+	if (smmu->num_context_banks < NUM_RESERVED_CB) {
+		/* Shouldn't really happen but hey... */
 		return -ENODEV;
 	}
 
@@ -698,7 +695,8 @@ static int smmu_v2_init_pgt(void)
 int smmu_v2_init(struct hyp_arm_smmu_v2_device *smmu)
 {
 	int ret, i;
-	size_t nr_pages, pg;
+	size_t nr_pages, pg, state_size;
+	void *state_pages;
 
 	/*
 	 * Note: UART debugging is provided by pKVM serial framework.
@@ -773,50 +771,36 @@ int smmu_v2_init(struct hyp_arm_smmu_v2_device *smmu)
 	if (ret)
 		return ret;
 
-	/* Allocate shadow arrays from hyp memory pool (now that we know num_mapping_groups) */
-	{
-		size_t smr_size = smmu->num_mapping_groups * sizeof(struct arm_smmu_smr);
-		size_t s2cr_size = smmu->num_mapping_groups * sizeof(struct arm_smmu_s2cr);
+	/* Now that we have num mapping groups, and CBs, calculate shadow state size */
+	state_size = smmu_shadow_state_size(smmu);
 
-		smmu->smrs = kvm_iommu_donate_pages_atomic(get_order(smr_size));
-		if (!smmu->smrs) {
-			smmu_err(smmu, "Failed to allocate smrs (%zu bytes)", smr_size);
-			return -ENOMEM;
-		}
-
-		smmu->s2crs = kvm_iommu_donate_pages_atomic(get_order(s2cr_size));
-		if (!smmu->s2crs) {
-			smmu_err(smmu, "Failed to allocate s2crs (%zu bytes)", s2cr_size);
-			return -ENOMEM;
-		}
-
-		smmu_info(smmu, "Allocated stream mapping arrays (%u entries, %zu bytes each)",
-			  smmu->num_mapping_groups, smr_size + s2cr_size);
+	/* Allocate shadow state from hyp memory pool */
+	state_pages = kvm_iommu_donate_pages_atomic(get_order(state_size));
+	if (!state_pages) {
+		smmu_err(smmu, "Failed to allocate structures (%zu bytes)", state_size);
+		return -ENOMEM;
 	}
 
-	bitmap_zero(smmu->cb_bitmap, ARM_SMMU_MAX_CBS);
+	memset(state_pages, 0, state_size);
+	smmu_shadow_state_from_pages(smmu, state_pages);
 
 	/* Pre-allocate hyp-reserved CBs; we know for sure we'll need them */
 	bitmap_set(smmu->cb_bitmap, 0, NUM_RESERVED_CB);
 
-	/* Initialize context bank state (all inactive) */
-	memset(smmu->cb_state, 0, sizeof(smmu->cb_state));
-	memset(smmu->host_cbndx_map, ARM_SMMU_INVALID_CB, sizeof(smmu->host_cbndx_map));
+	/* Initialize host mappings (all inactive) */
+	memset(smmu->host_cb_map, ARM_SMMU_INVALID_CB,
+	       smmu->num_context_banks * sizeof(smmu->host_cb_map[0]));
+	memset(smmu->host_sme_map, ARM_SMMU_INVALID_SME,
+	       smmu->num_mapping_groups * sizeof(smmu->host_sme_map[0]));
 
 	/* Initialize stream mapping arrays to invalid/fault state */
 	for (i = 0; i < smmu->num_mapping_groups; i++) {
-		smmu->smrs[i].valid = false;
-		smmu->smrs[i].id = 0;
-		smmu->smrs[i].mask = 0;
-
 		/*
 		 * Bypass mode by default to preserve bootloader mappings.
 		 * This allows devices initialized by firmware (display, etc.) to
 		 * continue working until they get properly attached to domains.
 		 */
 		smmu->s2crs[i].type = S2CR_TYPE_BYPASS;
-		smmu->s2crs[i].cbndx = 0;
-		smmu->s2crs[i].privcfg = 0;
 		smmu->s2crs[i].bypass = true;
 	}
 
@@ -884,11 +868,11 @@ static u8 smmu_v2_map_host_cb(struct hyp_arm_smmu_v2_device *smmu, u8 cb_idx_hos
 	if (cb_idx_host >= smmu->num_context_banks)
 		return ARM_SMMU_INVALID_CB;
 
-	cb_idx = smmu->host_cbndx_map[cb_idx_host];
+	cb_idx = smmu->host_cb_map[cb_idx_host];
 	if (cb_idx == ARM_SMMU_INVALID_CB) {
 		cb_idx = smmu_v2_alloc_cb(smmu);
 		if (cb_idx != ARM_SMMU_INVALID_CB)
-			smmu->host_cbndx_map[cb_idx_host] = cb_idx;
+			smmu->host_cb_map[cb_idx_host] = cb_idx;
 	}
 
 	return cb_idx;
@@ -906,8 +890,8 @@ static void smmu_v2_unmap_host_cb(struct hyp_arm_smmu_v2_device *smmu, u8 cb_idx
 	if (cb_idx_host >= smmu->num_context_banks)
 		return;
 
-	cb_idx = smmu->host_cbndx_map[cb_idx_host];
-	smmu->host_cbndx_map[cb_idx_host] = ARM_SMMU_INVALID_CB;
+	cb_idx = smmu->host_cb_map[cb_idx_host];
+	smmu->host_cb_map[cb_idx_host] = ARM_SMMU_INVALID_CB;
 	smmu_v2_free_cb(smmu, cb_idx);
 }
 
@@ -923,7 +907,7 @@ static u8 smmu_v2_find_host_cb_idx(struct hyp_arm_smmu_v2_device *smmu, u8 cb_id
 	u8 cb_idx_host;
 
 	for (cb_idx_host = 0; cb_idx_host < smmu->num_context_banks; cb_idx_host++) {
-		if (smmu->host_cbndx_map[cb_idx_host] == cb_idx)
+		if (smmu->host_cb_map[cb_idx_host] == cb_idx)
 			return cb_idx_host;
 	}
 
@@ -939,7 +923,7 @@ static void smmu_v2_cleanup_host_cbs(struct hyp_arm_smmu_v2_device *smmu)
 	u8 cb_idx, cb_idx_host;
 
 	for (cb_idx_host = 0; cb_idx_host < smmu->num_context_banks; cb_idx_host++) {
-		cb_idx = smmu->host_cbndx_map[cb_idx_host];
+		cb_idx = smmu->host_cb_map[cb_idx_host];
 		if (cb_idx == ARM_SMMU_INVALID_CB || smmu->cb_state[cb_idx].sctlr)
 			continue;
 
@@ -2100,11 +2084,9 @@ static bool smmu_v2_dabt_handler(struct user_pt_regs *regs, u64 esr, u64 addr)
 
 #ifdef CONFIG_ARM_SMMU_V2_PKVM_DEBUGFS
 static int smmu_v2_debug(pkvm_handle_t smmu_id, enum kvm_iommu_debug_ops op, void *out,
-			 size_t out_sz)
+			 size_t out_size)
 {
 	struct hyp_arm_smmu_v2_device *smmu;
-	size_t smt_size, array_size;
-	u8 *outp = out;
 	int ret;
 
 	if (smmu_id >= kvm_hyp_arm_smmu_v2_count) {
@@ -2115,7 +2097,7 @@ static int smmu_v2_debug(pkvm_handle_t smmu_id, enum kvm_iommu_debug_ops op, voi
 
 	smmu = &kvm_hyp_arm_smmu_v2_smmus[smmu_id];
 
-	ret = hyp_pin_shared_mem(out, out + out_sz);
+	ret = hyp_pin_shared_mem(out, out + out_size);
 	if (ret) {
 		drv_err("Failed to pin shared memory");
 		return ret;
@@ -2124,36 +2106,27 @@ static int smmu_v2_debug(pkvm_handle_t smmu_id, enum kvm_iommu_debug_ops op, voi
 	switch(op)
 	{
 	case PKVM_IOMMU_DEBUG_EXPORT_DEVICE:
-		if (out_sz < sizeof(*smmu)) {
+		if (out_size < sizeof(*smmu)) {
 			ret = -ENOMEM;
 			break;
 		}
 
-		memcpy(out, smmu, offsetof(struct hyp_arm_smmu_v2_device, smrs));
+		memcpy(out, smmu, offsetof(struct hyp_arm_smmu_v2_device, cb_state));
 		break;
-	case PKVM_IOMMU_DEBUG_EXPORT_SMT:
-		smt_size = smmu->num_mapping_groups * sizeof(smmu->smrs[0]);
-		smt_size += smmu->num_mapping_groups * sizeof(smmu->s2crs[0]);
-
-		if (out_sz < smt_size) {
+	case PKVM_IOMMU_DEBUG_EXPORT_STATE:
+		if (out_size < smmu_shadow_state_size(smmu)) {
 			ret = -ENOMEM;
 			break;
 		}
 
-		array_size = smmu->num_mapping_groups * sizeof(smmu->smrs[0]);
-		memcpy(outp, smmu->smrs, array_size);
-		outp += array_size;
-
-		array_size = smmu->num_mapping_groups * sizeof(smmu->s2crs[0]);
-		memcpy(outp, smmu->s2crs, array_size);
-		outp += array_size;
+		smmu_shadow_state_to_pages(smmu, out);
 		break;
 	default:
 		ret = -EOPNOTSUPP;
 		break;
 	}
 
-	hyp_unpin_shared_mem(out, out + out_sz);
+	hyp_unpin_shared_mem(out, out + out_size);
 	return ret;
 }
 #endif
