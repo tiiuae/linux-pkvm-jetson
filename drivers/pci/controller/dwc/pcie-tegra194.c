@@ -2106,6 +2106,22 @@ static int tegra_pcie_config_ep(struct tegra_pcie_dw *pcie,
 	return 0;
 }
 
+static ssize_t dma_cleanup_store(struct device *dev,
+				 struct device_attribute *attr,
+				 const char *buf, size_t count)
+{
+	if (dev->bus && dev->bus->dma_cleanup)
+		dev->bus->dma_cleanup(dev);
+	return count;
+}
+static DEVICE_ATTR_WO(dma_cleanup);
+
+static struct attribute *tegra234_pcie_dev_attrs[] = {
+	&dev_attr_dma_cleanup.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(tegra234_pcie_dev);
+
 static int tegra_pcie_dw_probe(struct platform_device *pdev)
 {
 	const struct tegra_pcie_dw_of_data *data;
@@ -2524,6 +2540,7 @@ static struct platform_driver tegra_pcie_dw_driver = {
 		.name	= "tegra194-pcie",
 		.pm = &tegra_pcie_dw_pm_ops,
 		.of_match_table = tegra_pcie_dw_of_match,
+		.dev_groups = tegra234_pcie_dev_groups,
 	},
 };
 module_platform_driver(tegra_pcie_dw_driver);
