@@ -542,13 +542,16 @@ int smmu_v2_reset(struct hyp_arm_smmu_v2_device *smmu)
 	/* Disable TLB broadcasting, enable VMID partitioning */
 	scr0 |= ARM_SMMU_sCR0_VMIDPNE | ARM_SMMU_sCR0_PTM;
 
+	/* Do not let conflicting matches bypass the SMMU */
+	scr0 |= ARM_SMMU_sCR0_SMCFCFG;
+
 	/*
-	 * Handle unmatched streams: clear USFCFG to allow bypass.
+	 * Handle unmatched streams: clear USFCFG to allow bypass if you face issues.
 	 * When USFCFG=0, undefined streams bypass the SMMU (no translation).
-	 * This helps during boot when not all devices are attached to domains.
+	 * This would help during boot when not all devices are attached to domains.
 	 * Security note: attached devices still use proper translation.
 	 */
-	/* scr0 &= ~ARM_SMMU_sCR0_USFCFG; -- already 0, no action needed */
+	scr0 |= ARM_SMMU_sCR0_USFCFG;
 
 	/* Disable forced broadcasting */
 	/* (FB bit is implicitly 0, no need to clear) */
@@ -881,7 +884,7 @@ static u8 smmu_v2_map_host_cb(struct hyp_arm_smmu_v2_device *smmu, u8 cb_idx_hos
 /**
  * smmu_v2_unmap_host_cb() - Unmap and free a context bank of the host
  * @smmu: SMMU device
- * @cb_idx_host: Context bank index used by the
+ * @cb_idx_host: Context bank index used by the host
  */
 static void smmu_v2_unmap_host_cb(struct hyp_arm_smmu_v2_device *smmu, u8 cb_idx_host)
 {
@@ -915,7 +918,7 @@ static u8 smmu_v2_find_host_cb_idx(struct hyp_arm_smmu_v2_device *smmu, u8 cb_id
 }
 
 /**
- * smmu_v2_cleanup_host_cbs() - Finds unused CBs by host, and unmaps thems
+ * smmu_v2_cleanup_host_cbs() - Finds unused CBs by host, and unmaps them
  * @smmu: SMMU device
  */
 static void smmu_v2_cleanup_host_cbs(struct hyp_arm_smmu_v2_device *smmu)
@@ -1004,6 +1007,106 @@ static int smmu_v2_init_s2_cb(struct hyp_arm_smmu_v2_device *smmu, struct io_pgt
 }
 
 /*
+ * Stream matching table management
+ */
+
+/**
+ * smmu_v2_alloc_sme() - Allocate a free stream matching entry
+ * @smmu: SMMU device
+ *
+ * Return: Stream matching index, or ARM_SMMU_INVALID_SME if none available
+ */
+static u8 smmu_v2_alloc_sme(struct hyp_arm_smmu_v2_device *smmu)
+{
+	u32 sme_idx;
+
+	hyp_spin_lock(&smmu->lock);
+
+	sme_idx = find_next_zero_bit(smmu->sme_bitmap, smmu->num_mapping_groups, 0);
+	if (sme_idx == smmu->num_mapping_groups)
+		sme_idx = ARM_SMMU_INVALID_SME;
+	else
+		bitmap_set(smmu->sme_bitmap, sme_idx, 1);
+
+	hyp_spin_unlock(&smmu->lock);
+	return sme_idx;
+}
+
+/**
+ * smmu_v2_free_sme() - Free a stream matching entry
+ * @smmu: SMMU device
+ * @sme_idx: Actual hardware stream matching entry index
+ */
+static void smmu_v2_free_sme(struct hyp_arm_smmu_v2_device *smmu, u8 sme_idx)
+{
+	if (sme_idx >= smmu->num_mapping_groups)
+		return;
+
+	hyp_spin_lock(&smmu->lock);
+	bitmap_clear(smmu->sme_bitmap, sme_idx, 1);
+	hyp_spin_unlock(&smmu->lock);
+}
+
+/**
+ * smmu_v2_map_host_sme() - Get or allocate a new stream matching entry for the host
+ * @smmu: SMMU device
+ * @sme_idx_host: The index that the host thinks this SME will be in.
+ *
+ * Return: Actual hardware SME index, or ARM_SMMU_INVALID_SME if none available
+ *         or invalid @sme_idx_host argument was provided.
+ */
+static u8 smmu_v2_map_host_sme(struct hyp_arm_smmu_v2_device *smmu, u8 sme_idx_host)
+{
+	u8 sme_idx;
+
+	if (sme_idx_host >= smmu->num_mapping_groups)
+		return ARM_SMMU_INVALID_SME;
+
+	sme_idx = smmu->host_sme_map[sme_idx_host];
+	if (sme_idx == ARM_SMMU_INVALID_SME) {
+		sme_idx = smmu_v2_alloc_sme(smmu);
+		if (sme_idx != ARM_SMMU_INVALID_SME)
+			smmu->host_sme_map[sme_idx_host] = sme_idx;
+	}
+
+	return sme_idx;
+}
+
+/**
+ * smmu_v2_unmap_host_sme() - Unmap and free a stream matching entry of the host
+ * @smmu: SMMU device
+ * @sme_idx_host: Stream matching entry index used by the host
+ */
+static void smmu_v2_unmap_host_sme(struct hyp_arm_smmu_v2_device *smmu, u8 sme_idx_host)
+{
+	u8 sme_idx;
+
+	if (sme_idx_host >= smmu->num_mapping_groups)
+		return;
+
+	sme_idx = smmu->host_sme_map[sme_idx_host];
+	smmu->host_sme_map[sme_idx_host] = ARM_SMMU_INVALID_SME;
+	smmu_v2_free_sme(smmu, sme_idx);
+}
+
+/**
+ * smmu_v2_cleanup_host_smes() - Finds unused SMEs by host, and unmaps them
+ * @smmu: SMMU device
+ */
+static void smmu_v2_cleanup_host_smes(struct hyp_arm_smmu_v2_device *smmu)
+{
+	u8 sme_idx, sme_idx_host;
+
+	for (sme_idx_host = 0; sme_idx_host < smmu->num_mapping_groups; sme_idx_host++) {
+		sme_idx = smmu->host_sme_map[sme_idx_host];
+		if (sme_idx == ARM_SMMU_INVALID_SME || smmu->smrs[sme_idx].valid)
+			continue;
+
+		smmu_v2_unmap_host_sme(smmu, sme_idx_host);
+	}
+}
+
+/*
  * MMIO Emulation
  */
 
@@ -1027,6 +1130,34 @@ int smmu_v2_handle_gr0(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 {
 	u32 val32;
 	u8 cb_idx, cb_idx_host;
+	u8 sme_idx_host, sme_idx;
+	int smereg_idx; /* 0: SMR, 1: S2CR */
+	u32 smereg_base[2] = {
+		ARM_SMMU_GR0_SMR(0),
+		ARM_SMMU_GR0_S2CR(0)
+	};
+
+	/* Find out which stream matching register it's trying to access, if any */
+	for (smereg_idx = 0; smereg_idx < 2; smereg_idx++) {
+		if (offset < smereg_base[smereg_idx] ||
+		    offset >= smereg_base[smereg_idx] + smmu->num_mapping_groups * 4)
+			continue;
+
+		sme_idx_host = (offset - smereg_base[smereg_idx]) >> 2;
+		if (sme_idx_host >= smmu->num_mapping_groups)
+			return -EINVAL;
+
+		sme_idx = smmu_v2_map_host_sme(smmu, sme_idx_host);
+
+		/* Ran out of SMEss; not sure what's best here, -EINVAL or 0 */
+		if (sme_idx == ARM_SMMU_INVALID_SME) {
+			*val = 0;
+			return 0;
+		}
+
+		offset = smereg_base[smereg_idx] + sme_idx * 4;
+		break;
+	}
 
 	/* ID registers - read-only capability reporting */
 	if (offset >= ARM_SMMU_GR0_ID0 && offset <= ARM_SMMU_GR0_ID7) {
@@ -1041,6 +1172,10 @@ int smmu_v2_handle_gr0(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 
 			/* Don't advertise stage-2 or nesting capabilities */
 			val32 &= ~(ARM_SMMU_ID0_S2TS | ARM_SMMU_ID0_NTS);
+
+			/* Don't advertise extended IDs feature; this driver doesn't support it */
+			val32 &= ~ARM_SMMU_ID0_EXIDS;
+
 			*val = val32;
 		} else if (offset == ARM_SMMU_GR0_ID1) {
 			val32 = (u32)*val;
@@ -1063,17 +1198,31 @@ int smmu_v2_handle_gr0(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 			val32 = (u32)*val;
 
 			if (val32 & ARM_SMMU_sCR0_CLIENTPD) {
-				/* Can't let host bypass translation globally */
+				/*
+				 * Can't let host bypass translation globally. This is done on 2
+				 * occassions: 1) during boot, and 2) during shutdown. During
+				 * boot, supposedly it is done to preserve boot mappings set by
+				 * the firmware. This might break such support, though t234
+				 * doesn't appear to make use of it. Regarding shutdown, masking
+				 * this doesn't seem to cause any issues.
+				 */
 				val32 &= ~ARM_SMMU_sCR0_CLIENTPD;
 			} else {
 				/*
 				 * Writing to sCR0 is the epilogue of the reset sequence. Right
 				 * before that (also part of the reset sequence), the host accesses
 				 * all CBs' SCTLR (writes 0). This causes our host_cb_map to be
-				 * fully populated. Clean up here.
+				 * fully populated. Clean up here and clean up also SMEs.
 				 */
 				smmu_v2_cleanup_host_cbs(smmu);
+				smmu_v2_cleanup_host_smes(smmu);
 			}
+
+			/*
+			 * We haven't advertised extended ID support but the host could still
+			 * try to use it as part of an attack. Mask it.
+			 */
+			val32 &= ~ARM_SMMU_sCR0_EXIDENABLE;
 
 			/*
 			 * Enforce USFCFG=1: unmapped streams must fault, not bypass.
@@ -1082,9 +1231,7 @@ int smmu_v2_handle_gr0(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 			 */
 			val32 |= ARM_SMMU_sCR0_USFCFG;
 
-			/*
-			 * Do not let conflicting matches bypass the SMMU
-			 */
+			/* Do not let conflicting matches bypass the SMMU */
 			val32 |= ARM_SMMU_sCR0_SMCFCFG;
 
 			/* Always keep fault reporting enabled */
@@ -1156,42 +1303,41 @@ int smmu_v2_handle_gr0(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 	}
 
 	/* SMR registers - stream match configuration (shadow state) */
-	if (offset >= ARM_SMMU_GR0_SMR(0) &&
-	    offset < ARM_SMMU_GR0_SMR(0) + (smmu->num_mapping_groups * 4)) {
-		u32 idx = (offset - ARM_SMMU_GR0_SMR(0)) >> 2;
-
-		if (idx >= smmu->num_mapping_groups)
-			return -EINVAL;
-
+	if (smereg_idx == 0) {
 		if (is_write) {
 			val32 = (u32)*val;
 
+			if (!(val32 & ARM_SMMU_SMR_VALID) && smmu->smrs[sme_idx].valid) {
+				/*
+				 * Host is disabling this SME; unmap it; Checking val32 alone
+				 * is not sufficient here as the host writes it invalid also
+				 * during reset (when our shadow .valid is also 0) and we
+				 * don't want to interfere with the initial reset sequence.
+				 */
+				smmu_v2_unmap_host_sme(smmu, sme_idx_host);
+			}
+
 			/* Update shadow state */
-			smmu->smrs[idx].valid = !!(val32 & ARM_SMMU_SMR_VALID);
-			smmu->smrs[idx].mask = FIELD_GET(ARM_SMMU_SMR_MASK, val32);
-			smmu->smrs[idx].id = FIELD_GET(ARM_SMMU_SMR_ID, val32);
+			smmu->smrs[sme_idx].valid = !!(val32 & ARM_SMMU_SMR_VALID);
+			smmu->smrs[sme_idx].mask = FIELD_GET(ARM_SMMU_SMR_MASK, val32);
+			smmu->smrs[sme_idx].id = FIELD_GET(ARM_SMMU_SMR_ID, val32);
 
 			/* Write through to hardware (no modification needed for SMR) */
 			smmu_writel(smmu, ARM_SMMU_GR0, offset, val32);
 		} else {
 			/* Return shadow state */
 			val32 = 0;
-			if (smmu->smrs[idx].valid)
+			if (smmu->smrs[sme_idx].valid)
 				val32 |= ARM_SMMU_SMR_VALID;
-			val32 |= FIELD_PREP(ARM_SMMU_SMR_MASK, smmu->smrs[idx].mask);
-			val32 |= FIELD_PREP(ARM_SMMU_SMR_ID, smmu->smrs[idx].id);
+			val32 |= FIELD_PREP(ARM_SMMU_SMR_MASK, smmu->smrs[sme_idx].mask);
+			val32 |= FIELD_PREP(ARM_SMMU_SMR_ID, smmu->smrs[sme_idx].id);
 			*val = val32;
 		}
 		return 0;
 	}
 
 	/* S2CR registers - stream-to-context mapping (shadow + enforce Stage-2) */
-	if (offset >= ARM_SMMU_GR0_S2CR(0) &&
-	    offset < ARM_SMMU_GR0_S2CR(0) + (smmu->num_mapping_groups * 4)) {
-		u32 idx = (offset - ARM_SMMU_GR0_S2CR(0)) >> 2;
-		if (idx >= smmu->num_mapping_groups)
-			return -EINVAL;
-
+	if (smereg_idx == 1) {
 		if (is_write) {
 			val32 = (u32)*val;
 
@@ -1207,35 +1353,36 @@ int smmu_v2_handle_gr0(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 			val32 |= FIELD_PREP(ARM_SMMU_S2CR_CBNDX, cb_idx);
 
 			/* Update shadow state */
-			smmu->s2crs[idx].type = FIELD_GET(ARM_SMMU_S2CR_TYPE, val32);
-			smmu->s2crs[idx].cbndx = FIELD_GET(ARM_SMMU_S2CR_CBNDX, val32);
-			smmu->s2crs[idx].privcfg = FIELD_GET(ARM_SMMU_S2CR_PRIVCFG, val32);
-			smmu->s2crs[idx].bypass = (smmu->s2crs[idx].type == S2CR_TYPE_BYPASS);
+			smmu->s2crs[sme_idx].type = FIELD_GET(ARM_SMMU_S2CR_TYPE, val32);
+			smmu->s2crs[sme_idx].cbndx = FIELD_GET(ARM_SMMU_S2CR_CBNDX, val32);
+			smmu->s2crs[sme_idx].privcfg = FIELD_GET(ARM_SMMU_S2CR_PRIVCFG, val32);
+			smmu->s2crs[sme_idx].bypass =
+				(smmu->s2crs[sme_idx].type == S2CR_TYPE_BYPASS);
 
 			/* We don't allow bypass */
-			if (smmu->s2crs[idx].type == S2CR_TYPE_BYPASS) {
+			if (smmu->s2crs[sme_idx].type == S2CR_TYPE_BYPASS) {
 				val32 &= ~ARM_SMMU_S2CR_TYPE;
 				val32 |= FIELD_PREP(ARM_SMMU_S2CR_TYPE, S2CR_TYPE_FAULT);
 
 				/* And let s2crs[idx].bypass indicate that we modified this */
-				smmu->s2crs[idx].type = FIELD_GET(ARM_SMMU_S2CR_TYPE, val32);
+				smmu->s2crs[sme_idx].type = FIELD_GET(ARM_SMMU_S2CR_TYPE, val32);
 			}
 
 			/* Write to hardware */
 			smmu_writel(smmu, ARM_SMMU_GR0, offset, val32);
 		} else {
 			/* Return shadow state; let the host think this is set to bypass */
-			if (smmu->s2crs[idx].bypass)
+			if (smmu->s2crs[sme_idx].bypass)
 				val32 = FIELD_PREP(ARM_SMMU_S2CR_TYPE, S2CR_TYPE_BYPASS);
 			else
-				val32 = FIELD_PREP(ARM_SMMU_S2CR_TYPE, smmu->s2crs[idx].type);
+				val32 = FIELD_PREP(ARM_SMMU_S2CR_TYPE, smmu->s2crs[sme_idx].type);
 
 			/* Map actual hardware CB index back to host index */
-			cb_idx = FIELD_PREP(ARM_SMMU_S2CR_CBNDX, smmu->s2crs[idx].cbndx);
+			cb_idx = FIELD_PREP(ARM_SMMU_S2CR_CBNDX, smmu->s2crs[sme_idx].cbndx);
 			cb_idx_host = smmu_v2_find_host_cb_idx(smmu, cb_idx);
 
 			val32 |= FIELD_PREP(ARM_SMMU_S2CR_CBNDX, cb_idx_host);
-			val32 |= FIELD_PREP(ARM_SMMU_S2CR_PRIVCFG, smmu->s2crs[idx].privcfg);
+			val32 |= FIELD_PREP(ARM_SMMU_S2CR_PRIVCFG, smmu->s2crs[sme_idx].privcfg);
 			*val = val32;
 		}
 		return 0;
@@ -1422,7 +1569,10 @@ int smmu_v2_handle_cb(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 				/*
 				 * Host is destroying a context; unmap it. Checking for !val32
 				 * alone is not sufficient as the host writes 0 also during
-				 * reset (when our shadow sctlr is also 0).
+				 * reset (when our shadow sctlr is also 0) and we don't want
+				 * to interfere with the initial reset sequence, otherwise we
+				 * would have the host configuring the same index again and again
+				 * instead of all of them.
 				 */
 				smmu_v2_unmap_host_cb(smmu, cb_idx_host);
 			}
