@@ -3,7 +3,7 @@
 
 #include <asm/kvm_host.h>
 
-#include "pkvm/arm-smmu-v2-shared.h"
+#include "pkvm/arm-smmu-v2.h"
 
 #ifdef CONFIG_ARM_SMMU_V2_PKVM_DEBUGFS
 void kvm_smmu_host_create_debugfs(pkvm_handle_t hyp_drv_id, struct hyp_arm_smmu_v2_device *smmus,

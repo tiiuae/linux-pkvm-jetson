@@ -24,7 +24,6 @@
 #include <asm/kvm_mmu.h>
 #include <asm/kvm_pkvm.h>
 
-#include "pkvm/arm-smmu-v2-shared.h"
 #include "arm-smmu-kvm-debugfs.h"
 
 /* Feature flags - must match pkvm/arm-smmu-v2.h */
