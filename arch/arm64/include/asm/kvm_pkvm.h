@@ -358,7 +358,7 @@ struct pkvm_ptdump_log_hdr {
 
 enum kvm_iommu_debug_ops {
 	PKVM_IOMMU_DEBUG_EXPORT_DEVICE,
-	PKVM_IOMMU_DEBUG_EXPORT_SMT,
+	PKVM_IOMMU_DEBUG_EXPORT_STATE,
 };
 
 #endif	/* __ARM64_KVM_PKVM_H__ */
