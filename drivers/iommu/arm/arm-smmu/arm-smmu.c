@@ -1400,9 +1400,21 @@ static phys_addr_t arm_smmu_iova_to_phys(struct iommu_domain *domain,
 static bool arm_smmu_capable(struct device *dev, enum iommu_cap cap)
 {
 	struct arm_smmu_master_cfg *cfg = dev_iommu_priv_get(dev);
+	struct arm_smmu_device *smmu = cfg->smmu;
+	const struct device_node *dn = smmu->dev->of_node;
 
 	switch (cap) {
 	case IOMMU_CAP_CACHE_COHERENCY:
+		if (smmu->model == ARM_MMU500 &&
+		    of_device_is_compatible(dn, "nvidia,tegra234-smmu")) {
+			/*
+			 * Fake the cache coherency support for Nvidia Orin AGX/NX
+			 * to allow VFIO usage. Their CoreLink MMU-500 SMMU
+			 * does not advertise support for coherent walk, but
+			 * vfio-pci works fine without it.
+			 */
+			return true;
+		}
 		/*
 		 * It's overwhelmingly the case in practice that when the pagetable
 		 * walk interface is connected to a coherent interconnect, all the
