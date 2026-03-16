@@ -756,28 +756,27 @@ static int smmu_reset(struct hyp_arm_smmu_v2_device *smmu)
 	reg = smmu_readl(smmu, ARM_SMMU_GR0, ARM_SMMU_GR0_sGFSR);
 	smmu_writel(smmu, ARM_SMMU_GR0, ARM_SMMU_GR0_sGFSR, reg);
 
-	/*
-	 * 2. Reset stream mapping groups: Initial values mark all SMRn as
-	 * invalid and all S2CRn as bypass (not fault) to preserve bootloader
-	 * mappings. This is critical for Tegra234 where the bootloader leaves
-	 * devices like display active with ongoing DMA. Setting to FAULT mode
-	 * would cause these devices to fault immediately.
-	 *
-	 * When devices get properly attached to domains, their S2CR entries
-	 * will be updated to TRANS mode with proper context bank assignments.
-	 */
+	/* 2. Reset stream mapping groups */
 	for (i = 0; i < smmu->num_mapping_groups; i++) {
 		/* Clear SMR (mark as invalid) */
 		smmu_writel(smmu, ARM_SMMU_GR0, ARM_SMMU_GR0_SMR(i), 0);
 
 		/*
-		 * Set S2CR to BYPASS type (allow unmapped streams to pass through).
-		 * This matches the behavior of the standard ARM SMMU driver which
-		 * preserves bootloader mappings for seamless handover (e.g., display
-		 * from firmware to kernel).
+		 * Set S2CR to FAULT.
+		 * Warning: this is different from Linux which tries to preserve
+		 *          boot mappings set by the firmware by allowing them
+		 *          to bypass. It is not clear whether that is necessary.
+		 *          This behaviour has not been tested with a connected
+		 *          display, where presumably it could cause a (hopefully)
+		 *          brief interuption. If such devices do not come back,
+		 *          then a mechanism would have to be devised so that we
+		 *          allow such mappings until some point in time, but not
+		 *          longer. A good candidate for such point might be
+		 *          host_stage2_idmap(), during which we attach the host's
+		 *          stage-2 just to be safe.
 		 */
 		smmu_writel(smmu, ARM_SMMU_GR0, ARM_SMMU_GR0_S2CR(i),
-			    FIELD_PREP(ARM_SMMU_S2CR_TYPE, S2CR_TYPE_BYPASS));
+			    FIELD_PREP(ARM_SMMU_S2CR_TYPE, S2CR_TYPE_FAULT));
 	}
 
 	/* 3. Make sure all context banks are disabled and clear CB_FSR */
@@ -923,15 +922,8 @@ static int smmu_init(struct hyp_arm_smmu_v2_device *smmu)
 	       smmu->num_mapping_groups * sizeof(smmu->host_sme_map[0]));
 
 	/* Initialize stream mapping arrays to invalid/fault state */
-	for (i = 0; i < smmu->num_mapping_groups; i++) {
-		/*
-		 * Bypass mode by default to preserve bootloader mappings.
-		 * This allows devices initialized by firmware (display, etc.) to
-		 * continue working until they get properly attached to domains.
-		 */
-		smmu->s2crs[i].type = S2CR_TYPE_BYPASS;
-		smmu->s2crs[i].bypass = true;
-	}
+	for (i = 0; i < smmu->num_mapping_groups; i++)
+		smmu->s2crs[i].type = S2CR_TYPE_FAULT;
 
 	/* Reset and configure hardware */
 	ret = smmu_reset(smmu);
