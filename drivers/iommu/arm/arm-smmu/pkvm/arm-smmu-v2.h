@@ -22,6 +22,7 @@
 #endif
 
 #include <linux/bitmap.h>
+#include <linux/io-pgtable.h>
 #include <linux/io.h>
 
 /* Align @cur_size to @type and add size of @num elements of @type */
@@ -87,16 +88,237 @@
 #define ARM_SMMU_FEAT_STREAM_MATCH	BIT(5)
 
 /*
+ * ARM SMMUv2 Register Definitions
+ * Complete set imported from arm-smmu.h for EL2 implementation
+ */
+
+/* GR0 Configuration Registers */
+#define ARM_SMMU_GR0_sCR0		0x0
+#define ARM_SMMU_sCR0_VMID16EN		BIT(31)
+#define ARM_SMMU_sCR0_SMCFCFG		BIT(21)
+#define ARM_SMMU_sCR0_BSU		GENMASK(15, 14)
+#define ARM_SMMU_sCR0_FB		BIT(13)
+#define ARM_SMMU_sCR0_PTM		BIT(12)
+#define ARM_SMMU_sCR0_VMIDPNE		BIT(11)
+#define ARM_SMMU_sCR0_USFCFG		BIT(10)
+#define ARM_SMMU_sCR0_GCFGFIE		BIT(5)
+#define ARM_SMMU_sCR0_GCFGFRE		BIT(4)
+#define ARM_SMMU_sCR0_EXIDENABLE	BIT(3)
+#define ARM_SMMU_sCR0_GFIE		BIT(2)
+#define ARM_SMMU_sCR0_GFRE		BIT(1)
+#define ARM_SMMU_sCR0_CLIENTPD		BIT(0)
+
+/* GR0 Identification Registers */
+#define ARM_SMMU_GR0_ID0		0x20
+#define ARM_SMMU_ID0_S1TS		BIT(30)
+#define ARM_SMMU_ID0_S2TS		BIT(29)
+#define ARM_SMMU_ID0_NTS		BIT(28)
+#define ARM_SMMU_ID0_SMS		BIT(27)
+#define ARM_SMMU_ID0_ATOSNS		BIT(26)
+#define ARM_SMMU_ID0_PTFS_NO_AARCH32	BIT(25)
+#define ARM_SMMU_ID0_PTFS_NO_AARCH32S	BIT(24)
+#define ARM_SMMU_ID0_NUMIRPT		GENMASK(23, 16)
+#define ARM_SMMU_ID0_CTTW		BIT(14)
+#define ARM_SMMU_ID0_NUMSIDB		GENMASK(12, 9)
+#define ARM_SMMU_ID0_EXIDS		BIT(8)
+#define ARM_SMMU_ID0_NUMSMRG		GENMASK(7, 0)
+
+#define ARM_SMMU_GR0_ID1		0x24
+#define ARM_SMMU_ID1_PAGESIZE		BIT(31)
+#define ARM_SMMU_ID1_NUMPAGENDXB	GENMASK(30, 28)
+#define ARM_SMMU_ID1_NUMS2CB		GENMASK(23, 16)
+#define ARM_SMMU_ID1_NUMCB		GENMASK(7, 0)
+
+#define ARM_SMMU_GR0_ID2		0x28
+#define ARM_SMMU_ID2_VMID16		BIT(15)
+#define ARM_SMMU_ID2_PTFS_64K		BIT(14)
+#define ARM_SMMU_ID2_PTFS_16K		BIT(13)
+#define ARM_SMMU_ID2_PTFS_4K		BIT(12)
+#define ARM_SMMU_ID2_UBS		GENMASK(11, 8)
+#define ARM_SMMU_ID2_OAS		GENMASK(7, 4)
+#define ARM_SMMU_ID2_IAS		GENMASK(3, 0)
+
+#define ARM_SMMU_GR0_ID7		0x3c
+#define ARM_SMMU_ID7_MAJOR		GENMASK(7, 4)
+#define ARM_SMMU_ID7_MINOR		GENMASK(3, 0)
+
+/* GR0 Fault Registers */
+#define ARM_SMMU_GR0_sGFSR		0x48
+#define ARM_SMMU_sGFSR_USF		BIT(1)
+
+#define ARM_SMMU_GR0_sGFSYNR0		0x50
+#define ARM_SMMU_GR0_sGFSYNR1		0x54
+#define ARM_SMMU_GR0_sGFSYNR2		0x58
+
+/* GR0 Global TLB Invalidation */
+#define ARM_SMMU_GR0_TLBIVMID		0x64
+#define ARM_SMMU_GR0_TLBIALLNSNH	0x68
+#define ARM_SMMU_GR0_TLBIALLH		0x6c
+#define ARM_SMMU_GR0_sTLBGSYNC		0x70
+
+#define ARM_SMMU_GR0_sTLBGSTATUS	0x74
+#define ARM_SMMU_sTLBGSTATUS_GSACTIVE	BIT(0)
+
+/* GR0 Stream Mapping Registers */
+#define ARM_SMMU_GR0_SMR(n)		(0x800 + ((n) << 2))
+#define ARM_SMMU_SMR_VALID		BIT(31)
+#define ARM_SMMU_SMR_MASK		GENMASK(31, 16)
+#define ARM_SMMU_SMR_ID			GENMASK(15, 0)
+
+#define ARM_SMMU_GR0_S2CR(n)		(0xc00 + ((n) << 2))
+#define ARM_SMMU_S2CR_PRIVCFG		GENMASK(25, 24)
+#define ARM_SMMU_S2CR_TYPE		GENMASK(17, 16)
+#define ARM_SMMU_S2CR_EXIDVALID		BIT(10)
+#define ARM_SMMU_S2CR_CBNDX		GENMASK(7, 0)
+
+/* S2CR Type values */
+#define S2CR_TYPE_TRANS			0
+#define S2CR_TYPE_BYPASS		1
+#define S2CR_TYPE_FAULT			2
+
+/* GR1 Context Bank Attribute Registers */
+#define ARM_SMMU_GR1_CBAR(n)		(0x0 + ((n) << 2))
+#define ARM_SMMU_CBAR_IRPTNDX		GENMASK(31, 24)
+#define ARM_SMMU_CBAR_TYPE		GENMASK(17, 16)
+#define ARM_SMMU_CBAR_S1_MEMATTR	GENMASK(15, 12)
+#define ARM_SMMU_CBAR_S1_MEMATTR_WB	0xf
+#define ARM_SMMU_CBAR_S1_BPSHCFG	GENMASK(9, 8)
+#define ARM_SMMU_CBAR_S1_BPSHCFG_NSH	3
+#define ARM_SMMU_CBAR_S1_CBNDX		GENMASK(15, 8)
+#define ARM_SMMU_CBAR_VMID		GENMASK(7, 0)
+
+/* CBAR Type values */
+#define CBAR_TYPE_S2_TRANS		0
+#define CBAR_TYPE_S1_TRANS_S2_BYPASS	1
+#define CBAR_TYPE_S1_TRANS_S2_FAULT	2
+#define CBAR_TYPE_S1_TRANS_S2_TRANS	3
+
+#define ARM_SMMU_GR1_CBFRSYNRA(n)	(0x400 + ((n) << 2))
+#define ARM_SMMU_CBFRSYNRA_SID		GENMASK(15, 0)
+
+#define ARM_SMMU_GR1_CBA2R(n)		(0x800 + ((n) << 2))
+#define ARM_SMMU_CBA2R_VMID16		GENMASK(31, 16)
+#define ARM_SMMU_CBA2R_VA64		BIT(0)
+
+/* Context Bank Registers (relative to CB base) */
+#define ARM_SMMU_CB_SCTLR		0x0
+#define ARM_SMMU_SCTLR_S1_ASIDPNE	BIT(12)
+#define ARM_SMMU_SCTLR_CFCFG		BIT(7)
+#define ARM_SMMU_SCTLR_HUPCF		BIT(8)
+#define ARM_SMMU_SCTLR_CFIE		BIT(6)
+#define ARM_SMMU_SCTLR_CFRE		BIT(5)
+#define ARM_SMMU_SCTLR_E		BIT(4)
+#define ARM_SMMU_SCTLR_AFE		BIT(2)
+#define ARM_SMMU_SCTLR_TRE		BIT(1)
+#define ARM_SMMU_SCTLR_M		BIT(0)
+
+#define ARM_SMMU_CB_ACTLR		0x4
+#define ARM_SMMU_CB_RESUME		0x8
+#define ARM_SMMU_RESUME_TERMINATE	BIT(0)
+
+#define ARM_SMMU_CB_TCR2		0x10
+#define ARM_SMMU_TCR2_SEP		GENMASK(17, 15)
+#define ARM_SMMU_TCR2_SEP_UPSTREAM	0x7
+#define ARM_SMMU_TCR2_AS		BIT(4)
+#define ARM_SMMU_TCR2_PASIZE		GENMASK(3, 0)
+
+#define ARM_SMMU_CB_TTBR0		0x20
+#define ARM_SMMU_CB_TTBR1		0x28
+#define ARM_SMMU_TTBRn_ASID		GENMASK_ULL(63, 48)
+
+#define ARM_SMMU_CB_TCR			0x30
+#define ARM_SMMU_TCR_EAE		BIT(31)
+#define ARM_SMMU_TCR_EPD1		BIT(23)
+#define ARM_SMMU_TCR_A1			BIT(22)
+#define ARM_SMMU_TCR_TG0		GENMASK(15, 14)
+#define ARM_SMMU_TCR_SH0		GENMASK(13, 12)
+#define ARM_SMMU_TCR_ORGN0		GENMASK(11, 10)
+#define ARM_SMMU_TCR_IRGN0		GENMASK(9, 8)
+#define ARM_SMMU_TCR_EPD0		BIT(7)
+#define ARM_SMMU_TCR_T0SZ		GENMASK(5, 0)
+
+/* VTCR fields (Stage-2 translation control via TCR2 in Stage-2-only mode) */
+#define ARM_SMMU_VTCR_TG1_4KB		BIT(31)
+#define ARM_SMMU_VTCR_PS		GENMASK(18, 16)
+#define ARM_SMMU_VTCR_TG0		ARM_SMMU_TCR_TG0
+#define ARM_SMMU_VTCR_SH0		ARM_SMMU_TCR_SH0
+#define ARM_SMMU_VTCR_ORGN0		ARM_SMMU_TCR_ORGN0
+#define ARM_SMMU_VTCR_IRGN0		ARM_SMMU_TCR_IRGN0
+#define ARM_SMMU_VTCR_SL0		GENMASK(7, 6)
+#define ARM_SMMU_VTCR_T0SZ		ARM_SMMU_TCR_T0SZ
+
+#define ARM_SMMU_CB_CONTEXTIDR		0x34
+#define ARM_SMMU_CB_S1_MAIR0		0x38
+#define ARM_SMMU_CB_S1_MAIR1		0x3c
+
+#define ARM_SMMU_CB_FSR			0x58
+#define ARM_SMMU_CB_FSR_MULTI		BIT(31)
+#define ARM_SMMU_CB_FSR_SS		BIT(30)
+#define ARM_SMMU_CB_FSR_FORMAT		GENMASK(10, 9)
+#define ARM_SMMU_CB_FSR_UUT		BIT(8)
+#define ARM_SMMU_CB_FSR_ASF		BIT(7)
+#define ARM_SMMU_CB_FSR_TLBLKF		BIT(6)
+#define ARM_SMMU_CB_FSR_TLBMCF		BIT(5)
+#define ARM_SMMU_CB_FSR_EF		BIT(4)
+#define ARM_SMMU_CB_FSR_PF		BIT(3)
+#define ARM_SMMU_CB_FSR_AFF		BIT(2)
+#define ARM_SMMU_CB_FSR_TF		BIT(1)
+
+#define ARM_SMMU_CB_FSR_IGN		(ARM_SMMU_CB_FSR_AFF |		\
+					 ARM_SMMU_CB_FSR_ASF |		\
+					 ARM_SMMU_CB_FSR_TLBMCF |	\
+					 ARM_SMMU_CB_FSR_TLBLKF)
+
+#define ARM_SMMU_CB_FSR_FAULT		(ARM_SMMU_CB_FSR_MULTI |	\
+					 ARM_SMMU_CB_FSR_SS |		\
+					 ARM_SMMU_CB_FSR_UUT |		\
+					 ARM_SMMU_CB_FSR_EF |		\
+					 ARM_SMMU_CB_FSR_PF |		\
+					 ARM_SMMU_CB_FSR_TF |		\
+					 ARM_SMMU_CB_FSR_IGN)
+
+#define ARM_SMMU_CB_FAR			0x60
+
+#define ARM_SMMU_CB_FSYNR0		0x68
+#define ARM_SMMU_CB_FSYNR0_PLVL		GENMASK(1, 0)
+#define ARM_SMMU_CB_FSYNR0_WNR		BIT(4)
+#define ARM_SMMU_CB_FSYNR0_PNU		BIT(5)
+#define ARM_SMMU_CB_FSYNR0_IND		BIT(6)
+#define ARM_SMMU_CB_FSYNR0_NSATTR	BIT(8)
+#define ARM_SMMU_CB_FSYNR0_PTWF		BIT(10)
+#define ARM_SMMU_CB_FSYNR0_AFR		BIT(11)
+#define ARM_SMMU_CB_FSYNR0_S1CBNDX	GENMASK(23, 16)
+
+/* Context Bank TLB Invalidation */
+#define ARM_SMMU_CB_S1_TLBIVA		0x600
+#define ARM_SMMU_CB_S1_TLBIASID		0x610
+#define ARM_SMMU_CB_S1_TLBIVAL		0x620
+#define ARM_SMMU_CB_S2_TLBIIPAS2	0x630
+#define ARM_SMMU_CB_S2_TLBIIPAS2L	0x638
+#define ARM_SMMU_CB_TLBSYNC		0x7f0
+#define ARM_SMMU_CB_TLBSTATUS		0x7f4
+
+/* Address Translation Service registers */
+#define ARM_SMMU_CB_PAR			0x50
+#define ARM_SMMU_CB_PAR_F		BIT(0)
+#define ARM_SMMU_CB_ATS1PR		0x800
+#define ARM_SMMU_CB_ATSR		0x8f0
+#define ARM_SMMU_CB_ATSR_ACTIVE		BIT(0)
+
+/* Timeouts */
+#define TLB_LOOP_TIMEOUT		1000000	/* 1s */
+
+/*
  * Stream Match Register (SMR) and Stream-to-Context Register (S2CR)
  * These are shadowed by EL2 to enforce nested translation
  */
-struct arm_smmu_smr {
+struct smmu_v2_smr {
 	u16			mask;
 	u16			id;
 	bool			valid;
 };
 
-struct arm_smmu_s2cr {
+struct smmu_v2_s2cr {
 	u8			type;
 	u8			cbndx;
 	u8			privcfg;
@@ -109,15 +331,17 @@ struct arm_smmu_s2cr {
  * Tracks per-CB translation configuration. This structure is part of
  * struct hyp_arm_smmu_v2_device and must have a fixed, known size.
  */
-struct smmu_v2_cb_state {
-	u32			domain_id;	/* pkvm_handle_t - owning domain */
+struct smmu_v2_cb {
+	u16			asid;		/* Address Space ID (S1) */
+	union {
+		u16		vmid;		/* Virtual Machine ID (S2) */
+		u16		domain_id;	/* Hyp domain id */
+	};
 	u32			cbar;		/* Context Bank Attribute Register */
 	u32			tcr[2];		/* Translation Control Register */
 	u64			ttbr[2];	/* Translation Table Base Register */
 	u32			sctlr;		/* System Control Register */
 	u32			mair[2];	/* Memory Attribute Indirection (Stage 1-only) */
-	u16			vmid;		/* Virtual Machine ID */
-	bool			reserved;	/* Is this CB in use by the hypervisor */
 };
 
 /*
@@ -157,15 +381,16 @@ struct hyp_arm_smmu_v2_device {
 	u32			numpage;	/* Number of GR pages (CB pages start at numpage) */
 	unsigned long		pgsize_bitmap;
 	u8			pgshift;	/* Page size shift */
-	u8			ias;		/* Input address size (bits) */
-	u8			oas;		/* Output address size (bits) */
-	u16			vmid_bits;
+	u8			ubs;		/* Upstream bus size (VA, bits) */
+	u8			ias;		/* IPA address size (bits) */
+	u8			oas;		/* Output address size (PA, bits) */
+	u16			sid_bits;	/* SID size (bits) */
 
 	/*
 	 * Context Bank Management
 	 * Per-CB state for all 128 context banks.
 	 */
-	struct smmu_v2_cb_state	*cb_state;
+	struct smmu_v2_cb	*cbs;
 
 	/* Whether a context bank is in use or not, by anyone */
 	unsigned long 		*cb_bitmap;
@@ -181,8 +406,8 @@ struct hyp_arm_smmu_v2_device {
 	 * Stream Mapping Table
 	 * Pointers to arrays for SMR/S2CR registers.
 	 */
-	struct arm_smmu_smr 	*smrs;
-	struct arm_smmu_s2cr 	*s2crs;
+	struct smmu_v2_smr 	*smrs;
+	struct smmu_v2_s2cr 	*s2crs;
 
 	/* Whether a stream matching entry is in use or not, by anyone */
 	unsigned long 		*sme_bitmap;
@@ -262,19 +487,7 @@ extern struct kvm_iommu_ops smmu_v2_ops;
  */
 
 /* Device initialization */
-int smmu_v2_probe_device(struct hyp_arm_smmu_v2_device *smmu);
-int smmu_v2_reset(struct hyp_arm_smmu_v2_device *smmu);
-int smmu_v2_init(struct hyp_arm_smmu_v2_device *smmu);
 int smmu_v2_global_init(pkvm_handle_t drv_id);
-
-/* MMIO emulation */
-bool smmu_v2_mmio_handler(u64 addr, bool is_write, u64 *val);
-int smmu_v2_handle_gr0(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
-		       bool is_write, u64 *val);
-int smmu_v2_handle_gr1(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
-		       bool is_write, u64 *val);
-int smmu_v2_handle_cb(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
-		      bool is_write, u64 *val);
 
 /* TLB operations */
 void smmu_v2_tlb_inv_context(struct hyp_arm_smmu_v2_device *smmu, u8 cb_idx);
@@ -315,6 +528,61 @@ static inline u64 smmu_readq(struct hyp_arm_smmu_v2_device *smmu,
 	return readq_relaxed(smmu->base + page + offset);
 }
 
+static inline u32 smmu_lpae_tcr(const struct io_pgtable_cfg *cfg)
+{
+	u32 tcr = FIELD_PREP(ARM_SMMU_TCR_TG0, cfg->arm_lpae_s1_cfg.tcr.tg) |
+		  FIELD_PREP(ARM_SMMU_TCR_SH0, cfg->arm_lpae_s1_cfg.tcr.sh) |
+		  FIELD_PREP(ARM_SMMU_TCR_ORGN0, cfg->arm_lpae_s1_cfg.tcr.orgn) |
+		  FIELD_PREP(ARM_SMMU_TCR_IRGN0, cfg->arm_lpae_s1_cfg.tcr.irgn) |
+		  FIELD_PREP(ARM_SMMU_TCR_T0SZ, cfg->arm_lpae_s1_cfg.tcr.tsz);
+
+       /*
+	* When TTBR1 is selected shift the TCR fields by 16 bits and disable
+	* translation in TTBR0
+	*/
+	if (cfg->quirks & IO_PGTABLE_QUIRK_ARM_TTBR1) {
+		tcr = (tcr << 16) & ~ARM_SMMU_TCR_A1;
+		tcr |= ARM_SMMU_TCR_EPD0;
+	} else
+		tcr |= ARM_SMMU_TCR_EPD1;
+
+	return tcr;
+}
+
+static inline u32 smmu_lpae_tcr2(const struct io_pgtable_cfg *cfg)
+{
+	return FIELD_PREP(ARM_SMMU_TCR2_PASIZE, cfg->arm_lpae_s1_cfg.tcr.ips) |
+	       FIELD_PREP(ARM_SMMU_TCR2_SEP, ARM_SMMU_TCR2_SEP_UPSTREAM);
+}
+
+static inline u32 smmu_lpae_vtcr(const struct io_pgtable_cfg *cfg)
+{
+	return ARM_SMMU_VTCR_TG1_4KB |
+	       FIELD_PREP(ARM_SMMU_VTCR_PS, cfg->arm_lpae_s2_cfg.vtcr.ps) |
+	       FIELD_PREP(ARM_SMMU_VTCR_TG0, cfg->arm_lpae_s2_cfg.vtcr.tg) |
+	       FIELD_PREP(ARM_SMMU_VTCR_SH0, cfg->arm_lpae_s2_cfg.vtcr.sh) |
+	       FIELD_PREP(ARM_SMMU_VTCR_ORGN0, cfg->arm_lpae_s2_cfg.vtcr.orgn) |
+	       FIELD_PREP(ARM_SMMU_VTCR_IRGN0, cfg->arm_lpae_s2_cfg.vtcr.irgn) |
+	       FIELD_PREP(ARM_SMMU_VTCR_SL0, cfg->arm_lpae_s2_cfg.vtcr.sl) |
+	       FIELD_PREP(ARM_SMMU_VTCR_T0SZ, cfg->arm_lpae_s2_cfg.vtcr.tsz);
+}
+
+static inline u16 smmu_guest_domain_id_to_asid(struct hyp_arm_smmu_v2_device *smmu,
+					       u16 domain_id)
+{
+	return (u16)smmu->num_context_banks + domain_id;
+}
+
+static inline u16 smmu_asid_to_domain_id(struct hyp_arm_smmu_v2_device *smmu, u16 asid)
+{
+	/* host */
+	if (asid < smmu->num_context_banks)
+		return 0;
+
+	/* guest */
+	return asid - (u16)smmu->num_context_banks;
+}
+
 /**
  * smmu_shadow_state_size() - Calculate size of shadow state (cbs, smrs, s2crs, etc)
  *
@@ -325,7 +593,7 @@ static inline size_t smmu_shadow_state_size(struct hyp_arm_smmu_v2_device *smmu)
 {
 	size_t state_size = 0;
 
-	state_size = ALIGN_ADD(state_size, *(smmu->cb_state), smmu->num_context_banks);
+	state_size = ALIGN_ADD(state_size, *(smmu->cbs), smmu->num_context_banks);
 
 	state_size = ALIGN(state_size, __alignof__(*(smmu->cb_bitmap)));
 	state_size += bitmap_size(smmu->num_context_banks);
@@ -351,7 +619,7 @@ static inline size_t smmu_shadow_state_size(struct hyp_arm_smmu_v2_device *smmu)
  */
 static inline void *smmu_shadow_state_from_pages(struct hyp_arm_smmu_v2_device *smmu, void *pages)
 {
-	pages = ALIGN_ASSIGN_ADV(pages, smmu->cb_state, smmu->num_context_banks);
+	pages = ALIGN_ASSIGN_ADV(pages, smmu->cbs, smmu->num_context_banks);
 
 	smmu->cb_bitmap = (void *)pages;
 	pages += bitmap_size(smmu->num_context_banks);
@@ -378,7 +646,7 @@ static inline void *smmu_shadow_state_from_pages(struct hyp_arm_smmu_v2_device *
  {
 	size_t array_size;
 
-	pages = ALIGN_COPY_ADV(pages, smmu->cb_state, smmu->num_context_banks);
+	pages = ALIGN_COPY_ADV(pages, smmu->cbs, smmu->num_context_banks);
 
 	pages = (void *)ALIGN((unsigned long)pages, __alignof__(unsigned long));
 	array_size = bitmap_size(smmu->num_context_banks);
