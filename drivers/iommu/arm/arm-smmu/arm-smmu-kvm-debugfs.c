@@ -54,13 +54,12 @@ static void kvm_smmu_dump_cbs(struct seq_file *m, struct hyp_arm_smmu_v2_device 
 	int i;
 	int cnt_same;
 
-	tbl_printf(m, "    | domain_id |     cbar |   tcr[0] |   tcr[1] |          ttbr[0] |          ttbr[1] |    sctlr |  mair[0] |  mair[1] | vmid \n");
-	tbl_printf(m, "====|===========|==========|==========|==========|==================|==================|==========|==========|==========|======\n");
+	tbl_printf(m, "    |     cbar |   tcr[0] |   tcr[1] |          ttbr[0] |          ttbr[1] |    sctlr |  mair[0] |  mair[1] | domain_id \n");
+	tbl_printf(m, "====|==========|==========|==========|==================|==================|==========|==========|==========|===========\n");
 
 	for (i = 0, cnt_same = 0; i < smmu->num_context_banks; i++) {
-		if (i > 0 && memcmp(&smmu->cb_state[i],
-				    &smmu->cb_state[i-1],
-				    sizeof(smmu->cb_state[i])) == 0) {
+		if (i > 0 && memcmp(&smmu->cbs[i], &smmu->cbs[i-1],
+				    sizeof(smmu->cbs[i])) == 0) {
 			cnt_same++;
 			continue;
 		} else if (cnt_same) {
@@ -68,18 +67,17 @@ static void kvm_smmu_dump_cbs(struct seq_file *m, struct hyp_arm_smmu_v2_device 
 			cnt_same = 0;
 		}
 
-		tbl_printf(m, "%3u |%10u |%9x |%9x |%9x |%17llx |%17llx |%9x |%9x |%9x |%5x\n",
+		tbl_printf(m, "%3d |%9x |%9x |%9x |%17llx |%17llx |%9x |%9x |%9x |%10u\n",
 			   i,
-			   smmu->cb_state[i].domain_id,
-			   smmu->cb_state[i].cbar,
-			   smmu->cb_state[i].tcr[0],
-			   smmu->cb_state[i].tcr[1],
-			   smmu->cb_state[i].ttbr[0],
-			   smmu->cb_state[i].ttbr[1],
-			   smmu->cb_state[i].sctlr,
-			   smmu->cb_state[i].mair[0],
-			   smmu->cb_state[i].mair[1],
-			   smmu->cb_state[i].vmid
+			   smmu->cbs[i].cbar,
+			   smmu->cbs[i].tcr[0],
+			   smmu->cbs[i].tcr[1],
+			   smmu->cbs[i].ttbr[0],
+			   smmu->cbs[i].ttbr[1],
+			   smmu->cbs[i].sctlr,
+			   smmu->cbs[i].mair[0],
+			   smmu->cbs[i].mair[1],
+			   smmu->cbs[i].domain_id
 			  );
 	}
 
@@ -87,8 +85,8 @@ static void kvm_smmu_dump_cbs(struct seq_file *m, struct hyp_arm_smmu_v2_device 
 		tbl_printf(m, "  : | < repeats %d times >\n", cnt_same);
 }
 
-static void kvm_smmu_dump_smt(struct seq_file *m, struct arm_smmu_smr *smrs,
-			      struct arm_smmu_s2cr *s2crs, u32 num_groups)
+static void kvm_smmu_dump_smt(struct seq_file *m, struct smmu_v2_smr *smrs,
+			      struct smmu_v2_s2cr *s2crs, u32 num_groups)
 {
 	int i;
 	int cnt_same;
@@ -186,13 +184,13 @@ static int kvm_smmu_host_device_show(struct seq_file *m, void *unused)
 	seq_printf(m, "num_s2_context_banks: %u\n", smmu->num_s2_context_banks);
 	seq_printf(m, "numpage: %u\n", smmu->numpage);
 	seq_printf(m, "pgshift: %u\n", smmu->pgshift);
+	seq_printf(m, "ubs: %u\n", smmu->ubs);
 	seq_printf(m, "ias: %u\n", smmu->ias);
 	seq_printf(m, "oas: %u\n", smmu->oas);
 	seq_printf(m, "pgsize_bitmap: %lx\n", smmu->pgsize_bitmap);
-	seq_printf(m, "vmid_bits: %u\n", smmu->vmid_bits);
 	seq_printf(m, "cb_bitmap: %*pbl\n", smmu->num_context_banks, smmu->cb_bitmap);
 
-	seq_printf(m, "cb_state:\n");
+	seq_printf(m, "cbs:\n");
 	kvm_smmu_dump_cbs(m, smmu);
 
 	seq_printf(m, "host_cb_map (host -> actual):\n");
