@@ -1544,7 +1544,7 @@ static int smmu_handle_gr0(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 
 		/* Always keep fault reporting enabled */
 		val32 |= (ARM_SMMU_sCR0_GFRE | ARM_SMMU_sCR0_GFIE |
-				ARM_SMMU_sCR0_GCFGFRE | ARM_SMMU_sCR0_GCFGFIE);
+			  ARM_SMMU_sCR0_GCFGFRE | ARM_SMMU_sCR0_GCFGFIE);
 
 		/* Force disable TLB broadcasting */
 		val32 |= (ARM_SMMU_sCR0_VMIDPNE | ARM_SMMU_sCR0_PTM);
@@ -2152,6 +2152,7 @@ static bool smmu_mmio_handler(u64 addr, bool is_write, u64 *val)
 {
 	struct hyp_arm_smmu_v2_device *smmu = NULL;
 	struct hyp_arm_smmu_v2_device *smmu_i;
+	phys_addr_t base;
 	u32 offset, page;
 	int ret;
 
@@ -2160,20 +2161,28 @@ static bool smmu_mmio_handler(u64 addr, bool is_write, u64 *val)
 		if (addr >= smmu_i->mmio_addr &&
 		    addr < smmu_i->mmio_addr + smmu_i->mmio_size) {
 			smmu = smmu_i;
+			base = smmu->mmio_addr;
 			break;
 		}
 
-		/* Return true if secondary base; we do all the duplication anyways */
+		/* Ignore writes on secondary base; redirect reads to primary */
 		if (smmu_i->has_secondary_base &&
 		    addr >= smmu_i->mmio_addr_sec &&
-		    addr < smmu_i->mmio_addr_sec + smmu_i->mmio_size)
-			return true;
+		    addr < smmu_i->mmio_addr_sec + smmu_i->mmio_size) {
+			if (is_write)
+				return true;
+			else {
+				smmu = smmu_i;
+				base = smmu->mmio_addr_sec;
+				break;
+			}
+		}
 	}
 
 	if (smmu == NULL)
 		return false;
 
-	offset = addr - smmu->mmio_addr;
+	offset = addr - base;
 	page = offset & ~((1 << smmu->pgshift) - 1);
 
 	hyp_spin_lock(&smmu->lock);
