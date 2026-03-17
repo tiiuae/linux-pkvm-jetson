@@ -2651,15 +2651,9 @@ static bool smmu_dabt_handler(struct user_pt_regs *regs, u64 esr, u64 addr)
 	if (!handled && platform_hooks && platform_hooks->mmio_handler)
 		handled = platform_hooks->mmio_handler(addr, is_write, &val);
 
-	if (handled) {
-		/* Write result to register if read */
-		if (!is_write)
-			regs->regs[rt] = val;
-
-		/* Advance PC to next instruction */
-		regs->pc += 4;
-	}
-
+	/* Write result to register if read */
+	if (handled && !is_write)
+		regs->regs[rt] = val;
 	return handled;
 }
 
