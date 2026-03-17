@@ -195,7 +195,7 @@ static int kvm_smmu_host_device_show(struct seq_file *m, void *unused)
 	kvm_smmu_dump_cbs(m, smmu);
 
 	seq_printf(m, "host_cb_map (host -> actual):\n");
-	for (i = 0; i < smmu->num_context_banks; i++)
+	for (i = 0; i < smmu_num_host_cbs(smmu); i++)
 		if (smmu->host_cb_map[i] != ARM_SMMU_INVALID_CB)
 			tbl_printf(m, "%u -> %u\n", i, smmu->host_cb_map[i]);
 
