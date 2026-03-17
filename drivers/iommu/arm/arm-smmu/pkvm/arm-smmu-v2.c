@@ -673,8 +673,8 @@ static int smmu_probe_device(struct hyp_arm_smmu_v2_device *smmu)
 		}
 		smmu->num_mapping_groups = size;
 	} else {
-		/* No stream matching, direct Stream ID indexing */
-		smmu->num_mapping_groups = 128;  /* Tegra234 has 128 */
+		/* We don't support direct Stream ID indexing */
+		return -ENODEV;
 	}
 
 	/* We will be masking extended ID support as we don't support it */

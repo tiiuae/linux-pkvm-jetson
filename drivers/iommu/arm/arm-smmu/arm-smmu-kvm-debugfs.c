@@ -187,6 +187,7 @@ static int kvm_smmu_host_device_show(struct seq_file *m, void *unused)
 	seq_printf(m, "ubs: %u\n", smmu->ubs);
 	seq_printf(m, "ias: %u\n", smmu->ias);
 	seq_printf(m, "oas: %u\n", smmu->oas);
+	seq_printf(m, "sid_bits: %u\n", smmu->sid_bits);
 	seq_printf(m, "pgsize_bitmap: %lx\n", smmu->pgsize_bitmap);
 	seq_printf(m, "cb_bitmap: %*pbl\n", smmu->num_context_banks, smmu->cb_bitmap);
 
