@@ -80,11 +80,6 @@ struct kvm_smmu_unmapped {
 
 static DEFINE_PER_CPU(struct kvm_smmu_unmapped, kvm_smmu_deferred_unuse);
 
-/* CB 0 is used exclusively by hyp for host stage 2 translation */
-#define HOST_S2_CBNDX 			0
-/* Statically reserved CBs for the hypervisor (so far only host stage 2) */
-#define NUM_RESERVED_CB 		1
-
 /*
  * Logging
  */
@@ -1160,7 +1155,7 @@ static int smmu_host_cb_map(struct hyp_arm_smmu_v2_device *smmu, int cb_idx_host
 {
 	int cb_idx;
 
-	if (cb_idx_host >= smmu->num_context_banks)
+	if (cb_idx_host >= smmu_num_host_cbs(smmu))
 		return ARM_SMMU_INVALID_CB;
 
 	cb_idx = smmu->host_cb_map[cb_idx_host];
@@ -1182,7 +1177,7 @@ static void smmu_host_cb_unmap(struct hyp_arm_smmu_v2_device *smmu, int cb_idx_h
 {
 	int cb_idx;
 
-	if (cb_idx_host >= smmu->num_context_banks)
+	if (cb_idx_host >= smmu_num_host_cbs(smmu))
 		return;
 
 	cb_idx = smmu->host_cb_map[cb_idx_host];
@@ -1201,7 +1196,7 @@ static int smmu_host_cb_find(struct hyp_arm_smmu_v2_device *smmu, int cb_idx)
 {
 	int cb_idx_host;
 
-	for (cb_idx_host = 0; cb_idx_host < smmu->num_context_banks; cb_idx_host++) {
+	for (cb_idx_host = 0; cb_idx_host < smmu_num_host_cbs(smmu); cb_idx_host++) {
 		if (smmu->host_cb_map[cb_idx_host] == cb_idx)
 			return cb_idx_host;
 	}
@@ -1217,7 +1212,7 @@ static void smmu_host_cb_cleanup(struct hyp_arm_smmu_v2_device *smmu)
 {
 	int cb_idx, cb_idx_host;
 
-	for (cb_idx_host = 0; cb_idx_host < smmu->num_context_banks; cb_idx_host++) {
+	for (cb_idx_host = 0; cb_idx_host < smmu_num_host_cbs(smmu); cb_idx_host++) {
 		cb_idx = smmu->host_cb_map[cb_idx_host];
 		if (cb_idx == ARM_SMMU_INVALID_CB || smmu->cbs[cb_idx].sctlr)
 			continue;
@@ -1428,28 +1423,6 @@ static int smmu_handle_gr0(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 		ARM_SMMU_GR0_S2CR(0)
 	};
 
-	/* Find out which stream matching register it's trying to access, if any */
-	for (smereg_idx = 0; smereg_idx < 2; smereg_idx++) {
-		if (offset < smereg_base[smereg_idx] ||
-		    offset >= smereg_base[smereg_idx] + smmu->num_mapping_groups * 4)
-			continue;
-
-		sme_idx_host = (offset - smereg_base[smereg_idx]) >> 2;
-		if (sme_idx_host >= smmu->num_mapping_groups)
-			return -EINVAL;
-
-		sme_idx = smmu_host_sme_map(smmu, sme_idx_host);
-
-		/* Ran out of SMEss; not sure what's best here, -EINVAL or 0 */
-		if (sme_idx == ARM_SMMU_INVALID_SME) {
-			*val = 0;
-			return 0;
-		}
-
-		offset = smereg_base[smereg_idx] + sme_idx * 4;
-		break;
-	}
-
 	/* ID registers - read-only capability reporting */
 	if (offset >= ARM_SMMU_GR0_ID0 && offset <= ARM_SMMU_GR0_ID7) {
 		if (is_write)
@@ -1474,8 +1447,7 @@ static int smmu_handle_gr0(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 			 * These will be owned by the hypervisor
 			 */
 			val32 &= ~ARM_SMMU_ID1_NUMCB;
-			val32 |= FIELD_PREP(ARM_SMMU_ID1_NUMCB,
-					    smmu->num_context_banks - NUM_RESERVED_CB);
+			val32 |= FIELD_PREP(ARM_SMMU_ID1_NUMCB, smmu_num_host_cbs(smmu));
 		} else if (offset == ARM_SMMU_GR0_ID2) {
 			/*
 			 * Don't advertise 16-bit VMIDs feature; we could support it,
@@ -1606,6 +1578,31 @@ static int smmu_handle_gr0(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 		return 0;
 	}
 
+	/*
+	 * Find out which stream matching register it's trying to access,
+	 * if any, and map it to actual hardware index.
+	 */
+	for (smereg_idx = 0; smereg_idx < 2; smereg_idx++) {
+		if (offset < smereg_base[smereg_idx] ||
+		    offset >= smereg_base[smereg_idx] + smmu->num_mapping_groups * 4)
+			continue;
+
+		sme_idx_host = (offset - smereg_base[smereg_idx]) >> 2;
+		if (sme_idx_host >= smmu->num_mapping_groups)
+			return -EINVAL;
+
+		sme_idx = smmu_host_sme_map(smmu, sme_idx_host);
+
+		/* Ran out of SMEss; not sure what's best here, -EINVAL or 0 */
+		if (sme_idx == ARM_SMMU_INVALID_SME) {
+			*val = 0;
+			return 0;
+		}
+
+		offset = smereg_base[smereg_idx] + sme_idx * 4;
+		break;
+	}
+
 	/* SMR registers - stream match configuration (shadow state) */
 	if (smereg_idx == 0) {
 		if (is_write) {
@@ -1725,16 +1722,16 @@ static int smmu_handle_gr1(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 		ARM_SMMU_GR1_CBFRSYNRA(0)
 	};
 
-	/* Find out which CB register it's trying to access */
+	/*
+	 * Find out which CB register it's trying to access, and map it to
+	 * actual hardware index.
+	 */
 	for (cbreg_idx = 0; cbreg_idx < 3; cbreg_idx++) {
 		if (offset < cbreg_base[cbreg_idx] ||
-		    offset >= cbreg_base[cbreg_idx] + smmu->num_context_banks * 4)
+		    offset >= cbreg_base[cbreg_idx] + smmu_num_host_cbs(smmu) * 4)
 			continue;
 
 		cb_idx_host = (offset - cbreg_base[cbreg_idx]) >> 2;
-		if (cb_idx_host >= smmu->num_context_banks)
-			return -EINVAL;
-
 		cb_idx = smmu_host_cb_map(smmu, cb_idx_host);
 		if (cb_idx == ARM_SMMU_INVALID_CB) {
 			/* Ran out of CBs; not sure what's best here, -EINVAL or 0 */
@@ -1850,7 +1847,7 @@ static int smmu_handle_cb(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 		return -EINVAL;  /* Pages 0 to numpage-1 are GR0/GR1 */
 
 	cb_idx_host = page_offset - smmu->numpage;
-	if (cb_idx_host >= smmu->num_context_banks)
+	if (cb_idx_host >= smmu_num_host_cbs(smmu))
 		return -EINVAL;
 
 	cb_idx = smmu_host_cb_map(smmu, cb_idx_host);
@@ -2376,9 +2373,10 @@ static int smmu_domain_alloc(pkvm_handle_t iommu,
 		return -ENODEV;
 
 	/*
-	 * U16_MAX because we'll be using it as ASID (u16).
+	 * U16_MAX because we'll be using it as VMID and ASID (u16).
 	 * - num_context_banks because we reserve bottom <num_context_banks>
-	 *   ASIDs for the host. Linux currently uses cb_idx as ASID.
+	 *   ASIDs for our reserved CBs and the host's CBs. Linux currently
+	 *   uses cb_idx as ASID.
 	 */
 	if (domain->domain_id > U16_MAX - smmu->num_context_banks)
 		return -EINVAL;

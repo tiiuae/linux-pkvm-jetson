@@ -67,6 +67,12 @@
  */
 #define MAX_CLIENTS_PER_SID		8
 
+/* CB 0 is used exclusively by hyp for host stage 2 translation */
+#define HOST_S2_CBNDX 			0
+/* Statically reserved CBs for the hypervisor (so far only host stage 2) */
+#define NUM_RESERVED_CB 		1
+#define smmu_num_host_cbs(smmu)		((smmu)->num_context_banks - NUM_RESERVED_CB)
+
 /* Page shift for SMMU register pages */
 #define ARM_SMMU_PGSHIFT		16
 
@@ -598,7 +604,7 @@ static inline size_t smmu_shadow_state_size(struct hyp_arm_smmu_v2_device *smmu)
 	state_size = ALIGN(state_size, __alignof__(*(smmu->cb_bitmap)));
 	state_size += bitmap_size(smmu->num_context_banks);
 
-	state_size = ALIGN_ADD(state_size, *(smmu->host_cb_map), smmu->num_context_banks);
+	state_size = ALIGN_ADD(state_size, *(smmu->host_cb_map), smmu_num_host_cbs(smmu));
 	state_size = ALIGN_ADD(state_size, *(smmu->smrs), smmu->num_mapping_groups);
 	state_size = ALIGN_ADD(state_size, *(smmu->s2crs), smmu->num_mapping_groups);
 
@@ -624,7 +630,7 @@ static inline void *smmu_shadow_state_from_pages(struct hyp_arm_smmu_v2_device *
 	smmu->cb_bitmap = (void *)pages;
 	pages += bitmap_size(smmu->num_context_banks);
 
-	pages = ALIGN_ASSIGN_ADV(pages, smmu->host_cb_map, smmu->num_context_banks);
+	pages = ALIGN_ASSIGN_ADV(pages, smmu->host_cb_map, smmu_num_host_cbs(smmu));
 	pages = ALIGN_ASSIGN_ADV(pages, smmu->smrs, smmu->num_mapping_groups);
 	pages = ALIGN_ASSIGN_ADV(pages, smmu->s2crs, smmu->num_mapping_groups);
 
@@ -653,7 +659,7 @@ static inline void *smmu_shadow_state_from_pages(struct hyp_arm_smmu_v2_device *
 	memcpy(pages, smmu->cb_bitmap, array_size);
 	pages = (void *)((u8 *)pages + array_size);
 
-	pages = ALIGN_COPY_ADV(pages, smmu->host_cb_map, smmu->num_context_banks);
+	pages = ALIGN_COPY_ADV(pages, smmu->host_cb_map, smmu_num_host_cbs(smmu));
 	pages = ALIGN_COPY_ADV(pages, smmu->smrs, smmu->num_mapping_groups);
 	pages = ALIGN_COPY_ADV(pages, smmu->s2crs, smmu->num_mapping_groups);
 
