@@ -101,3 +101,12 @@ void __arm_lpae_free_data(struct io_pgtable_cfg *cfg, void *p)
 	else
 		kvm_iommu_reclaim_page(p);
 }
+
+#if IS_ENABLED(CONFIG_IOMMUFD_DRIVER)
+void iova_bitmap_set(struct iova_bitmap *bitmap,
+		     unsigned long iova, size_t length)
+{
+	/* Dirty bit not supported */
+	BUG();
+}
+#endif
