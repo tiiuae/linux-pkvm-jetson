@@ -34,7 +34,7 @@ struct hyp_tegra_mc {
 	u32			num_clients;
 };
 
-/* MC controller instance (defined in tegra234-mc.c) */
+/* MC controller instance (defined in tegra234-mc-pkvm.c) */
 extern struct hyp_tegra_mc tegra234_mc;
 
 /*

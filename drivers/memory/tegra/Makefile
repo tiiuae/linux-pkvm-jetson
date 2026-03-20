@@ -28,4 +28,3 @@ tegra210-emc-y := tegra210-emc-core.o tegra210-emc-cc-r21021.o
 
 # pKVM Memory Controller integration
 obj-$(CONFIG_TEGRA_MC_PKVM) += tegra-mc-kvm.o
-obj-$(CONFIG_TEGRA_MC_PKVM) += pkvm/
