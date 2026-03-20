@@ -14,7 +14,7 @@
  * Architecture (following SMMUv3 pKVM pattern from linux2):
  *   - This stub: core_initcall, allocates SMMU array, registers with EL2
  *   - Standard arm-smmu.c: platform driver, IOMMU ops, Stage-1 management
- *   - EL2 pkvm/arm-smmu-v2.c: MMIO trapping, Stage-2 identity mapping
+ *   - EL2 pkvm/arm-smmu-v2-pkvm.c: MMIO trapping, Stage-2 identity mapping
  */
 
 #include <linux/init.h>
@@ -24,13 +24,11 @@
 #include <asm/kvm_mmu.h>
 #include <asm/kvm_pkvm.h>
 
+#include "arm-smmu.h"
 #include "arm-smmu-kvm-debugfs.h"
 
-/* Feature flags - must match pkvm/arm-smmu-v2.h */
-#define ARM_SMMU_FEAT_COHERENT_WALK	BIT(3)
-
 /* External EL2 symbols */
-extern struct kvm_iommu_ops kvm_nvhe_sym(smmu_v2_ops);
+extern struct kvm_iommu_ops kvm_nvhe_sym(hyp_arm_smmu_v2_ops);
 extern struct hyp_arm_smmu_v2_device *kvm_nvhe_sym(kvm_hyp_arm_smmu_v2_smmus);
 #define kvm_hyp_arm_smmu_v2_smmus kvm_nvhe_sym(kvm_hyp_arm_smmu_v2_smmus)
 extern size_t kvm_nvhe_sym(kvm_hyp_arm_smmu_v2_count);
@@ -66,7 +64,8 @@ static int kvm_arm_smmu_v2_init(void)
 	int ret;
 	pkvm_handle_t hyp_drv_id;
 
-	ret = kvm_iommu_register_hyp_ops(ksym_ref_addr_nvhe(smmu_v2_ops), &hyp_drv_id);
+	ret = kvm_iommu_register_hyp_ops(ksym_ref_addr_nvhe(hyp_arm_smmu_v2_ops),
+					 &hyp_drv_id);
 
 	if (ret == 0)
 		kvm_smmu_host_create_debugfs(hyp_drv_id, kvm_arm_smmu_v2_array,

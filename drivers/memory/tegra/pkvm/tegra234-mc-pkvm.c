@@ -18,9 +18,9 @@
 #include <nvhe/serial.h>
 #include <dt-bindings/memory/tegra234-mc.h>
 
-#include "tegra234-mc.h"
-#include "smmu-platform.h"
-#include "arm-smmu-v2.h"
+#include <smmu-platform.h>
+#include <arm-smmu-v2-pkvm.h>
+#include "tegra234-mc-pkvm.h"
 
 /*
  * EL2 hypervisor symbols for MC MMIO configuration.
@@ -163,15 +163,14 @@ int mc_validate_sid_for_client(u32 client_id, u32 sid)
 	int i;
 
 	/* Look up the assigned SID */
-	entry = smmu_v2_lookup_sid(sid);
+	entry = smmu_lookup_sid(sid);
 	if (!entry)
 		return -EPERM;  /* SID not assigned to any domain */
 
 	/* Check if this client is in the list of clients for this SID */
-	for (i = 0; i < entry->num_clients; i++) {
+	for (i = 0; i < entry->num_clients; i++)
 		if (entry->client_ids[i] == client_id)
 			return 0;  /* Valid - client is registered for this SID */
-	}
 
 	/* Client not found in SID's client list */
 	return -EPERM;
@@ -205,14 +204,13 @@ static int mc_handle_sid_override(const struct mc_client_info *client, u32 val)
 	/* Validate that this client is authorized to use this SID */
 	if (mc_validate_sid_for_client(client->client_id, sid)) {
 		/* SID not assigned to this client - security violation */
-		entry = smmu_v2_lookup_sid(sid);
-		if (!entry || !entry->active) {
+		entry = smmu_lookup_sid(sid);
+		if (!entry || !entry->active)
 			hyp_err("MC: Client '%s' (ID 0x%x) attempted to use unassigned SID %u\n",
 				client->name, client->client_id, sid);
-		} else {
+		else
 			hyp_err("MC: Client '%s' (ID 0x%x) attempted to steal SID %u\n",
 				client->name, client->client_id, sid);
-		}
 		return -EPERM;
 	}
 
@@ -406,7 +404,7 @@ err_reclaim:
 /*
  * Platform hooks for SMMU integration
  */
-static const struct smmu_v2_platform_hooks tegra234_mc_hooks = {
+static const struct smmu_platform_hooks tegra234_mc_hooks = {
 	.init = tegra234_mc_init,
 	.mmio_handler = tegra234_mc_mmio_handler,
 };
@@ -414,12 +412,12 @@ static const struct smmu_v2_platform_hooks tegra234_mc_hooks = {
 /*
  * Register Tegra MC platform hooks with SMMU driver
  *
- * Called by smmu_v2_global_init() via CONFIG_TEGRA_MC_PKVM ifdef.
+ * Called by smmu_global_init() via CONFIG_TEGRA_MC_PKVM ifdef.
  * Registers MC MMIO handler for SID override validation.
  */
 void tegra234_mc_register_hooks(void)
 {
-	smmu_v2_register_platform_hooks(&tegra234_mc_hooks);
+	smmu_register_platform_hooks(&tegra234_mc_hooks);
 }
 
 /*
@@ -442,8 +440,8 @@ int mc_register_sid_mapping(u32 client_id, u32 sid)
 	int i;
 
 	/* Validate SID range */
-	if (sid >= ARM_SMMU_MAX_SIDS) {
-		hyp_err("MC: Invalid SID %u (max %u)", sid, ARM_SMMU_MAX_SIDS);
+	if (sid >= HYP_SMMUV2_MAX_SIDS) {
+		hyp_err("MC: Invalid SID %u (max %u)", sid, HYP_SMMUV2_MAX_SIDS);
 		return -EINVAL;
 	}
 
@@ -453,15 +451,14 @@ int mc_register_sid_mapping(u32 client_id, u32 sid)
 	 * Check if this client is already registered for this SID (idempotent).
 	 * Multiple clients can share the same SID (e.g., read/write pairs).
 	 */
-	for (i = 0; i < entry->num_clients; i++) {
+	for (i = 0; i < entry->num_clients; i++)
 		if (entry->client_ids[i] == client_id)
 			return 0;  /* Already registered - idempotent */
-	}
 
 	/* Add new client to the list */
-	if (entry->num_clients >= MAX_CLIENTS_PER_SID) {
+	if (entry->num_clients >= HYP_SMMUV2_MAX_CLIENTS_PER_SID) {
 		hyp_err("MC: SID %u client limit exceeded (%u clients)",
-			sid, MAX_CLIENTS_PER_SID);
+			sid, HYP_SMMUV2_MAX_CLIENTS_PER_SID);
 		return -ENOSPC;
 	}
 
@@ -472,7 +469,7 @@ int mc_register_sid_mapping(u32 client_id, u32 sid)
 
 	/*
 	 * Note: cb_idx and smmu_id are populated later
-	 * during device attachment (smmu_v2_attach_dev).
+	 * during device attachment (smmu_attach_dev).
 	 */
 
 	return 0;
