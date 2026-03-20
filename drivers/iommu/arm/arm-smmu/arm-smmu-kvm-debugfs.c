@@ -85,8 +85,8 @@ static void kvm_smmu_dump_cbs(struct seq_file *m, struct hyp_arm_smmu_v2_device 
 		tbl_printf(m, "  : | < repeats %d times >\n", cnt_same);
 }
 
-static void kvm_smmu_dump_smt(struct seq_file *m, struct smmu_v2_smr *smrs,
-			      struct smmu_v2_s2cr *s2crs, u32 num_groups)
+static void kvm_smmu_dump_smt(struct seq_file *m, struct hyp_arm_smmu_v2_smr *smrs,
+			      struct hyp_arm_smmu_v2_s2cr *s2crs, u32 num_groups)
 {
 	int i;
 	int cnt_same;
@@ -196,7 +196,7 @@ static int kvm_smmu_host_device_show(struct seq_file *m, void *unused)
 
 	seq_printf(m, "host_cb_map (host -> actual):\n");
 	for (i = 0; i < smmu_num_host_cbs(smmu); i++)
-		if (smmu->host_cb_map[i] != ARM_SMMU_INVALID_CB)
+		if (smmu->host_cb_map[i] != HYP_SMMUV2_INVALID_CB)
 			tbl_printf(m, "%u -> %u\n", i, smmu->host_cb_map[i]);
 
 	seq_printf(m, "sme_bitmap: %*pbl\n", smmu->num_mapping_groups, smmu->sme_bitmap);
@@ -206,7 +206,7 @@ static int kvm_smmu_host_device_show(struct seq_file *m, void *unused)
 
 	seq_printf(m, "host_sme_map (host -> actual):\n");
 	for (i = 0; i < smmu->num_mapping_groups; i++)
-		if (smmu->host_sme_map[i] != ARM_SMMU_INVALID_SME)
+		if (smmu->host_sme_map[i] != HYP_SMMUV2_INVALID_SME)
 			tbl_printf(m, "%u -> %u\n", i, smmu->host_sme_map[i]);
 
 exit_with_pages:
@@ -231,8 +231,8 @@ static const struct file_operations kvm_smmu_host_device_fops = {
 	.release	= kvm_smmu_host_device_close,
 };
 
-void kvm_smmu_host_create_debugfs(pkvm_handle_t hyp_drv_id, struct hyp_arm_smmu_v2_device *smmus,
-				  size_t smmu_count)
+void kvm_smmu_host_create_debugfs(pkvm_handle_t hyp_drv_id,
+				  struct hyp_arm_smmu_v2_device *smmus, size_t smmu_count)
 {
 	char dirname[64];
 	struct dentry *kvm_debugfs_dir;
