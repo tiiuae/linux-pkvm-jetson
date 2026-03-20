@@ -209,10 +209,18 @@ void hyp_printf(const char *fmt, ...)
 					u64 val = va_arg(args, u64);
 					hyp_hex(val);
 					p++; /* Skip the 'x' */
-				} else if (*(p + 1) == 'd' || *(p + 1) == 'u') {
+				} else if (*(p + 1) == 'd') {
+					long long int val = va_arg(args, long long int);
+					if (val < 0) {
+						__hyp_putc('-');
+						val *= -1;
+					}
+					hyp_dec(val);
+					p++; /* Skip the 'u' */
+				} else if (*(p + 1) == 'u') {
 					u64 val = va_arg(args, u64);
 					hyp_dec(val);
-					p++; /* Skip the 'd'/'u' */
+					p++; /* Skip the 'u' */
 				} else {
 					__hyp_putc('%');
 					__hyp_putc('l');
@@ -223,17 +231,33 @@ void hyp_printf(const char *fmt, ...)
 				u64 val = va_arg(args, u64);
 				hyp_hex(val);
 				p++; /* Skip the 'x' */
-			} else if (*(p + 1) == 'd' || *(p + 1) == 'u') {
+			} else if (*(p + 1) == 'd') {
+				long int val = va_arg(args, long int);
+				if (val < 0) {
+					__hyp_putc('-');
+					val *= -1;
+				}
+				hyp_dec(val);
+				p++; /* Skip the 'd' */
+			} else if (*(p + 1) == 'u') {
 				/* long decimal - also treat as 64-bit on arm64 */
 				u64 val = va_arg(args, u64);
 				hyp_dec(val);
-				p++; /* Skip the 'd'/'u' */
+				p++; /* Skip the 'u' */
 			} else {
 				__hyp_putc('%');
 				__hyp_putc('l');
 			}
 			break;
-		case 'd':
+		case 'd': {
+			int val = va_arg(args, int);
+			if (val < 0) {
+				__hyp_putc('-');
+				val *= -1;
+			}
+			hyp_dec(val);
+			break;
+		}
 		case 'u': {
 			u64 val = va_arg(args, u64);
 			hyp_dec(val);
