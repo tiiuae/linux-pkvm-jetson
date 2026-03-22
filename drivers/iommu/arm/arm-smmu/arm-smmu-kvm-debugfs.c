@@ -90,6 +90,7 @@ static void kvm_smmu_dump_smt(struct seq_file *m, struct hyp_arm_smmu_v2_smr *sm
 {
 	int i;
 	int cnt_same;
+	bool at_least_one_hyp_disabled = 0;
 
 	tbl_printf(m, "    |        SMR          |              S2CR\n");
 	tbl_printf(m, "    |------|------|-------|------|-------|---------|-------\n");
@@ -107,20 +108,26 @@ static void kvm_smmu_dump_smt(struct seq_file *m, struct hyp_arm_smmu_v2_smr *sm
 			cnt_same = 0;
 		}
 
-		tbl_printf(m, "%3u |%5x |%5x |%6u |%5x |%6u |%8x |%7u\n",
+		tbl_printf(m, "%3u |%5x |%5x |%5u%s |%5x |%6u |%8x |%7u\n",
 			   i,
 			   smrs[i].mask,
 			   smrs[i].id,
 			   smrs[i].valid,
+			   smrs[i].hyp_disabled ? "*" : " ",
 			   s2crs[i].type,
 			   s2crs[i].cbndx,
 			   s2crs[i].privcfg,
 			   s2crs[i].bypass
 			  );
+
+		at_least_one_hyp_disabled |= smrs[i].hyp_disabled;
 	}
 
 	if (cnt_same)
 		tbl_printf(m, "  : | < repeats %d times >\n", cnt_same);
+
+	if (at_least_one_hyp_disabled)
+		tbl_printf(m, "%59s\n", "([*]: Disabled by hypervisor)");
 }
 
 static int kvm_smmu_host_device_show(struct seq_file *m, void *unused)
@@ -187,7 +194,6 @@ static int kvm_smmu_host_device_show(struct seq_file *m, void *unused)
 	seq_printf(m, "ubs: %u\n", smmu->ubs);
 	seq_printf(m, "ias: %u\n", smmu->ias);
 	seq_printf(m, "oas: %u\n", smmu->oas);
-	seq_printf(m, "sid_bits: %u\n", smmu->sid_bits);
 	seq_printf(m, "pgsize_bitmap: %lx\n", smmu->pgsize_bitmap);
 	seq_printf(m, "cb_bitmap: %*pbl\n", smmu->num_context_banks, smmu->cb_bitmap);
 
