@@ -20,12 +20,14 @@
 #include <linux/init.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
+#include <linux/platform_device.h>
 
 #include <asm/kvm_mmu.h>
 #include <asm/kvm_pkvm.h>
 
 #include "arm-smmu.h"
 #include "arm-smmu-kvm-debugfs.h"
+#include "pkvm/arm-smmu-v2-pkvm.h"
 
 /* External EL2 symbols */
 extern struct kvm_iommu_ops kvm_nvhe_sym(hyp_arm_smmu_v2_ops);
@@ -47,6 +49,9 @@ static struct hyp_arm_smmu_v2_device *kvm_arm_smmu_v2_array;
 #define ksym_ref_addr_nvhe(x) \
 	((typeof(kvm_nvhe_sym(x)) *)(kern_hyp_va(lm_alias(&kvm_nvhe_sym(x)))))
 
+/* Array to link SMMU id back to MMIO base addresses */
+static phys_addr_t *smmu_id_to_mmio;
+
 /*
  * Calculate number of pages needed for SMMU page tables.
  * Use host stage-2 page count plus extra for context banks.
@@ -54,6 +59,18 @@ static struct hyp_arm_smmu_v2_device *kvm_arm_smmu_v2_array;
 static size_t smmu_v2_hyp_pgt_pages(void)
 {
 	return host_s2_pgtable_pages() + 500;
+}
+
+static int kvm_arm_smmu_v2_id(struct device *dev)
+{
+	struct arm_smmu_device *smmu = dev_get_drvdata(dev);
+	int id;
+
+	for (id = 0; id < kvm_arm_smmu_v2_count; id++)
+		if (smmu_id_to_mmio[id] == smmu->ioaddr)
+			return id;
+
+	return -1;
 }
 
 /*
@@ -74,20 +91,72 @@ static int kvm_arm_smmu_v2_init(void)
 	return ret;
 }
 
+static int kvm_arm_smmu_v2_id_by_of(struct device_node *np, pkvm_handle_t *out_id)
+{
+	struct device *dev = bus_find_device_by_of_node(&platform_bus_type, np);
+
+	*out_id = kvm_arm_smmu_v2_id(dev);
+	put_device(dev);
+	return 0;
+}
+
+static int kvm_arm_smmu_v2_num_ids(struct device *dev)
+{
+	struct iommu_fwspec *fwspec = dev_iommu_fwspec_get(dev);
+
+	if (!fwspec)
+		return 0;
+
+	return fwspec->num_ids;
+}
+
+static int kvm_arm_smmu_v2_device_id(struct device *dev, u32 idx,
+				     pkvm_handle_t *out_iommu, u32 *out_sid)
+{
+	struct iommu_fwspec *fwspec = dev_iommu_fwspec_get(dev);
+	struct arm_smmu_master_cfg *cfg = dev_iommu_priv_get(dev);
+
+	if (!fwspec || !cfg)
+		return -ENODEV;
+	if (idx >= fwspec->num_ids)
+		return -ENOENT;
+
+	/*
+	 * In smmu v2, fwspec->ids[idx] is actually SMR.MASK | SMR.ID, not
+	 * just the SID. Host controlling the mask (here, or even at the VMM
+	 * level), doesn't seem right from a security standpoint. Then again,
+	 * this whole thing with the SIDs seems flawed. Isn't it too much
+	 * control for the EL1 host to choose SIDs? It could in theory, pass
+	 * a SID for another device, one that it maintains control over, and
+	 * then use it to DMA into the guest once the guest has set it up with
+	 * the IOMMU.
+	 */
+	*out_sid = fwspec->ids[idx];
+	*out_iommu = kvm_arm_smmu_v2_id(cfg->smmu->dev);
+	return 0;
+}
+
 static struct kvm_iommu_driver kvm_smmu_v2_driver = {
 	.init_driver = kvm_arm_smmu_v2_init,
+	.get_iommu_id_by_of = kvm_arm_smmu_v2_id_by_of,
+	.get_device_iommu_num_ids = kvm_arm_smmu_v2_num_ids,
+	.get_device_iommu_id = kvm_arm_smmu_v2_device_id,
 };
 
 static void kvm_arm_smmu_v2_array_free(void)
 {
 	int order;
 
-	if (!kvm_arm_smmu_v2_array)
-		return;
+	if (kvm_arm_smmu_v2_array) {
+		order = get_order(kvm_arm_smmu_v2_count * sizeof(*kvm_arm_smmu_v2_array));
+		free_pages((unsigned long)kvm_arm_smmu_v2_array, order);
+		kvm_arm_smmu_v2_array = NULL;
+	}
 
-	order = get_order(kvm_arm_smmu_v2_count * sizeof(*kvm_arm_smmu_v2_array));
-	free_pages((unsigned long)kvm_arm_smmu_v2_array, order);
-	kvm_arm_smmu_v2_array = NULL;
+	if (smmu_id_to_mmio) {
+		kfree(smmu_id_to_mmio);
+		smmu_id_to_mmio = NULL;
+	}
 }
 
 /*
@@ -119,11 +188,19 @@ static int kvm_arm_smmu_v2_array_alloc(void)
 
 	pr_info("arm-smmu-kvm: Found %zu SMMUv2 instances\n", kvm_arm_smmu_v2_count);
 
-	/* Allocate array */
+	/* Used by EL1 in kvm_arm_smmu_v2_id() to find SMMU id */
+	smmu_id_to_mmio = kzalloc(kvm_arm_smmu_v2_count * sizeof(*smmu_id_to_mmio),
+				  GFP_KERNEL);
+	if (!smmu_id_to_mmio)
+		return -ENOMEM;
+
+	/* Allocate SMMU device array */
 	smmu_order = get_order(kvm_arm_smmu_v2_count * sizeof(*kvm_arm_smmu_v2_array));
 	kvm_arm_smmu_v2_array = (void *)__get_free_pages(GFP_KERNEL | __GFP_ZERO, smmu_order);
-	if (!kvm_arm_smmu_v2_array)
-		return -ENOMEM;
+	if (!kvm_arm_smmu_v2_array) {
+		ret = -ENOMEM;
+		goto out_err;
+	}
 
 	/* Parse device tree for SMMU MMIO addresses */
 	for (compat = tegra234_smmu_compat; *compat; compat++) {
@@ -139,6 +216,7 @@ static int kvm_arm_smmu_v2_array_alloc(void)
 				goto out_err;
 			}
 
+			smmu_id_to_mmio[i] = res.start;
 			kvm_arm_smmu_v2_array[i].id = i;
 			kvm_arm_smmu_v2_array[i].mmio_addr = res.start;
 			kvm_arm_smmu_v2_array[i].mmio_size = resource_size(&res);

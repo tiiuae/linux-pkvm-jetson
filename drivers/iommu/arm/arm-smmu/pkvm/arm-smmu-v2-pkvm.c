@@ -673,9 +673,6 @@ static int smmu_probe_device(struct hyp_arm_smmu_v2_device *smmu)
 		return -ENODEV;
 	}
 
-	/* We will be masking extended ID support as we don't support it */
-	smmu->sid_bits = FIELD_GET(ARM_SMMU_ID0_NUMSIDB, id0);
-
 	/* ID1: Context banks and page size (register layout, not translation) */
 	smmu->pgshift = (id1 & ARM_SMMU_ID1_PAGESIZE) ? 16 : 12;  /* 64KB or 4KB */
 
@@ -935,14 +932,14 @@ static int smmu_init(struct hyp_arm_smmu_v2_device *smmu)
  * smmu_cb_alloc() - Allocate a free context bank
  * @smmu: SMMU device
  *
- * Return: Context bank index, or HYP_SMMUV2_INVALID_CB if none available
+ * Return: Context bank index, or -ENOSPC if none available
  */
 static int smmu_cb_alloc(struct hyp_arm_smmu_v2_device *smmu)
 {
 	int cb_idx = find_next_zero_bit(smmu->cb_bitmap, smmu->num_context_banks,
 					HYP_SMMUV2_NUM_RSVD_CB);
 	if (cb_idx == smmu->num_context_banks)
-		cb_idx = HYP_SMMUV2_INVALID_CB;
+		cb_idx = -ENOSPC;
 	else
 		bitmap_set(smmu->cb_bitmap, cb_idx, 1);
 	return cb_idx;
@@ -1146,20 +1143,20 @@ static void smmu_cb_write(struct hyp_arm_smmu_v2_device *smmu, int cb_idx)
  * @smmu: SMMU device
  * @cb_idx_host: The index that the host thinks this context bank will be in.
  *
- * Return: Actual hardware context bank index, or HYP_SMMUV2_INVALID_CB if:
- *         none available or invalid @cb_idx_host argument was provided.
+ * Return: Actual hardware context bank index, -EINVAL on invalid argument, or
+ *         -ENOSPC if none available.
  */
 static int smmu_host_cb_map(struct hyp_arm_smmu_v2_device *smmu, int cb_idx_host)
 {
 	int cb_idx;
 
 	if (cb_idx_host >= smmu_num_host_cbs(smmu))
-		return HYP_SMMUV2_INVALID_CB;
+		return -EINVAL;
 
 	cb_idx = smmu->host_cb_map[cb_idx_host];
 	if (cb_idx == HYP_SMMUV2_INVALID_CB) {
 		cb_idx = smmu_cb_alloc(smmu);
-		if (cb_idx != HYP_SMMUV2_INVALID_CB)
+		if (cb_idx >= 0)
 			smmu->host_cb_map[cb_idx_host] = cb_idx;
 	}
 
@@ -1188,18 +1185,17 @@ static void smmu_host_cb_unmap(struct hyp_arm_smmu_v2_device *smmu, int cb_idx_h
  * @smmu: SMMU device
  * @cb_idx: The index that the host thinks this context bank will be in.
  *
- * Return: Host context bank index, or HYP_SMMUV2_INVALID_CB if not found.
+ * Return: Host context bank index, or -ENOENT if not found.
  */
 static int smmu_host_cb_find(struct hyp_arm_smmu_v2_device *smmu, int cb_idx)
 {
 	int cb_idx_host;
 
-	for (cb_idx_host = 0; cb_idx_host < smmu_num_host_cbs(smmu); cb_idx_host++) {
+	for (cb_idx_host = 0; cb_idx_host < smmu_num_host_cbs(smmu); cb_idx_host++)
 		if (smmu->host_cb_map[cb_idx_host] == cb_idx)
 			return cb_idx_host;
-	}
 
-	return HYP_SMMUV2_INVALID_CB;
+	return -ENOENT;
 }
 
 /**
@@ -1247,13 +1243,13 @@ static void smmu_host_cb_init_s2(struct hyp_arm_smmu_v2_device *smmu,
  * smmu_sme_alloc() - Allocate a free stream matching entry
  * @smmu: SMMU device
  *
- * Return: Stream matching index, or HYP_SMMUV2_INVALID_SME if none available
+ * Return: Stream matching index, or -ENOSPC if none available
  */
 static int smmu_sme_alloc(struct hyp_arm_smmu_v2_device *smmu)
 {
 	int sme_idx = find_next_zero_bit(smmu->sme_bitmap, smmu->num_mapping_groups, 0);
 	if (sme_idx == smmu->num_mapping_groups)
-		sme_idx = HYP_SMMUV2_INVALID_SME;
+		sme_idx = -ENOSPC;
 	else
 		bitmap_set(smmu->sme_bitmap, sme_idx, 1);
 	return sme_idx;
@@ -1271,14 +1267,15 @@ static void smmu_sme_free(struct hyp_arm_smmu_v2_device *smmu, int sme_idx)
 }
 
 static void smmu_sme_init(struct hyp_arm_smmu_v2_device *smmu, int sme_idx,
-			  u32 sid, int cb_idx)
+			  u16 mask, u16 sid, int cb_idx)
 {
 	struct hyp_arm_smmu_v2_smr *smr = &smmu->smrs[sme_idx];
 	struct hyp_arm_smmu_v2_s2cr *s2cr = &smmu->s2crs[sme_idx];
 
-	smr->mask = (1 << smmu->sid_bits) - 1;
+	smr->mask = mask;
 	smr->id = (u16)sid;
 	smr->valid = true;
+	smr->hyp_disabled = false;
 
 	s2cr->type = S2CR_TYPE_TRANS;
 	s2cr->cbndx = (u8)cb_idx;
@@ -1286,7 +1283,7 @@ static void smmu_sme_init(struct hyp_arm_smmu_v2_device *smmu, int sme_idx,
 	s2cr->bypass = 0;
 }
 
-static void smmu_sme_disable(struct hyp_arm_smmu_v2_device *smmu, int sme_idx)
+static void smmu_sme_clear(struct hyp_arm_smmu_v2_device *smmu, int sme_idx)
 {
 	struct hyp_arm_smmu_v2_smr *smr = &smmu->smrs[sme_idx];
 	struct hyp_arm_smmu_v2_s2cr *s2cr = &smmu->s2crs[sme_idx];
@@ -1294,6 +1291,7 @@ static void smmu_sme_disable(struct hyp_arm_smmu_v2_device *smmu, int sme_idx)
 	smr->mask = 0;
 	smr->id = 0;
 	smr->valid = false;
+	smr->hyp_disabled = false;
 
 	s2cr->type = S2CR_TYPE_FAULT;
 	s2cr->cbndx = 0;
@@ -1301,10 +1299,19 @@ static void smmu_sme_disable(struct hyp_arm_smmu_v2_device *smmu, int sme_idx)
 	s2cr->bypass = 0;
 }
 
-static void smmu_sme_write(struct hyp_arm_smmu_v2_device *smmu, int sme_idx)
+static void smmu_sme_hyp_disable(struct hyp_arm_smmu_v2_device *smmu, int sme_idx)
 {
 	struct hyp_arm_smmu_v2_smr *smr = &smmu->smrs[sme_idx];
-	struct hyp_arm_smmu_v2_s2cr *s2cr = &smmu->s2crs[sme_idx];
+	u32 reg = FIELD_PREP(ARM_SMMU_SMR_ID, smr->id) |
+		  FIELD_PREP(ARM_SMMU_SMR_MASK, smr->mask);
+
+	smmu_writel(smmu, ARM_SMMU_GR0, ARM_SMMU_GR0_SMR(sme_idx), reg);
+	smr->hyp_disabled = true;
+}
+
+static void smmu_smr_write(struct hyp_arm_smmu_v2_device *smmu, int sme_idx)
+{
+	struct hyp_arm_smmu_v2_smr *smr = &smmu->smrs[sme_idx];
 	u32 reg = FIELD_PREP(ARM_SMMU_SMR_ID, smr->id) |
 		  FIELD_PREP(ARM_SMMU_SMR_MASK, smr->mask);
 
@@ -1312,44 +1319,148 @@ static void smmu_sme_write(struct hyp_arm_smmu_v2_device *smmu, int sme_idx)
 		reg |= ARM_SMMU_SMR_VALID;
 
 	smmu_writel(smmu, ARM_SMMU_GR0, ARM_SMMU_GR0_SMR(sme_idx), reg);
-
-	reg = FIELD_PREP(ARM_SMMU_S2CR_TYPE, s2cr->type) |
-	      FIELD_PREP(ARM_SMMU_S2CR_CBNDX, s2cr->cbndx) |
-	      FIELD_PREP(ARM_SMMU_S2CR_PRIVCFG, s2cr->privcfg);
-
-	smmu_writel(smmu, ARM_SMMU_GR0, ARM_SMMU_GR0_S2CR(sme_idx), reg);
+	smr->hyp_disabled = false;
 }
 
-static int smmu_sme_find_by_sid(struct hyp_arm_smmu_v2_device *smmu, u32 sid)
+#define smmu_sme_hyp_enable(smmu, sme_idx) smmu_smr_write((smmu), (sme_idx))
+
+static void smmu_sme_write(struct hyp_arm_smmu_v2_device *smmu, int sme_idx)
+{
+	struct hyp_arm_smmu_v2_s2cr *s2cr = &smmu->s2crs[sme_idx];
+	u32 reg = FIELD_PREP(ARM_SMMU_S2CR_TYPE, s2cr->type) |
+		  FIELD_PREP(ARM_SMMU_S2CR_CBNDX, s2cr->cbndx) |
+		  FIELD_PREP(ARM_SMMU_S2CR_PRIVCFG, s2cr->privcfg);
+
+	smmu_writel(smmu, ARM_SMMU_GR0, ARM_SMMU_GR0_S2CR(sme_idx), reg);
+	smmu_smr_write(smmu, sme_idx);
+}
+
+/**
+ * smmu_sme_find_next() - Find an SME that would match all IDs of the given SMR.
+ * @smmu: SMMU device
+ * @mask: The mask of the candidate SMR.
+ * @id: The SID of the candidate SMR.
+ * @start_idx: The index to start the search from.
+ *
+ * Return: Stream matching index, or -ENOENT if none found.
+ */
+static int smmu_sme_find_next(struct hyp_arm_smmu_v2_device *smmu, u16 mask,
+			      u16 id, int start_idx)
+{
+	int i;
+	struct hyp_arm_smmu_v2_smr *smr;
+
+	for (i = start_idx; i < smmu->num_mapping_groups; i++) {
+		smr = &smmu->smrs[i];
+
+		/*
+		 * (mask & smr->mask) == mask:
+		 *   smr->mask is at least as broad as mask.
+		 * !((id ^ smr->id) & ~smr->mask)
+		 *   Different bits are not selected by smr->mask -> matched.
+		 *
+		 * Together: smr[i] matches all possible IDs that the entry
+		 * <mask, id> would match (and maybe more).
+		 */
+		if ((mask & smr->mask) == mask &&
+		    !((id ^ smr->id) & ~smr->mask))
+			return i;
+	}
+
+	return -ENOENT;
+}
+
+#define smmu_sme_find(smmu, mask, id) \
+	smmu_sme_find_next((smmu), (mask), (id), 0)
+/**
+ * smmu_sme_find_next_conflict() - Find potentially conflicting SMRs.
+ * @smmu: SMMU device
+ * @mask: The mask of the candidate SMR.
+ * @id: The SID of the candidate SMR.
+ * @start_idx: The index to start the search from.
+ *
+ * Finds valid, non-blocled SMRs that could match at least one common SID with
+ * the candidate SMR mask,id pair passed as argument. Note that a potentially
+ * conflicting SMR does not necessarily match the specified SID (@id).
+ *
+ * Return: Stream matching index, or -ENOENT if none found.
+ */
+static int smmu_sme_find_next_conflict(struct hyp_arm_smmu_v2_device *smmu,
+				       u16 mask, u16 id, int start_idx)
+{
+	int i;
+	struct hyp_arm_smmu_v2_smr *smr;
+
+	for (i = start_idx; i < smmu->num_mapping_groups; i++) {
+		smr = &smmu->smrs[i];
+
+		/*
+		 * According to the specification, invalid SMRs (SMR.VALID==0)
+		 * are not included in the stream matching table search so
+		 * they shouldn't trigger a conflict fault
+		 */
+		if (!smr->valid || smr->hyp_disabled)
+			continue;
+
+		/*
+		 * This is tricky. Masks specify bit to ignore, zeros are bits
+		 * that are relevant. combined mask = mask1 | mask2. The set
+		 * bits in the combined mask are bits that either one ignores.
+		 * If a bit is ignored by either mask, then a candidate SID
+		 * can choose its value based on the other mask's ID. The zero
+		 * bits in the combined mask are bits that are relevent to
+		 * both. If IDs differ in any of the bits that are relevant to
+		 * both, then there cannot be a SID that passes both SMRs, i.e
+		 * there is no conflict.
+		 *
+		 *  (id ^ smr->id)    : The different bits in IDs
+		 * ~(mask | smr->mask): The bits that both care about
+		 * !(... & ...)       : No different bits that both care about
+		 */
+		if (!((id ^ smr->id) & ~(mask | smr->mask)))
+			return i;
+	}
+
+	return -ENOENT;
+}
+
+#define smmu_sme_find_conflict(smmu, mask, id) \
+	smmu_sme_find_next_conflict((smmu), (mask), (id), 0)
+
+static int smmu_sme_find_next_by_cb(struct hyp_arm_smmu_v2_device *smmu,
+				    int cbndx, int start_idx)
 {
 	int i;
 
-	for (i = 0; i < smmu->num_mapping_groups; i++)
-		if (smmu->smrs[i].id == sid)
+	for (i = start_idx; i < smmu->num_mapping_groups; i++)
+		if (smmu->s2crs[i].cbndx == cbndx)
 			return i;
 
-	return HYP_SMMUV2_INVALID_SME;
+	return -ENOENT;
 }
+
+#define smmu_sme_find_by_cb(smmu, cbndx) \
+	smmu_sme_find_next_by_cb((smmu), (cbndx), 0)
 
 /**
  * smmu_host_sme_map() - Get or allocate a new stream matching entry for the host
  * @smmu: SMMU device
  * @sme_idx_host: The index that the host thinks this SME will be in.
  *
- * Return: Actual hardware SME index, or HYP_SMMUV2_INVALID_SME if none available
- *         or invalid @sme_idx_host argument was provided.
+ * Return: Actual hardware SME index, -EINVAL if invalid argument was provided,
+ *         or -ENOSPC if none available.
  */
 static int smmu_host_sme_map(struct hyp_arm_smmu_v2_device *smmu, int sme_idx_host)
 {
 	int sme_idx;
 
 	if (sme_idx_host >= smmu->num_mapping_groups)
-		return HYP_SMMUV2_INVALID_SME;
+		return -EINVAL;
 
 	sme_idx = smmu->host_sme_map[sme_idx_host];
 	if (sme_idx == HYP_SMMUV2_INVALID_SME) {
 		sme_idx = smmu_sme_alloc(smmu);
-		if (sme_idx != HYP_SMMUV2_INVALID_SME)
+		if (sme_idx >= 0)
 			smmu->host_sme_map[sme_idx_host] = sme_idx;
 	}
 
@@ -1371,6 +1482,24 @@ static void smmu_host_sme_unmap(struct hyp_arm_smmu_v2_device *smmu, int sme_idx
 	sme_idx = smmu->host_sme_map[sme_idx_host];
 	smmu->host_sme_map[sme_idx_host] = HYP_SMMUV2_INVALID_SME;
 	smmu_sme_free(smmu, sme_idx);
+}
+
+/**
+ * smmu_host_sme_find() - Given a hardware SME index, find the host index
+ * @smmu: SMMU device
+ * @cb_idx: The index that the host thinks this SME is in.
+ *
+ * Return: Host SME index, or -ENOENT if not found.
+ */
+static int smmu_host_sme_find(struct hyp_arm_smmu_v2_device *smmu, int sme_idx)
+{
+	int sme_idx_host;
+
+	for (sme_idx_host = 0; sme_idx_host < smmu->num_mapping_groups; sme_idx_host++)
+		if (smmu->host_sme_map[sme_idx_host] == sme_idx)
+			return sme_idx_host;
+
+	return -ENOENT;
 }
 
 /**
@@ -1415,6 +1544,8 @@ static int smmu_handle_gr0(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 	u32 val32;
 	int cb_idx, cb_idx_host;
 	int sme_idx_host, sme_idx;
+	struct hyp_arm_smmu_v2_smr *smr;
+	struct hyp_arm_smmu_v2_s2cr *s2cr;
 	int smereg_idx; /* 0: SMR, 1: S2CR */
 	u32 smereg_base[2] = {
 		ARM_SMMU_GR0_SMR(0),
@@ -1577,7 +1708,7 @@ static int smmu_handle_gr0(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 	}
 
 	/*
-	 * Find out which stream matching register it's trying to access,
+	 * Find out which stream mapping register it's trying to access,
 	 * if any, and map it to actual hardware index.
 	 */
 	for (smereg_idx = 0; smereg_idx < 2; smereg_idx++) {
@@ -1592,7 +1723,7 @@ static int smmu_handle_gr0(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 		sme_idx = smmu_host_sme_map(smmu, sme_idx_host);
 
 		/* Ran out of SMEss; not sure what's best here, -EINVAL or 0 */
-		if (sme_idx == HYP_SMMUV2_INVALID_SME) {
+		if (sme_idx < 0) {
 			*val = 0;
 			return 0;
 		}
@@ -1601,12 +1732,14 @@ static int smmu_handle_gr0(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 		break;
 	}
 
-	/* SMR registers - stream match configuration (shadow state) */
+	/* SMR registers - stream matching configuration */
 	if (smereg_idx == 0) {
+		smr = &smmu->smrs[sme_idx];
+
 		if (is_write) {
 			val32 = (u32)*val;
 
-			if (!(val32 & ARM_SMMU_SMR_VALID) && smmu->smrs[sme_idx].valid) {
+			if (!(val32 & ARM_SMMU_SMR_VALID) && smr->valid) {
 				/*
 				 * Host is disabling this SME; unmap it; Checking val32 alone
 				 * is not sufficient here as the host writes it invalid also
@@ -1617,71 +1750,94 @@ static int smmu_handle_gr0(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 			}
 
 			/* Update shadow state */
-			smmu->smrs[sme_idx].valid = !!(val32 & ARM_SMMU_SMR_VALID);
-			smmu->smrs[sme_idx].mask = FIELD_GET(ARM_SMMU_SMR_MASK, val32);
-			smmu->smrs[sme_idx].id = FIELD_GET(ARM_SMMU_SMR_ID, val32);
+			smr->valid = !!(val32 & ARM_SMMU_SMR_VALID);
+			smr->mask = FIELD_GET(ARM_SMMU_SMR_MASK, val32);
+			smr->id = FIELD_GET(ARM_SMMU_SMR_ID, val32);
+			smr->hyp_disabled = false;
+
+			/*
+			 * We don't need to check for existing SMEs for this SID
+			 * as we've enabled faulting on conflicts (SMCFCFG). Worst
+			 * case the host tries to configure a SID owned by a guest
+			 * and they both fault.
+			 */
 
 			/* Write through to hardware (no modification needed for SMR) */
 			smmu_writel(smmu, ARM_SMMU_GR0, offset, val32);
 		} else {
 			/* Return shadow state */
 			val32 = 0;
-			if (smmu->smrs[sme_idx].valid)
+			if (smr->valid)
 				val32 |= ARM_SMMU_SMR_VALID;
-			val32 |= FIELD_PREP(ARM_SMMU_SMR_MASK, smmu->smrs[sme_idx].mask);
-			val32 |= FIELD_PREP(ARM_SMMU_SMR_ID, smmu->smrs[sme_idx].id);
+			val32 |= FIELD_PREP(ARM_SMMU_SMR_MASK, smr->mask);
+			val32 |= FIELD_PREP(ARM_SMMU_SMR_ID, smr->id);
 			*val = val32;
 		}
 		return 0;
 	}
 
-	/* S2CR registers - stream-to-context mapping (shadow + enforce Stage-2) */
+	/* S2CR registers - stream-to-context mapping */
 	if (smereg_idx == 1) {
+		s2cr = &smmu->s2crs[sme_idx];
+		smr = &smmu->smrs[sme_idx];
+
 		if (is_write) {
 			val32 = (u32)*val;
 
 			/* Map the context bank index to actual hardware CB */
 			cb_idx_host = FIELD_GET(ARM_SMMU_S2CR_CBNDX, val32);
 			cb_idx = smmu_host_cb_map(smmu, cb_idx_host);
-			if (cb_idx == HYP_SMMUV2_INVALID_CB)
+			if (cb_idx < 0) {
 				/* We ran out of CBs or a CBNDX too large */
 				return -EINVAL;
+			}
 
 			/* Correct it in S2CR */
 			val32 &= ~ARM_SMMU_S2CR_CBNDX;
 			val32 |= FIELD_PREP(ARM_SMMU_S2CR_CBNDX, cb_idx);
 
 			/* Update shadow state */
-			smmu->s2crs[sme_idx].type = FIELD_GET(ARM_SMMU_S2CR_TYPE, val32);
-			smmu->s2crs[sme_idx].cbndx = FIELD_GET(ARM_SMMU_S2CR_CBNDX, val32);
-			smmu->s2crs[sme_idx].privcfg = FIELD_GET(ARM_SMMU_S2CR_PRIVCFG, val32);
-			smmu->s2crs[sme_idx].bypass =
-				(smmu->s2crs[sme_idx].type == S2CR_TYPE_BYPASS);
+			s2cr->type = FIELD_GET(ARM_SMMU_S2CR_TYPE, val32);
+			s2cr->cbndx = FIELD_GET(ARM_SMMU_S2CR_CBNDX, val32);
+			s2cr->privcfg = FIELD_GET(ARM_SMMU_S2CR_PRIVCFG, val32);
+			s2cr->bypass = (s2cr->type == S2CR_TYPE_BYPASS);
 
-			/* We don't allow bypass */
-			if (smmu->s2crs[sme_idx].type == S2CR_TYPE_BYPASS) {
+			switch(s2cr->type) {
+			case S2CR_TYPE_BYPASS:
+				/* We don't allow bypass, change to fault */
 				val32 &= ~ARM_SMMU_S2CR_TYPE;
 				val32 |= FIELD_PREP(ARM_SMMU_S2CR_TYPE, S2CR_TYPE_FAULT);
+				s2cr->type = S2CR_TYPE_FAULT;
 
-				/* And let s2crs[idx].bypass indicate that we modified this */
-				smmu->s2crs[sme_idx].type = FIELD_GET(ARM_SMMU_S2CR_TYPE, val32);
+				/* ...and let .bypass indicate that we modified this */
+				break;
+			case S2CR_TYPE_TRANS:
+				/*
+				 * There's cases where we invalidate a host's SMR.
+				 * This is a good time to sync it back to the hw.
+				 */
+				if (smr->hyp_disabled)
+					smmu_sme_hyp_enable(smmu, sme_idx);
+				break;
+			default:
+				break;
 			}
 
 			/* Write to hardware */
 			smmu_writel(smmu, ARM_SMMU_GR0, offset, val32);
 		} else {
 			/* Return shadow state; let the host think this is set to bypass */
-			if (smmu->s2crs[sme_idx].bypass)
+			if (s2cr->bypass)
 				val32 = FIELD_PREP(ARM_SMMU_S2CR_TYPE, S2CR_TYPE_BYPASS);
 			else
-				val32 = FIELD_PREP(ARM_SMMU_S2CR_TYPE, smmu->s2crs[sme_idx].type);
+				val32 = FIELD_PREP(ARM_SMMU_S2CR_TYPE, s2cr->type);
 
 			/* Map actual hardware CB index back to host index */
-			cb_idx = FIELD_PREP(ARM_SMMU_S2CR_CBNDX, smmu->s2crs[sme_idx].cbndx);
+			cb_idx = FIELD_PREP(ARM_SMMU_S2CR_CBNDX, s2cr->cbndx);
 			cb_idx_host = smmu_host_cb_find(smmu, cb_idx);
 
 			val32 |= FIELD_PREP(ARM_SMMU_S2CR_CBNDX, cb_idx_host);
-			val32 |= FIELD_PREP(ARM_SMMU_S2CR_PRIVCFG, smmu->s2crs[sme_idx].privcfg);
+			val32 |= FIELD_PREP(ARM_SMMU_S2CR_PRIVCFG, s2cr->privcfg);
 			*val = val32;
 		}
 		return 0;
@@ -1731,7 +1887,7 @@ static int smmu_handle_gr1(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 
 		cb_idx_host = (offset - cbreg_base[cbreg_idx]) >> 2;
 		cb_idx = smmu_host_cb_map(smmu, cb_idx_host);
-		if (cb_idx == HYP_SMMUV2_INVALID_CB) {
+		if (cb_idx < 0) {
 			/* Ran out of CBs; not sure what's best here, -EINVAL or 0 */
 			*val = 0;
 			return 0;
@@ -1850,7 +2006,7 @@ static int smmu_handle_cb(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 		return -EINVAL;
 
 	cb_idx = smmu_host_cb_map(smmu, cb_idx_host);
-	if (cb_idx == HYP_SMMUV2_INVALID_CB) {
+	if (cb_idx < 0) {
 		/* Ran out of CBs; not sure what's best here, -EINVAL or 0 */
 		*val = 0;
 		return 0;
@@ -2387,11 +2543,11 @@ static int smmu_domain_alloc(pkvm_handle_t iommu,
 
 	hyp_spin_lock(&smmu->lock);
 
-	cb_idx = smmu_cb_alloc(smmu);
-	if (cb_idx == HYP_SMMUV2_INVALID_CB) {
-		ret = -EBUSY;
+	ret = smmu_cb_alloc(smmu);
+	if (ret < 0)
 		goto error_with_lock;
-	}
+
+	cb_idx = ret;
 
 	smmu_domain->domain = domain;
 	smmu_domain->type = type;
@@ -2425,15 +2581,26 @@ static void smmu_domain_free(struct kvm_hyp_iommu_domain *domain)
 {
 	struct hyp_arm_smmu_v2_domain *smmu_domain = domain->priv;
 	struct hyp_arm_smmu_v2_device *smmu = smmu_domain->smmu;
-	struct hyp_arm_smmu_v2_cb *cb = &smmu->cbs[smmu_domain->cbndx];
+	int sme_idx, cb_idx = smmu_domain->cbndx;
+	struct hyp_arm_smmu_v2_cb *cb = &smmu->cbs[cb_idx];
 
 	if (smmu_domain->pgtable)
 		kvm_arm_io_pgtable_free(smmu_domain->pgtable);
 
 	hyp_spin_lock(&smmu->lock);
 	memset(cb, 0, sizeof(*cb));
-	smmu_cb_write(smmu, smmu_domain->cbndx);
-	smmu_cb_free(smmu, smmu_domain->cbndx);
+	smmu_cb_write(smmu, cb_idx);
+	smmu_cb_free(smmu, cb_idx);
+
+	sme_idx = smmu_sme_find_by_cb(smmu, cb_idx);
+	while (sme_idx >= 0) {
+		smmu_sme_clear(smmu, sme_idx);
+		smmu_sme_write(smmu, sme_idx);
+		smmu_sme_free(smmu, sme_idx);
+
+		sme_idx = smmu_sme_find_next_by_cb(smmu, cb_idx, sme_idx + 1);
+	}
+
 	hyp_spin_unlock(&smmu->lock);
 
 	smmu_flush_deferred_unuse(this_cpu_ptr(&kvm_smmu_deferred_unuse));
@@ -2441,10 +2608,12 @@ static void smmu_domain_free(struct kvm_hyp_iommu_domain *domain)
 }
 
 static int smmu_dev_attach(pkvm_handle_t iommu, struct kvm_hyp_iommu_domain *domain,
-			   u32 sid, u32 pasid, u32 pasid_bits, unsigned long flags)
+			   u32 smr, u32 pasid, u32 pasid_bits, unsigned long flags)
 {
 	struct hyp_arm_smmu_v2_device *smmu = smmu_id_to_ptr(iommu);
 	struct hyp_arm_smmu_v2_domain *smmu_domain = domain->priv;
+	u16 mask = FIELD_GET(ARM_SMMU_SMR_MASK, smr);
+	u16 sid = FIELD_GET(ARM_SMMU_SMR_ID, smr);
 	int ret = 0;
 	int sme_idx;
 
@@ -2452,24 +2621,46 @@ static int smmu_dev_attach(pkvm_handle_t iommu, struct kvm_hyp_iommu_domain *dom
 		return -ENODEV;
 	if (smmu_domain->smmu != smmu)
 		return -EBUSY;
-	if (sid > U16_MAX)
-		return -EINVAL;
 
 	hyp_spin_lock(&smmu->lock);
 
-	if (smmu_sme_find_by_sid(smmu, sid) != HYP_SMMUV2_INVALID_SME) {
-		/* SID exists; conflicting SME would fault (sCR0_SMCFCFG) */
-		ret = -EEXIST;
-		goto exit_with_lock;
+	/*
+	 * Prevent conflicts. This is not done for security reasons as we have
+	 * faulting on conflicts enabled (sCR0.SMCFCFG), but rather to prevent
+	 * faults.
+	 */
+	sme_idx = smmu_sme_find_conflict(smmu, mask, sid);
+	while (sme_idx >= 0) {
+		if (smmu->s2crs[sme_idx].type == S2CR_TYPE_FAULT) {
+			/*
+			 * SID exists, is valid, but is set to fault. Host sets
+			 * S2CR.TYPE=fault when it blocks a device during VFIO
+			 * handover to a guest. In such cases, disable it on
+			 * the hardware and mark it as hyp_disabled. Once the
+			 * host switches back to S2CR.TYPE=trans, we will re-
+			 * enable it based on the hyp_disabled flag.
+			 */
+			smmu_sme_hyp_disable(smmu, sme_idx);
+		} else {
+			/*
+			 * SID exists, is valid and is not set to fault. Adding
+			 * a second entry would cause both to fault because we
+			 * always set sCR0.SMCFCFG=1. Bail out anyway.
+			 */
+			ret = -EEXIST;
+			goto exit_with_lock;
+		}
+
+		sme_idx = smmu_sme_find_next_conflict(smmu, mask, sid, sme_idx + 1);
 	}
 
 	sme_idx = smmu_sme_alloc(smmu);
-	if (sme_idx == HYP_SMMUV2_INVALID_SME) {
-		ret = -EBUSY;
+	if (sme_idx < 0) {
+		ret = sme_idx;
 		goto exit_with_lock;
 	}
 
-	smmu_sme_init(smmu, sme_idx, sid, smmu_domain->cbndx);
+	smmu_sme_init(smmu, sme_idx, mask, sid, smmu_domain->cbndx);
 	smmu_sme_write(smmu, sme_idx);
 
 exit_with_lock:
@@ -2478,11 +2669,12 @@ exit_with_lock:
 }
 
 static int smmu_dev_detach(pkvm_handle_t iommu, struct kvm_hyp_iommu_domain *domain,
-			   u32 sid, u32 pasid)
+			   u32 smr, u32 pasid)
 {
 	struct hyp_arm_smmu_v2_device *smmu = smmu_id_to_ptr(iommu);
 	struct hyp_arm_smmu_v2_domain *smmu_domain = domain->priv;
-	int ret = 0;
+	u16 mask = FIELD_GET(ARM_SMMU_SMR_MASK, smr);
+	u16 sid = FIELD_GET(ARM_SMMU_SMR_ID, smr);
 	int sme_idx;
 
 	if (!smmu)
@@ -2492,45 +2684,67 @@ static int smmu_dev_detach(pkvm_handle_t iommu, struct kvm_hyp_iommu_domain *dom
 
 	hyp_spin_lock(&smmu->lock);
 
-	sme_idx = smmu_sme_find_by_sid(smmu, sid);
-	if (sme_idx == HYP_SMMUV2_INVALID_SME) {
-		ret = -EINVAL;
-		goto exit_with_lock;
+	/* Entry that matches at least as many streams as this mask,sid pair */
+	sme_idx = smmu_sme_find(smmu, mask, sid);
+
+	/* Remove matches pointing to this domain's context bank */
+	while (sme_idx >= 0) {
+		if (smmu->s2crs[sme_idx].cbndx == smmu_domain->cbndx) {
+			smmu_sme_clear(smmu, sme_idx);
+			smmu_sme_write(smmu, sme_idx);
+			smmu_sme_free(smmu, sme_idx);
+		}
+
+		sme_idx = smmu_sme_find_next(smmu, mask, sid, sme_idx + 1);
 	}
 
-	smmu_sme_disable(smmu, sme_idx);
-	smmu_sme_write(smmu, sme_idx);
-	smmu_sme_free(smmu, sme_idx);
-
-exit_with_lock:
 	hyp_spin_unlock(&smmu->lock);
-	return ret;
+	return 0;
 }
 
-static int smmu_dev_block_dma(pkvm_handle_t iommu, u32 sid, bool is_host2guest)
+static int smmu_dev_block_dma(pkvm_handle_t iommu, u32 smr, bool is_host2guest)
 {
 	struct hyp_arm_smmu_v2_device *smmu = smmu_id_to_ptr(iommu);
-	int ret = 0;
+	u16 mask = FIELD_GET(ARM_SMMU_SMR_MASK, smr);
+	u16 sid = FIELD_GET(ARM_SMMU_SMR_ID, smr);
 	int sme_idx;
+	bool is_hosts;
 
 	if (!smmu)
 		return -ENODEV;
 
 	hyp_spin_lock(&smmu->lock);
 
-	sme_idx = smmu_sme_find_by_sid(smmu, sid);
-	if (sme_idx == HYP_SMMUV2_INVALID_SME) {
-		/* Nothing to do, already blocked */
-		goto exit_with_lock;
+	/* Entry that matches at least as many streams as this mask,sid pair */
+	sme_idx = smmu_sme_find(smmu, mask, sid);
+
+	/*
+	 * Block only if the SME is owned by the supposed owner. If host
+	 * manages to call this specifying a guest's SME (and vice versa),
+	 * ignore it.
+	 */
+	while (sme_idx >= 0) {
+		is_hosts = (smmu_host_sme_find(smmu, sme_idx) >= 0);
+
+		if (is_host2guest && is_hosts) {
+			/*
+			 * Just block it on hardware even though we don't
+			 * expect this to be called. The host should be using
+			 * the emulated SMMU, not the PVIOMMU API.
+			 */
+			smmu_sme_hyp_disable(smmu, sme_idx);
+		} else if (!is_host2guest && !is_hosts) {
+			/* Guests are more straightforward; wipe it */
+			smmu_sme_clear(smmu, sme_idx);
+			smmu_sme_write(smmu, sme_idx);
+			smmu_sme_free(smmu, sme_idx);
+		}
+
+		sme_idx = smmu_sme_find_next(smmu, mask, sid, sme_idx + 1);
 	}
 
-	smmu_sme_disable(smmu, sme_idx);
-	smmu_sme_write(smmu, sme_idx);
-	smmu_sme_free(smmu, sme_idx);
-
-exit_with_lock:
 	hyp_spin_unlock(&smmu->lock);
-	return ret;
+	return 0;
 }
 
 static phys_addr_t smmu_iova_to_phys(struct kvm_hyp_iommu_domain *domain,
