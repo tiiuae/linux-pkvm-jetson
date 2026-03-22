@@ -82,6 +82,12 @@
 #define ARM_SMMU_CBAR_S1_CBNDX		GENMASK(15, 8)
 #define ARM_SMMU_VTCR_TG1_4KB           BIT(31)
 
+/* Wrong in arm-smmu.h */
+#undef ARM_SMMU_SMR_MASK
+#undef ARM_SMMU_SMR_ID
+#define ARM_SMMU_SMR_MASK		GENMASK(30, 16)
+#define ARM_SMMU_SMR_ID			GENMASK(14, 0)
+
 /*
  * Stream Match Register (SMR) and Stream-to-Context Register (S2CR)
  * These are shadowed by EL2 to enforce nested translation
@@ -89,7 +95,8 @@
 struct hyp_arm_smmu_v2_smr {
 	u16			mask;
 	u16			id;
-	bool			valid;
+	bool			valid;		/* What the host thinks */
+	bool			hyp_disabled; 	/* Set as invalid by hyp on hw */
 };
 
 struct hyp_arm_smmu_v2_s2cr {
@@ -160,7 +167,6 @@ struct hyp_arm_smmu_v2_device {
 	u8			ubs;		/* Upstream bus size (VA, bits) */
 	u8			ias;		/* IPA address size (bits) */
 	u8			oas;		/* Output address size (PA, bits) */
-	u16			sid_bits;	/* Stream ID size (bits) */
 
 	/* Context bank management */
 
