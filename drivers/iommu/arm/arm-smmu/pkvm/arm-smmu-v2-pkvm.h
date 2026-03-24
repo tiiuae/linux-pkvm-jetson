@@ -113,11 +113,11 @@ struct hyp_arm_smmu_v2_s2cr {
  * struct hyp_arm_smmu_v2_device and must have a fixed, known size.
  */
 struct hyp_arm_smmu_v2_cb {
-	u16			asid;		/* Address Space ID (S1) */
 	union {
-		u16		vmid;		/* Virtual Machine ID (S2) */
+		u16		asid;		/* Address Space ID (S1) */
 		u16		domain_id;	/* Hyp domain id */
 	};
+	u8			vmid;		/* Virtual Machine ID (S2) */
 	u32			cbar;		/* Context Bank Attribute Register */
 	u32			tcr[2];		/* Translation Control Register */
 	u64			ttbr[2];	/* Translation Table Base Register */
@@ -325,22 +325,6 @@ static inline u32 smmu_lpae_vtcr(const struct io_pgtable_cfg *cfg)
 	       FIELD_PREP(ARM_SMMU_VTCR_IRGN0, cfg->arm_lpae_s2_cfg.vtcr.irgn) |
 	       FIELD_PREP(ARM_SMMU_VTCR_SL0, cfg->arm_lpae_s2_cfg.vtcr.sl) |
 	       FIELD_PREP(ARM_SMMU_VTCR_T0SZ, cfg->arm_lpae_s2_cfg.vtcr.tsz);
-}
-
-static inline u16 smmu_guest_domain_id_to_asid(struct hyp_arm_smmu_v2_device *smmu,
-					       u16 domain_id)
-{
-	return (u16)smmu->num_context_banks + domain_id;
-}
-
-static inline u16 smmu_asid_to_domain_id(struct hyp_arm_smmu_v2_device *smmu, u16 asid)
-{
-	/* host */
-	if (asid < smmu->num_context_banks)
-		return 0;
-
-	/* guest */
-	return asid - (u16)smmu->num_context_banks;
 }
 
 /**
