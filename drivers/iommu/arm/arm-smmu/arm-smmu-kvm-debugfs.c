@@ -157,7 +157,7 @@ static int kvm_smmu_host_device_show(struct seq_file *m, void *unused)
 	ret = kvm_smmu_export_dev(hyp_drv_id, smmu_id, smmu);
 	if (ret) {
 		seq_printf(m, "<Error %d exporting device structure>\n", ret);
-		goto exit_with_pages;
+		return ret;
 	}
 
 	/* Allocate memory for the dynamically allocated state */
