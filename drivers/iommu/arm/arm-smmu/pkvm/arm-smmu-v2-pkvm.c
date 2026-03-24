@@ -720,10 +720,6 @@ static int smmu_probe_device(struct hyp_arm_smmu_v2_device *smmu)
 	size = arm_smmu_id_size_to_bits(FIELD_GET(ARM_SMMU_ID2_OAS, id2));
 	smmu->oas = size;
 
-	/* Check for 16-bit VMID support */
-	if (id2 & ARM_SMMU_ID2_VMID16)
-		smmu->features |= ARM_SMMU_FEAT_VMID16;
-
 	/* ID7: SMMU architecture version */
 	/* For Tegra234, this is SMMUv2 (ARM MMU-500) */
 	/* Version info is informational only */
@@ -805,9 +801,7 @@ static int smmu_reset(struct hyp_arm_smmu_v2_device *smmu)
 	 */
 	scr0 |= ARM_SMMU_sCR0_USFCFG;
 
-	/* Enable 16-bit VMIDs if supported */
-	if (smmu->features & ARM_SMMU_FEAT_VMID16)
-		scr0 |= ARM_SMMU_sCR0_VMID16EN;
+	/* Don't enable 16-bit VMIDs even if supported */
 
 	/* Disable forced broadcasting */
 	/* (FB bit is implicitly 0, no need to clear) */
@@ -962,71 +956,75 @@ static void smmu_cb_free(struct hyp_arm_smmu_v2_device *smmu, int cb_idx)
  * @smmu: SMMU device
  * @cb_idx: The hardware index of the context bank
  * @domain_type: Stage 1 or 2. One of enum kvm_arm_smmu_domain_type
- * @domain_id: 0 for host, all others for guests. Assumes < U16_MAX-num_context_banks
+ * @domain_id: Assumes < 256 for the host, < 511 for guests. Will be used for
+ *             ASID and VMID.
  * @pgtbl_cfg: The page table configuration to initialise from
  *
  * Depending on @domain_type, either sets S1-translate-S2-bypass or S2-translate.
  * * Does not support stage 1 domains for nesting (S1-translate-S2-tranlate) even
  *   though it can be used to setup a stage 2 domain for nesting with another CB.
- * * Host domain ASIDs (stage 1) are set to @cb_idx. Just as Linux does.
- * * Guest domain ASIDs (stage 1) are calculated from domain IDs mapped above
- *   `smmu.num_context_banks` to avoid collisions with the Linux host.
- * * All VMIDs (host/guest x stage 1/2) are set to @domain_id.
+ * * ASIDs are set to @domain_id. This is based on the fact that pKVM partitions
+ *   domain IDs and allocates in [0, 256) for the host and in [256,512) for the
+ *   guest.
+ * * Host VMIDs are set to 0.
+ * * Guest VMIDs are set to low byte of <@domain_id + 1>.
  */
 static void smmu_cb_init(struct hyp_arm_smmu_v2_device *smmu, int cb_idx, int domain_type,
 			 u16 domain_id, struct io_pgtable_cfg *pgtbl_cfg)
 {
 	struct hyp_arm_smmu_v2_cb *cb = &smmu->cbs[cb_idx];
 	bool stage1 = domain_type == KVM_ARM_SMMU_DOMAIN_S1;
-	bool host = domain_id == 0;
+	bool host = (domain_id < 256);
 
 	/*
 	 * VMIDs are a mess...
 	 *
 	 * For the host:
-	 *   Linux driver does not set VMID (i.e. VMID==0) for stage 1 when
+	 *   Linux driver does not write VMID (i.e. VMID==0) for stage 1 when
 	 *   8-bit VMIDs are used. Not sure if this is intended. Follow it
 	 *   anyway, as according to the spec, VMIDs across S1 and S2 must
-	 *   match, and we do use nesting (id mapped S2) to isolating the host.
+	 *   match, and we do use nesting (identity-mapped S2) to isolate the
+	 *   host.
 	 *
 	 *   When 16-bit VMIDs are supported, Linux sets the S1 VMID to
-	 *   <cb_idx> and the S2 VMID to <cb_idx + 1>. We trap that and set
-	 *   it to 0. So, all host VMIDs equal domain_id (0), regardless of
-	 *   stage and size. Again this is required for nesting to work.
+	 *   <cb_idx> and the S2 VMID to <cb_idx + 1>. We don't advertise
+	 *   16-bit VMID support but we also trap the setting of 16-bit VMIDs
+	 *   and override those to 0 anyway. So, all host VMIDs equal to 0
+	 *   regardless of stage and size. Again this is required for nesting
+	 *   to work.
 	 *
-	 * For the guest:
+	 * For the guests:
 	 *   We have no way to communicate VMIDs across domains unless
 	 *   we are the ones to setup the nesting. Since we aren't, and this
 	 *   implementation does not support nesting for guests (at least not
-	 *   through the hyp iommu PV interface), set it to domain_id just to
+	 *   through the hyp iommu PV interface), set it to domain_id+1 just to
 	 *   avoid invalidating unwanted S2 entries (see smmu_tlb_inv_context()).
 	 */
+	if (host)
+		cb->vmid = 0;
+	else
+		cb->vmid = (u8)(domain_id + 1);
 
-	/* Union'ed with domain_id */
-	cb->vmid = (u16)domain_id;
-
-	/* ASID */
-	if (host && stage1)
-		/* We don't ever configure host S1 but follow Linux's approach */
-		cb->asid = cb_idx;
-	else if (!host && stage1)
-		cb->asid = smmu_guest_domain_id_to_asid(smmu, domain_id);
+	/*
+	 * ASID
+	 *
+	 * We don't ever configure host S1, so this should be good for everyone
+	 */
+	cb->asid = domain_id;
 
 	/* CBAR */
-	if (stage1) {
+	if (stage1)
 		cb->cbar = FIELD_PREP(ARM_SMMU_CBAR_TYPE, CBAR_TYPE_S1_TRANS_S2_BYPASS);
-	} else {
+	else
 		cb->cbar = FIELD_PREP(ARM_SMMU_CBAR_TYPE, CBAR_TYPE_S2_TRANS);
-	}
 
 	/* TCR */
 	if (stage1) {
 		cb->tcr[0] = smmu_lpae_tcr(pgtbl_cfg);
 		cb->tcr[1] = smmu_lpae_tcr2(pgtbl_cfg);
 		cb->tcr[1] |= ARM_SMMU_TCR2_AS;
-	} else {
+	} else
 		cb->tcr[0] = smmu_lpae_vtcr(pgtbl_cfg);
-	}
 
 	/* TTBRs */
 	if (stage1) {
@@ -1037,9 +1035,8 @@ static void smmu_cb_init(struct hyp_arm_smmu_v2_device *smmu, int cb_idx, int do
 			cb->ttbr[1] |= pgtbl_cfg->arm_lpae_s1_cfg.ttbr;
 		else
 			cb->ttbr[0] |= pgtbl_cfg->arm_lpae_s1_cfg.ttbr;
-	} else {
+	} else
 		cb->ttbr[0] = pgtbl_cfg->arm_lpae_s2_cfg.vttbr;
-	}
 
 	/* MAIRs (stage-1 only) */
 	if (stage1) {
@@ -1055,8 +1052,6 @@ static void smmu_cb_init(struct hyp_arm_smmu_v2_device *smmu, int cb_idx, int do
  *
  * All values written as specified in smmu->cbs[cb_idx] except CBAR in which
  * case only TYPE and CBNDX are respected.
- *
- * VMID is always written as 0.
  */
 static void smmu_cb_write(struct hyp_arm_smmu_v2_device *smmu, int cb_idx)
 {
@@ -1077,11 +1072,6 @@ static void smmu_cb_write(struct hyp_arm_smmu_v2_device *smmu, int cb_idx)
 
 	/* CBA2R */
 	reg = ARM_SMMU_CBA2R_VA64;
-
-	/* 16-bit VMIDs live in CBA2R */
-	if (smmu->features & ARM_SMMU_FEAT_VMID16)
-		reg |= FIELD_PREP(ARM_SMMU_CBA2R_VMID16, cb->vmid);
-
 	smmu_writel(smmu, ARM_SMMU_GR1, ARM_SMMU_GR1_CBA2R(cb_idx), reg);
 
 	/* CBAR */
@@ -1102,8 +1092,7 @@ static void smmu_cb_write(struct hyp_arm_smmu_v2_device *smmu, int cb_idx)
 	}
 
 	/* 8-bit VMIDs live in CBAR */
-	if (!(smmu->features & ARM_SMMU_FEAT_VMID16))
-		reg |= FIELD_PREP(ARM_SMMU_CBAR_VMID, cb->vmid);
+	reg |= FIELD_PREP(ARM_SMMU_CBAR_VMID, cb->vmid);
 
 	cb->cbar = reg;
 	smmu_writel(smmu, ARM_SMMU_GR1, ARM_SMMU_GR1_CBAR(cb_idx), reg);
@@ -1948,14 +1937,18 @@ static int smmu_handle_gr1(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 		if (is_write) {
 			val32 = (u32)*val;
 
-			/*
-			 * Linux sets vmid=asid here (?) force 0 on host even
-			 * though we have force-disabled 16-bit VMIDs
-			 */
-			val32 &= ~ARM_SMMU_CBA2R_VMID16;
+			/* Require ARM_SMMU_CTX_FMT_AARCH64 */
+			if (!(val32 & ARM_SMMU_CBA2R_VA64))
+				return -EINVAL;
 
-			/* Allow all the rest of CBA2R fields (MONC, VA64) */
-			smmu_writel(smmu, ARM_SMMU_GR1, offset, val32);
+			/*
+			 * Linux sets vmid=asid here (?). Force VMID=0 on host
+			 * even though we have force-disabled 16-bit VMIDs.
+			 *
+			 * Clear also the MONC bit, and there's no other field
+			 * left to take from val32.
+			 */
+			smmu_writel(smmu, ARM_SMMU_GR1, offset, ARM_SMMU_CBA2R_VA64);
 		} else
 			*val = smmu_readl(smmu, ARM_SMMU_GR1, offset);
 		return 0;
@@ -2068,6 +2061,9 @@ static int smmu_handle_cb(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 		if (is_write) {
 			val32 = (u32)*val;
 
+			/* Force 16-bit ASID size */
+			val32 |= ARM_SMMU_TCR2_AS;
+
 			/* Store in shadow state */
 			smmu->cbs[cb_idx].tcr[1] = val32;
 
@@ -2089,6 +2085,9 @@ static int smmu_handle_cb(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 
 			smmu->cbs[cb_idx].ttbr[0] = val64;
 
+			if (!(smmu->cbs[cb_idx].tcr && ARM_SMMU_TCR_A1))
+				smmu->cbs[cb_idx].asid = FIELD_GET(ARM_SMMU_TTBRn_ASID, val64);
+
 			/* Host/bypass domains: write through */
 			smmu_writeq(smmu, cb_page, cb_offset, val64);
 		} else {
@@ -2103,6 +2102,9 @@ static int smmu_handle_cb(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 			val64 = *val;
 
 			smmu->cbs[cb_idx].ttbr[1] = val64;
+
+			if (smmu->cbs[cb_idx].tcr && ARM_SMMU_TCR_A1)
+				smmu->cbs[cb_idx].asid = FIELD_GET(ARM_SMMU_TTBRn_ASID, val64);
 
 			/*
 			 * TTBR1 is only used in Stage-1 translation.
@@ -2520,20 +2522,17 @@ static int smmu_domain_alloc(pkvm_handle_t iommu,
 	int cb_idx;
 	int ret;
 
-	/* domain 0 not used and ID reserved for the s2 vmid. */
-	if (domain->domain_id == 0)
+	/* Don't support host domains through this interface */
+	if (domain->domain_id < 256)
 		return -EPERM;
+
+	/* We rely on this upper bound to set 8-bit VMIDs (smmu_cb_init()) */
+	if (domain->domain_id >= 511)
+		return -EINVAL;
+
 	if (!smmu)
 		return -ENODEV;
 
-	/*
-	 * U16_MAX because we'll be using it as VMID and ASID (u16).
-	 * - num_context_banks because we reserve bottom <num_context_banks>
-	 *   ASIDs for our reserved CBs and the host's CBs. Linux currently
-	 *   uses cb_idx as ASID.
-	 */
-	if (domain->domain_id > U16_MAX - smmu->num_context_banks)
-		return -EINVAL;
 	if (type >= KVM_ARM_SMMU_DOMAIN_MAX)
 		return -EINVAL;
 
