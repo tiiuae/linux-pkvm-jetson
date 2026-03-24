@@ -54,8 +54,8 @@ static void kvm_smmu_dump_cbs(struct seq_file *m, struct hyp_arm_smmu_v2_device 
 	int i;
 	int cnt_same;
 
-	tbl_printf(m, "    |     cbar |   tcr[0] |   tcr[1] |          ttbr[0] |          ttbr[1] |    sctlr |  mair[0] |  mair[1] | domain_id \n");
-	tbl_printf(m, "====|==========|==========|==========|==================|==================|==========|==========|==========|===========\n");
+	tbl_printf(m, "    |     cbar |   tcr[0] |   tcr[1] |          ttbr[0] |          ttbr[1] |    sctlr |  mair[0] |  mair[1] | vmid | domain_id \n");
+	tbl_printf(m, "====|==========|==========|==========|==================|==================|==========|==========|==========|======|===========\n");
 
 	for (i = 0, cnt_same = 0; i < smmu->num_context_banks; i++) {
 		if (i > 0 && memcmp(&smmu->cbs[i], &smmu->cbs[i-1],
@@ -67,7 +67,7 @@ static void kvm_smmu_dump_cbs(struct seq_file *m, struct hyp_arm_smmu_v2_device 
 			cnt_same = 0;
 		}
 
-		tbl_printf(m, "%3d |%9x |%9x |%9x |%17llx |%17llx |%9x |%9x |%9x |%10u\n",
+		tbl_printf(m, "%3d |%9x |%9x |%9x |%17llx |%17llx |%9x |%9x |%9x |%5u |%10u\n",
 			   i,
 			   smmu->cbs[i].cbar,
 			   smmu->cbs[i].tcr[0],
@@ -77,6 +77,7 @@ static void kvm_smmu_dump_cbs(struct seq_file *m, struct hyp_arm_smmu_v2_device 
 			   smmu->cbs[i].sctlr,
 			   smmu->cbs[i].mair[0],
 			   smmu->cbs[i].mair[1],
+			   smmu->cbs[i].vmid,
 			   smmu->cbs[i].domain_id
 			  );
 	}
