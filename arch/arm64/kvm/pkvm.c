@@ -557,6 +557,7 @@ static int pkvm_register_device(struct of_phandle_args *args,
 
 	dev->nr_iommus = j;
 	dev->ctxt = NULL;
+	dev->refcount = 0;
 	dev->group_id = group_id;
 
 	return 0;
