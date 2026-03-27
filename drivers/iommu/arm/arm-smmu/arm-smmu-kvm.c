@@ -20,6 +20,7 @@
 #include <linux/init.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
+#include <linux/of_platform.h>
 #include <linux/platform_device.h>
 
 #include <asm/kvm_mmu.h>
@@ -93,11 +94,25 @@ static int kvm_arm_smmu_v2_init(void)
 
 static int kvm_arm_smmu_v2_id_by_of(struct device_node *np, pkvm_handle_t *out_id)
 {
-	struct device *dev = bus_find_device_by_of_node(&platform_bus_type, np);
+	struct resource res;
+	int id, ret;
 
-	*out_id = kvm_arm_smmu_v2_id(dev);
-	put_device(dev);
-	return 0;
+	pr_info("kvm_arm_smmu_v2_id_by_of: np.full_name = %s\n", np->full_name);
+
+	ret = of_address_to_resource(np, 0, &res);
+	if (ret) {
+		pr_err("arm-smmu-kvm: Failed to get resource for %pOF\n", np);
+		return -ENOENT;
+	}
+
+	for (id = 0; id < kvm_arm_smmu_v2_count; id++) {
+		if (smmu_id_to_mmio[id] == res.start) {
+			*out_id = id;
+			return 0;
+		}
+	}
+	pr_err("arm-smmu-kvm: Didn't find matching smmu\n");
+	return -ENODEV;
 }
 
 static int kvm_arm_smmu_v2_num_ids(struct device *dev)
