@@ -1864,6 +1864,11 @@ static int __pkvm_arch_reclaim_device(struct device *dev, void *data)
 	struct resource *r;
 	int index = 0;
 
+	if (!dev)
+		return -EINVAL;
+	if (!dev_is_platform(dev))
+		return -EOPNOTSUPP;
+
 	pdev = to_platform_device(dev);
 
 	while ((r = platform_get_resource(pdev, IORESOURCE_MEM, index++)))
