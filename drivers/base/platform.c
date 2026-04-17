@@ -57,6 +57,9 @@ struct resource *platform_get_resource(struct platform_device *dev,
 {
 	u32 i;
 
+	if (WARN_ON(!dev))
+		return NULL;
+
 	for (i = 0; i < dev->num_resources; i++) {
 		struct resource *r = &dev->resource[i];
 
