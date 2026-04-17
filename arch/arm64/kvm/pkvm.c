@@ -558,6 +558,7 @@ static int pkvm_register_device(struct of_phandle_args *args,
 	dev->nr_iommus = j;
 	dev->ctxt = NULL;
 	dev->refcount = 0;
+	dev->reset_handler = NULL;
 	dev->group_id = group_id;
 
 	return 0;
@@ -587,7 +588,7 @@ static int pkvm_init_devices(void)
 
 	dev_sz = PAGE_ALIGN(size_mul(sizeof(struct pkvm_device), dev_cnt));
 
-	dev_base = alloc_pages_exact(dev_sz, GFP_KERNEL_ACCOUNT);
+	dev_base = alloc_pages_exact(dev_sz, GFP_KERNEL_ACCOUNT | __GFP_ZERO);
 
 	if (!dev_base)
 		return -ENOMEM;
