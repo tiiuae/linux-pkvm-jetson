@@ -192,13 +192,11 @@ static int pkvm_device_reset(struct pkvm_device *dev, bool host_to_guest)
 
 	hyp_assert_lock_held(&device_spinlock);
 
-	/* Reset is mandatory. */
-	if (!dev->ops || !dev->ops->reset)
-		return -ENODEV;
-
-	ret = dev->ops->reset(dev->cookie, host_to_guest);
-	if (ret)
-		return ret;
+	if (dev->ops && dev->ops->reset) {
+		ret = dev->ops->reset(dev->cookie, host_to_guest);
+		if (ret)
+			return ret;
+	}
 
 	for (i = 0 ; i < dev->nr_iommus ; ++i) {
 		iommu = &dev->iommus[i];
