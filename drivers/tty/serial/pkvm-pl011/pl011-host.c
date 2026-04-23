@@ -1,6 +1,8 @@
 #include <linux/init.h>
 #include <linux/module.h>
 #include <linux/kernel.h>
+#include <linux/of.h>
+#include <linux/of_address.h>
 
 #include <asm/kvm_pkvm.h>
 #include <asm/kvm_mmu.h>
@@ -24,6 +26,27 @@ static int kvm_serial_register_hyp_ops(struct kvm_serial_ops *hyp_ops)
 }
 #endif
 
+static bool pl011_dt_node_is_available(void)
+{
+	struct device_node *np;
+
+	for_each_compatible_node(np, NULL, "arm,sbsa-uart") {
+		struct resource res;
+
+		if (of_address_to_resource(np, 0, &res)) {
+			of_node_put(np);
+			continue;
+		}
+
+		if (res.start == CONFIG_SERIAL_PKVM_PL011_BASE_PHYS) {
+			bool available = of_device_is_available(np);
+			of_node_put(np);
+			return available;
+		}
+	}
+	return false;
+}
+
 static int __init pl011_nvhe_init(void)
 {
 	int ret;
@@ -31,7 +54,13 @@ static int __init pl011_nvhe_init(void)
 	if (!is_protected_kvm_enabled())
 		return 0;
 
-	pr_info("Loading pl011 driver\n");
+	if (!pl011_dt_node_is_available()) {
+		pr_err("pkvm-pl011: UART at %#llx not enabled in device tree\n",
+		       (u64)CONFIG_SERIAL_PKVM_PL011_BASE_PHYS);
+		return -ENODEV;
+	}
+
+	pr_info("pkvm-pl011: Loading pl011 driver\n");
 
 #ifdef MODULE
 	ret = pkvm_load_el2_module(kvm_nvhe_sym(pl011_hyp_init_module));
@@ -39,7 +68,7 @@ static int __init pl011_nvhe_init(void)
 	ret = kvm_serial_register_hyp_ops(ksym_ref_addr_nvhe(pl011_ops));
 #endif
 	if (ret)
-		pr_err("Failed to load pl011 driver: %d\n", ret);
+		pr_err("pkvm-pl011: Failed to load pl011 driver: %d\n", ret);
 
 	return ret;
 }
