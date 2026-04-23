@@ -62,3 +62,16 @@ config TEGRA210_EMC
 	  external memory.
 
 endif
+
+config TEGRA_MC_PKVM
+	bool "pKVM support for Tegra Memory Controller"
+	depends on ARCH_TEGRA_234_SOC && ARM_SMMU_V2_PKVM
+	default y if ARM_SMMU_V2_PKVM
+	help
+	  Enable pKVM hypervisor integration for Tegra Memory Controller.
+	  This allows the EL2 hypervisor to trap and validate Stream ID
+	  override writes, preventing devices from using unauthorized
+	  Stream IDs to bypass IOMMU isolation.
+
+	  This option automatically builds when ARM_SMMU_V2_PKVM is enabled
+	  on Tegra234 platforms.

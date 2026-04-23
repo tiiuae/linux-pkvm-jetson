@@ -354,6 +354,30 @@ static const struct tegra_mc_client tegra234_mc_clients[] = {
 			},
 		},
 	}, {
+		.id = TEGRA234_MEMORY_CLIENT_SDMMCRA,
+		.name = "sdmmcra",
+		.bpmp_id = TEGRA_ICC_BPMP_SDMMC_1,
+		.type = TEGRA_ICC_NISO,
+		.sid = TEGRA234_SID_SDMMC1A,
+		.regs = {
+			.sid = {
+				.override = 0x300,
+				.security = 0x304,
+			},
+		},
+	}, {
+		.id = TEGRA234_MEMORY_CLIENT_SDMMCWA,
+		.name = "sdmmcwa",
+		.bpmp_id = TEGRA_ICC_BPMP_SDMMC_1,
+		.type = TEGRA_ICC_NISO,
+		.sid = TEGRA234_SID_SDMMC1A,
+		.regs = {
+			.sid = {
+				.override = 0x320,
+				.security = 0x324,
+			},
+		},
+	}, {
 		.id = TEGRA234_MEMORY_CLIENT_SDMMCRAB,
 		.name = "sdmmcrab",
 		.bpmp_id = TEGRA_ICC_BPMP_SDMMC_4,

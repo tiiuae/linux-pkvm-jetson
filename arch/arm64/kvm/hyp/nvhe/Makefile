@@ -41,6 +41,24 @@ hyp-obj-$(CONFIG_ARM_SMMU_V3_PKVM_PV) += $(HYP_SMMU_V3_DRV_PATH)/pkvm/pv/arm-smm
 	$(HYP_SMMU_V3_DRV_PATH)/pkvm/arm-smmu-v3-lib-hyp.o
 endif
 
+# SMMU v2 driver built-in
+HYP_SMMU_V2_DRV_PATH = ../../../../../drivers/iommu/arm/arm-smmu
+
+ifeq ($(CONFIG_ARM_SMMU_V2_PKVM),y)
+hyp-obj-$(CONFIG_ARM_SMMU_V2_PKVM) += $(HYP_SMMU_V2_DRV_PATH)/pkvm/arm-smmu-v2-pkvm.o \
+	$(HYP_SMMU_V3_DRV_PATH)/pkvm/io-pgtable-arm-hyp.o \
+	$(HYP_SMMU_V2_DRV_PATH)/../../io-pgtable-arm.o \
+	$(HYP_SMMU_V2_DRV_PATH)/../../../../drivers/firmware/efi/libstub/find.o
+endif
+
+# Tegra Memory Controller pKVM integration (separate from SMMU driver)
+HYP_TEGRA_MC_PATH = ../../../../../drivers/memory/tegra
+
+ifeq ($(CONFIG_TEGRA_MC_PKVM),y)
+subdir-ccflags-y += -I$(srctree)/drivers/iommu/arm/arm-smmu/pkvm
+hyp-obj-$(CONFIG_TEGRA_MC_PKVM) += $(HYP_TEGRA_MC_PATH)/pkvm/tegra234-mc-pkvm.o
+endif
+
 # Only for built-in, not modules
 HYP_PL011_DRV_PATH = ../../../../../drivers/tty/serial/pkvm-pl011
 

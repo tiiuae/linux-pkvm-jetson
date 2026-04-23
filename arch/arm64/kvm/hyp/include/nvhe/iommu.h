@@ -4,6 +4,7 @@
 
 #include <asm/kvm_host.h>
 #include <asm/kvm_pgtable.h>
+#include <asm/kvm_pkvm.h>
 
 #include <linux/iommu.h>
 
@@ -22,6 +23,11 @@ int kvm_iommu_dev_block_dma(pkvm_handle_t iommu_id, u32 endpoint_id, bool host_t
 
 int kvm_iommu_force_free_domain(pkvm_handle_t domain_id, struct pkvm_hyp_vm *vm);
 int kvm_iommu_id_to_token(pkvm_handle_t smmu_id, u64 *out_token);
+
+#ifdef CONFIG_ARM_SMMU_V2_PKVM_DEBUGFS
+int kvm_iommu_debug(pkvm_handle_t drv_id, pkvm_handle_t smmu_id, enum kvm_iommu_debug_ops op,
+		    void *out, size_t out_sz);
+#endif
 
 struct kvm_iommu_ops {
 	int (*init)(pkvm_handle_t drv_id);
@@ -49,6 +55,9 @@ struct kvm_iommu_ops {
 	int (*dev_block_dma)(pkvm_handle_t iommu, u32 endpoint_id,
 			     bool is_host_to_guest);
 	int (*get_iommu_token_by_id)(pkvm_handle_t smmu_id, u64 *out_token);
+#ifdef CONFIG_ARM_SMMU_V2_PKVM_DEBUGFS
+	int (*debug)(pkvm_handle_t smmu_id, enum kvm_iommu_debug_ops op, void *out, size_t out_sz);
+#endif
 };
 
 int kvm_iommu_init(void *pool_base, size_t nr_pages);
