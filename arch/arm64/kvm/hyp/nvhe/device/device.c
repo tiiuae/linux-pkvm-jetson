@@ -9,6 +9,7 @@
 #include <nvhe/mm.h>
 #include <nvhe/pkvm.h>
 #include <nvhe/pviommu-host.h>
+#include <nvhe/serial.h>
 
 #include <kvm/arm_hypercalls.h>
 #include <kvm/device.h>
