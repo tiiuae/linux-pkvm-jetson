@@ -17,6 +17,7 @@
 
 struct tegra_bpmp_clk;
 struct tegra_bpmp_ops;
+struct tegra_bpmp_transfer_ops;
 
 struct tegra_bpmp_soc {
 	struct {
@@ -73,6 +74,8 @@ struct tegra_bpmp {
 	const struct tegra_bpmp_soc *soc;
 	struct device *dev;
 	void *priv;
+
+	const struct tegra_bpmp_transfer_ops *transfer_ops;
 
 	struct {
 		struct mbox_client client;
@@ -202,7 +205,7 @@ struct tegra_bpmp_resp_packed {
 
 bool tegra_bpmp_message_valid(const struct tegra_bpmp_message *msg);
 
-#if IS_ENABLED(CONFIG_TEGRA_BPMP_HOST_PROXY)
+#if IS_ENABLED(CONFIG_TEGRA_BPMP_HOST_PROXY) || IS_ENABLED(CONFIG_VIRTIO_BPMP)
 int bpmp_message_req_serialize(const struct tegra_bpmp_message *msg,
 			       struct tegra_bpmp_req_packed *out);
 int bpmp_message_resp_deserialize(const struct tegra_bpmp_resp_packed *resp,
