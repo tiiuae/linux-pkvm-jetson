@@ -177,13 +177,16 @@ static inline void tegra_bpmp_free_mrq(struct tegra_bpmp *bpmp,
 }
 
 static inline bool tegra_bpmp_mrq_is_supported(struct tegra_bpmp *bpmp,
-					      unsigned int mrq)
+					       unsigned int mrq)
 {
 	return false;
 }
 #endif
 
 void tegra_bpmp_handle_rx(struct tegra_bpmp *bpmp);
+
+bool tegra_bpmp_message_valid(const struct tegra_bpmp_message *msg);
+
 
 #if IS_ENABLED(CONFIG_CLK_TEGRA_BPMP)
 int tegra_bpmp_init_clocks(struct tegra_bpmp *bpmp);
@@ -220,6 +223,5 @@ static inline int tegra_bpmp_init_debugfs(struct tegra_bpmp *bpmp)
 	return 0;
 }
 #endif
-
 
 #endif /* __SOC_TEGRA_BPMP_H */
