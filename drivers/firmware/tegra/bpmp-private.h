@@ -26,4 +26,20 @@ struct tegra_bpmp_ops {
 extern const struct tegra_bpmp_ops tegra186_bpmp_ops;
 extern const struct tegra_bpmp_ops tegra210_bpmp_ops;
 
+/**
+ * Transport Error Codes
+ */
+/* No such device */
+#define BPMP_TRANSPORT_ENODEV	201
+/* No data available */
+#define BPMP_TRANSPORT_ENODATA	261
+/* Invalid message */
+#define BPMP_TRANSPORT_EBADMSG	277
+/* Invalid argument */
+#define BPMP_TRANSPORT_EINVAL	222
+
+/** @} Transport Error Codes */
+
+#define BPMP_TRANSPORT_ERRCODE_OFFSET 200
+
 #endif
