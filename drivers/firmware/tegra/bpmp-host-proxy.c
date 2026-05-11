@@ -36,66 +36,6 @@ static struct bpmp_allowed_res bpmp_ares;
 
 static struct tegra_bpmp *bpmp = NULL;
 
-#define BPMP_HOST_VERBOSE 1
-#if BPMP_HOST_VERBOSE
-
-static void hexDump(const char *desc, const void *addr, const int len)
-{
-	int i;
-	unsigned char buff[17];
-	unsigned char out_buff[4000];
-	unsigned char *p_out_buff = out_buff;
-	const unsigned char *pc = (const unsigned char *)addr;
-
-	if (desc != NULL)
-		printk("%s:\n", desc);
-
-	if (len == 0) {
-		printk(DEVICE_NAME ":   ZERO LENGTH\n");
-		return;
-	}
-	if (len < 0) {
-		printk(DEVICE_NAME ":   NEGATIVE LENGTH: %d\n", len);
-		return;
-	}
-
-	if (len > 400) {
-		printk(DEVICE_NAME ":   VERY LONG: %d\n", len);
-		return;
-	}
-
-	for (i = 0; i < len; i++) {
-		if ((i % 16) == 0) {
-			if (i != 0) {
-				p_out_buff +=
-					sprintf(p_out_buff, "  %s\n", buff);
-			}
-
-			p_out_buff += sprintf(p_out_buff, "  %04x ", i);
-		}
-
-		p_out_buff += sprintf(p_out_buff, " %02x", pc[i]);
-
-		if ((pc[i] < 0x20) || (pc[i] > 0x7e))
-			buff[i % 16] = '.';
-		else
-			buff[i % 16] = pc[i];
-		buff[(i % 16) + 1] = '\0';
-	}
-
-	while ((i % 16) != 0) {
-		p_out_buff += sprintf(p_out_buff, "   ");
-		i++;
-	}
-
-	p_out_buff += sprintf(p_out_buff, "  %s\n", buff);
-
-	printk(DEVICE_NAME ": %s", out_buff);
-}
-#else
-#define hexDump(...)
-#endif
-
 enum transfer_status {
 	TRANSFER_NONE,
 	TRANSFER_PREPARE,
