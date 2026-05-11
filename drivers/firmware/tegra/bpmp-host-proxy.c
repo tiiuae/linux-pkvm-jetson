@@ -1,4 +1,15 @@
 /* SPDX-License-Identifier: GPL-2.0 */
+/*
+ * To probe this driver, add a matching node to your platform device tree.
+ *
+	bpmp_host_proxy: bpmp_host_proxy {
+		compatible = "nvidia,bpmp-host-proxy";
+		nvidia,bpmp = <&bpmp>;
+		allowed-clocks = <TEGRA234_CLK_UARTA>;
+		allowed-resets = <TEGRA234_RESET_UARTA>;
+		status = "okay";
+	};
+ */
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
@@ -294,50 +305,6 @@ static struct file_operations fops = {
 	.write = write,
 };
 
-static const struct of_device_id tegra_bpmp_match[] = {
-#if IS_ENABLED(CONFIG_ARCH_TEGRA_186_SOC) ||     \
-	IS_ENABLED(CONFIG_ARCH_TEGRA_194_SOC) || \
-	IS_ENABLED(CONFIG_ARCH_TEGRA_234_SOC) || \
-	IS_ENABLED(CONFIG_ARCH_TEGRA_264_SOC)
-	{ .compatible = "nvidia,tegra186-bpmp" },
-#endif
-#if IS_ENABLED(CONFIG_ARCH_TEGRA_210_SOC)
-	{ .compatible = "nvidia,tegra210-bpmp" },
-#endif
-	{}
-};
-
-static int bpmp_drv_find(void)
-{
-	struct device_node *np;
-	struct platform_device *bpmp_dev;
-	int rc = 0;
-
-	np = of_find_matching_node(NULL, tegra_bpmp_match);
-	if (!np) {
-		pr_err("Could not find bpmp OF node\n");
-		return -ENOENT;
-	}
-	bpmp_dev = of_find_device_by_node(np);
-	if (!bpmp_dev) {
-		pr_err("No driver registered for bpmp platform node\n");
-		rc = -ENODEV;
-		goto put_node;
-	}
-	bpmp = platform_get_drvdata(bpmp_dev);
-	if (!bpmp) {
-		pr_err("bpmp has not been probed\n");
-		rc = -EPROBE_DEFER;
-		goto put_dev;
-	}
-
-	pr_info("bpmp firmware handle registered\n");
-put_dev:
-	put_device(&bpmp_dev->dev);
-put_node:
-	of_node_put(np);
-	return rc;
-}
 
 static int bpmp_host_proxy_probe(struct platform_device *pdev)
 {
@@ -345,9 +312,14 @@ static int bpmp_host_proxy_probe(struct platform_device *pdev)
 
 	dev_info(&pdev->dev, "%s, installing module.", __func__);
 
-	err = bpmp_drv_find();
-	if (err)
+	/* Get a reference to the bpmp device via the device tree
+		nvidia,bpmp = <&bpmp>; */
+	bpmp = tegra_bpmp_get(&pdev->dev);
+	err = PTR_ERR_OR_ZERO(bpmp);
+	if (err) {
+		pr_err("tegra_bpmp_get returned error: %d\n", err);
 		return err;
+	}
 
 	bpmp_ares.clocks_size = of_property_read_variable_u32_array(
 		pdev->dev.of_node, "allowed-clocks", bpmp_ares.clock, 0,
@@ -355,7 +327,8 @@ static int bpmp_host_proxy_probe(struct platform_device *pdev)
 
 	if (bpmp_ares.clocks_size <= 0) {
 		dev_err(&pdev->dev, "No allowed clocks defined");
-		return -EINVAL;
+		err = -EINVAL;
+		goto bpmp_put;
 	}
 
 	dev_info(&pdev->dev, "bpmp_ares.clocks_size: %d",
@@ -370,7 +343,8 @@ static int bpmp_host_proxy_probe(struct platform_device *pdev)
 
 	if (bpmp_ares.resets_size <= 0) {
 		dev_err(&pdev->dev, "No allowed resets defined");
-		return -EINVAL;
+		err = -EINVAL;
+		goto bpmp_put;
 	}
 
 	dev_info(&pdev->dev, "bpmp_ares.resets_size: %d",
@@ -382,32 +356,39 @@ static int bpmp_host_proxy_probe(struct platform_device *pdev)
 	major_number = register_chrdev(0, DEVICE_NAME, &fops);
 	if (major_number < 0) {
 		dev_err(&pdev->dev, "could not register number.\n");
-		return major_number;
+		err = major_number;
+		goto bpmp_put;
 	}
 	dev_info(&pdev->dev, "registered correctly with major number %d\n",
 		 major_number);
 
 	bpmp_host_proxy_class = class_create(CLASS_NAME);
-	if (IS_ERR(bpmp_host_proxy_class)) {
-		unregister_chrdev(major_number, DEVICE_NAME);
+	err = PTR_ERR_OR_ZERO(bpmp_host_proxy_class);
+	if (err) {
 		dev_err(&pdev->dev, "Failed to register device class\n");
-		return PTR_ERR(bpmp_host_proxy_class);
+		goto fail_class;
 	}
 	dev_info(&pdev->dev, "device class registered correctly\n");
 
 	bpmp_host_proxy_device = device_create(bpmp_host_proxy_class, NULL,
 					       MKDEV(major_number, 0), NULL,
 					       DEVICE_NAME);
-	if (IS_ERR(bpmp_host_proxy_device)) {
-		class_destroy(bpmp_host_proxy_class);
-		unregister_chrdev(major_number, DEVICE_NAME);
+	err = PTR_ERR_OR_ZERO(bpmp_host_proxy_device);
+	if (err) {
 		dev_err(&pdev->dev, "Failed to create the device\n");
-		return PTR_ERR(bpmp_host_proxy_device);
+		goto fail_create;
 	}
 
 	dev_info(&pdev->dev, "device created correctly\n");
-
 	return 0;
+
+fail_create:
+	class_destroy(bpmp_host_proxy_class);
+fail_class:
+	unregister_chrdev(major_number, DEVICE_NAME);
+bpmp_put:
+	tegra_bpmp_put(bpmp);
+	return err;
 }
 
 static void bpmp_host_proxy_remove(struct platform_device *pdev)
@@ -417,6 +398,7 @@ static void bpmp_host_proxy_remove(struct platform_device *pdev)
 	class_unregister(bpmp_host_proxy_class);
 	class_destroy(bpmp_host_proxy_class);
 	unregister_chrdev(major_number, DEVICE_NAME);
+	tegra_bpmp_put(bpmp);
 }
 
 static const struct of_device_id bpmp_host_proxy_ids[] = {
