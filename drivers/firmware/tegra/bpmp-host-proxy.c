@@ -56,22 +56,31 @@ static bool check_if_allowed(struct tegra_bpmp_message *msg)
 	struct mrq_reset_request *reset_req = NULL;
 	struct mrq_clk_request *clock_req = NULL;
 	struct mrq_pg_request *pg_req = NULL;
-	uint32_t clk_cmd = 0;
-	int i = 0;
+	uint32_t clk_cmd;
+	int i;
 
-	if (msg->mrq == MRQ_PING || msg->mrq == MRQ_QUERY_TAG ||
-	    msg->mrq == MRQ_THREADED_PING || msg->mrq == MRQ_QUERY_ABI ||
-	    msg->mrq == MRQ_QUERY_FW_TAG) {
+	switch (msg->mrq) {
+	case MRQ_PING:
+	case MRQ_QUERY_TAG:
+	case MRQ_THREADED_PING:
+	case MRQ_QUERY_ABI:
+	case MRQ_QUERY_FW_TAG:
 		return true;
-	}
 
-	if (msg->mrq == MRQ_PG) {
+	case MRQ_PG:
 		pg_req = (struct mrq_pg_request *)msg->tx.data;
-		pr_alert("got powergate MRQ: cmd = %d, id = %d\n", pg_req->cmd, pg_req->id);
-		return false;
-	}
 
-	if (msg->mrq == MRQ_RESET) {
+		pr_alert("got powergate MRQ: cmd = %d, id = %d\n", pg_req->cmd,
+			 pg_req->id);
+		/* allow everything except SET_STATE */
+		if (pg_req->cmd == CMD_PG_QUERY_ABI ||
+		    pg_req->cmd == CMD_PG_GET_STATE ||
+		    pg_req->cmd == CMD_PG_GET_NAME ||
+		    pg_req->cmd == CMD_PG_GET_MAX_ID)
+			return true;
+		break;
+
+	case MRQ_RESET:
 		reset_req = (struct mrq_reset_request *)msg->tx.data;
 
 		for (i = 0; i < bpmp_ares.resets_size; i++) {
@@ -80,8 +89,9 @@ static bool check_if_allowed(struct tegra_bpmp_message *msg)
 			}
 		}
 		pr_err("Error, reset not allowed for: %d", reset_req->reset_id);
-		return false;
-	} else if (msg->mrq == MRQ_CLK) {
+		break;
+
+	case MRQ_CLK:
 		clock_req = (struct mrq_clk_request *)msg->tx.data;
 
 		for (i = 0; i < bpmp_ares.clocks_size; i++) {
@@ -101,10 +111,12 @@ static bool check_if_allowed(struct tegra_bpmp_message *msg)
 
 		pr_err("Error, clock not allowed for: %d, with command: %d",
 		       clock_req->cmd_and_id & 0x0FFF, clk_cmd);
-		return false;
-	}
+		break;
 
-	pr_err("Error, msg->mrq %d not allowed", msg->mrq);
+	default:
+		pr_err("Error, msg->mrq %d not allowed", msg->mrq);
+		break;
+	}
 
 	return false;
 }
