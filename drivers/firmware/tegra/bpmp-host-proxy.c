@@ -16,7 +16,6 @@
 #include "linux/of_platform.h"
 #include <linux/module.h>
 #include <linux/device.h>
-#include <linux/kernel.h>
 #include <linux/fs.h>
 #include <linux/uaccess.h>
 #include <linux/slab.h>
@@ -32,6 +31,9 @@
 struct bpmp_allowed_res {
 	int clocks_size;
 	uint32_t clock[BPMP_HOST_MAX_CLOCKS_SIZE];
+	int clock_parents_size;
+	/* Flat list of indirectly allowed clocks */
+	uint32_t *clock_parents;
 	int resets_size;
 	uint32_t reset[BPMP_HOST_MAX_RESETS_SIZE];
 };
@@ -62,12 +64,27 @@ struct bpmp_transaction_ctx {
 	int write_status;
 };
 
+static int tegra_bpmp_clk_get_info(struct tegra_bpmp *bpmp, unsigned int id,
+				   struct cmd_clk_get_all_info_response *info)
+{
+	struct mrq_clk_request req = {
+		.cmd_and_id = ((uint32_t)CMD_CLK_GET_ALL_INFO << 24) | id,
+	};
+	struct tegra_bpmp_message msg = {
+		.mrq = MRQ_CLK,
+		.tx = { .data = &req, .size = sizeof(req) },
+		.rx = { .data = info, .size = sizeof(*info) },
+	};
+
+	return tegra_bpmp_transfer(bpmp, &msg);
+}
+
 static bool check_if_allowed(struct tegra_bpmp_message *msg)
 {
 	struct mrq_reset_request *reset_req = NULL;
 	struct mrq_clk_request *clock_req = NULL;
 	struct mrq_pg_request *pg_req = NULL;
-	uint32_t clk_cmd;
+	uint32_t clk_cmd, clk_id;
 	int i;
 
 	switch (msg->mrq) {
@@ -104,15 +121,22 @@ static bool check_if_allowed(struct tegra_bpmp_message *msg)
 
 	case MRQ_CLK:
 		clock_req = (struct mrq_clk_request *)msg->tx.data;
+		clk_id = clock_req->cmd_and_id & 0x0FFF;
+		clk_cmd = (clock_req->cmd_and_id >> 24) & 0x000F;
+
+		pr_info("Got command: %d for clock %d", clk_cmd, clk_id);
 
 		for (i = 0; i < bpmp_ares.clocks_size; i++) {
-			if (bpmp_ares.clock[i] ==
-			    (clock_req->cmd_and_id & 0x0FFF)) {
+			if (bpmp_ares.clock[i] == clk_id)
 				return true;
-			}
 		}
 
-		clk_cmd = (clock_req->cmd_and_id >> 24) & 0x000F;
+		if (clk_cmd == CMD_CLK_ENABLE) {
+			for (i = 0; i < bpmp_ares.clock_parents_size; i++) {
+				if (bpmp_ares.clock_parents[i] == clk_id)
+					return true;
+			}
+		}
 
 		if (clk_cmd == CMD_CLK_GET_MAX_CLK_ID ||
 		    clk_cmd == CMD_CLK_GET_ALL_INFO ||
@@ -121,7 +145,7 @@ static bool check_if_allowed(struct tegra_bpmp_message *msg)
 		}
 
 		pr_err("Error, clock not allowed for: %d, with command: %d",
-		       clock_req->cmd_and_id & 0x0FFF, clk_cmd);
+		       clk_id, clk_cmd);
 		break;
 
 	default:
@@ -219,7 +243,8 @@ static ssize_t read(struct file *filep, char *buffer, size_t len,
 		break;
 	case TRANSFER_PREPARE:
 		pr_err("write op returned an error: %d\n", ctx->write_status);
-		ctx->msg.rx.ret = ctx->write_status - BPMP_TRANSPORT_ERRCODE_OFFSET;
+		ctx->msg.rx.ret =
+			ctx->write_status - BPMP_TRANSPORT_ERRCODE_OFFSET;
 		break;
 	case TRANSFER_START:
 		/* ctx->msg is properly setup */
@@ -308,7 +333,7 @@ static struct file_operations fops = {
 
 static int bpmp_host_proxy_probe(struct platform_device *pdev)
 {
-	int err, i;
+	int err, i, j;
 
 	dev_info(&pdev->dev, "%s, installing module.", __func__);
 
@@ -333,8 +358,36 @@ static int bpmp_host_proxy_probe(struct platform_device *pdev)
 
 	dev_info(&pdev->dev, "bpmp_ares.clocks_size: %d",
 		 bpmp_ares.clocks_size);
+
+	bpmp_ares.clock_parents_size = 0;
+
+	unsigned int max_parents = bpmp_ares.clocks_size * MRQ_CLK_MAX_PARENTS;
+	bpmp_ares.clock_parents = devm_kcalloc(&pdev->dev, max_parents,
+					       sizeof(uint32_t), GFP_KERNEL);
+
 	for (i = 0; i < bpmp_ares.clocks_size; i++) {
-		dev_info(&pdev->dev, "bpmp_ares.clock %d", bpmp_ares.clock[i]);
+		struct cmd_clk_get_all_info_response info;
+		uint32_t clk_id = bpmp_ares.clock[i];
+
+		dev_info(&pdev->dev, "bpmp_ares.clock %d", clk_id);
+
+		err = tegra_bpmp_clk_get_info(bpmp, clk_id, &info);
+		if (err)
+			goto bpmp_put;
+
+		if (bpmp_ares.clock_parents_size + info.num_parents >
+		    max_parents) {
+			err = -ENOMEM;
+			goto bpmp_put;
+		}
+
+		for (j = 0; j < info.num_parents; j++) {
+			dev_info(&pdev->dev, "clock %u parent: %u", clk_id,
+				 info.parents[j]);
+			bpmp_ares.clock_parents[bpmp_ares.clock_parents_size +
+						j] = info.parents[j];
+		}
+		bpmp_ares.clock_parents_size += info.num_parents;
 	}
 
 	bpmp_ares.resets_size = of_property_read_variable_u32_array(
@@ -419,4 +472,4 @@ builtin_platform_driver(bpmp_host_proxy_driver);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Hugo Ros");
 MODULE_DESCRIPTION("BPMP host proxy");
-MODULE_VERSION("0.1");
+MODULE_VERSION("1.0");
