@@ -44,77 +44,6 @@
 
 #include "bpmp-private.h"
 
-static int virtio_bpmp_ops_init(struct tegra_bpmp *bpmp)
-{
-	return 0;
-}
-
-static void virtio_bpmp_ops_deinit(struct tegra_bpmp *bpmp)
-{
-	/* noop */
-}
-
-static bool virtio_bpmp_ops_is_message_ready(struct tegra_bpmp_channel *channel)
-{
-	/* this should never run */
-	WARN_ON_ONCE(true);
-	return true;
-}
-
-static int virtio_bpmp_ops_ack_message(struct tegra_bpmp_channel *channel)
-{
-	/* this should never run */
-	WARN_ON_ONCE(true);
-	return 0;
-}
-
-static bool virtio_bpmp_ops_is_channel_free(struct tegra_bpmp_channel *channel)
-{
-	/* this should never run */
-	WARN_ON_ONCE(true);
-	return true;
-}
-
-static int virtio_bpmp_ops_post_message(struct tegra_bpmp_channel *channel)
-{
-	/* this should never run */
-	WARN_ON_ONCE(true);
-	return 0;
-}
-
-static int virtio_bpmp_ops_ring_doorbell(struct tegra_bpmp *bpmp)
-{
-	/* this should never run */
-	WARN_ON_ONCE(true);
-	return 0;
-}
-
-static int virtio_bpmp_ops_resume(struct tegra_bpmp *bpmp)
-{
-	/* this should never run */
-	WARN_ON_ONCE(true);
-	return 0;
-}
-
-const struct tegra_bpmp_ops virtio_bpmp_ops = {
-	.init = virtio_bpmp_ops_init,
-	.deinit = virtio_bpmp_ops_deinit,
-	.is_response_ready = virtio_bpmp_ops_is_message_ready,
-	.is_request_ready = virtio_bpmp_ops_is_message_ready,
-	.ack_response = virtio_bpmp_ops_ack_message,
-	.ack_request = virtio_bpmp_ops_ack_message,
-	.is_response_channel_free = virtio_bpmp_ops_is_channel_free,
-	.is_request_channel_free = virtio_bpmp_ops_is_channel_free,
-	.post_response = virtio_bpmp_ops_post_message,
-	.post_request = virtio_bpmp_ops_post_message,
-	.ring_doorbell = virtio_bpmp_ops_ring_doorbell,
-	.resume = virtio_bpmp_ops_resume,
-};
-
-static const struct tegra_bpmp_soc virtio_soc = {
-	.ops = &virtio_bpmp_ops,
-};
-
 struct bpmp_virtio_device {
 	/*
 	 * Reference to the platform device that implements the tegra_bpmp struct.
@@ -219,10 +148,10 @@ static int virtio_bpmp_process_response(struct device *dev,
 
 	long expected = sizeof(struct tegra_bpmp_resp_packed);
 	if (len != expected) {
-		dev_crit(dev,
-			 "hypervisor bug: response size mismatch,"
-			 " got %u, expected %lu\n",
-			 len, expected);
+		dev_err(dev,
+			"virtio_bpmp_send: response size mismatch,"
+			" got %u, expected %lu\n",
+			len, expected);
 		return -EMSGSIZE;
 	}
 
@@ -313,7 +242,78 @@ static int virtio_bpmp_transfer_atomic(struct tegra_bpmp *bpmp,
 	return 0;
 }
 
+static int virtio_bpmp_ops_init(struct tegra_bpmp *bpmp)
+{
+	return 0;
+}
+
+static void virtio_bpmp_ops_deinit(struct tegra_bpmp *bpmp)
+{
+	/* noop */
+}
+
+static bool virtio_bpmp_ops_is_message_ready(struct tegra_bpmp_channel *channel)
+{
+	/* this should never run */
+	WARN_ON_ONCE(true);
+	return true;
+}
+
+static int virtio_bpmp_ops_ack_message(struct tegra_bpmp_channel *channel)
+{
+	/* this should never run */
+	WARN_ON_ONCE(true);
+	return 0;
+}
+
+static bool virtio_bpmp_ops_is_channel_free(struct tegra_bpmp_channel *channel)
+{
+	/* this should never run */
+	WARN_ON_ONCE(true);
+	return true;
+}
+
+static int virtio_bpmp_ops_post_message(struct tegra_bpmp_channel *channel)
+{
+	/* this should never run */
+	WARN_ON_ONCE(true);
+	return 0;
+}
+
+static int virtio_bpmp_ops_ring_doorbell(struct tegra_bpmp *bpmp)
+{
+	/* this should never run */
+	WARN_ON_ONCE(true);
+	return 0;
+}
+
+static int virtio_bpmp_ops_resume(struct tegra_bpmp *bpmp)
+{
+	/* this should never run */
+	WARN_ON_ONCE(true);
+	return 0;
+}
+
 #define BPMP_FW_TAG_SIZE 32
+
+const struct tegra_bpmp_ops virtio_bpmp_ops = {
+	.init = virtio_bpmp_ops_init,
+	.deinit = virtio_bpmp_ops_deinit,
+	.is_response_ready = virtio_bpmp_ops_is_message_ready,
+	.is_request_ready = virtio_bpmp_ops_is_message_ready,
+	.ack_response = virtio_bpmp_ops_ack_message,
+	.ack_request = virtio_bpmp_ops_ack_message,
+	.is_response_channel_free = virtio_bpmp_ops_is_channel_free,
+	.is_request_channel_free = virtio_bpmp_ops_is_channel_free,
+	.post_response = virtio_bpmp_ops_post_message,
+	.post_request = virtio_bpmp_ops_post_message,
+	.ring_doorbell = virtio_bpmp_ops_ring_doorbell,
+	.resume = virtio_bpmp_ops_resume,
+};
+
+static const struct tegra_bpmp_soc virtio_soc = {
+	.ops = &virtio_bpmp_ops,
+};
 
 static const struct tegra_bpmp_transfer_ops virtio_bpmp_transfer_ops = {
 	.transfer_atomic = virtio_bpmp_transfer_atomic,
