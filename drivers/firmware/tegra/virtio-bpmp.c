@@ -313,6 +313,7 @@ const struct tegra_bpmp_ops virtio_bpmp_ops = {
 
 static const struct tegra_bpmp_soc virtio_soc = {
 	.ops = &virtio_bpmp_ops,
+	.num_resets = 193,
 };
 
 static const struct tegra_bpmp_transfer_ops virtio_bpmp_transfer_ops = {
