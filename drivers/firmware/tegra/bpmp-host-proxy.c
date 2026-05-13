@@ -32,7 +32,7 @@ struct bpmp_allowed_res {
 	int clocks_size;
 	uint32_t clock[BPMP_HOST_MAX_CLOCKS_SIZE];
 	int clock_parents_size;
-	/* Flat list of indirectly allowed clocks */
+	/* Flat list of transitively allowed clocks */
 	uint32_t *clock_parents;
 	int resets_size;
 	uint32_t reset[BPMP_HOST_MAX_RESETS_SIZE];
@@ -56,13 +56,30 @@ enum transfer_status {
 };
 
 struct bpmp_transaction_ctx {
-	struct tegra_bpmp_message msg;
 	/* Shared lock for reads and writes.
 	 * We don't expect any concurrency within the same transaction. */
 	struct mutex lock;
+	struct tegra_bpmp_message msg;
 	enum transfer_status transfer_status;
 	int write_status;
 };
+
+/*
+ * Releases memory allocated for tx and rx buffers. Should be done before a new
+ * call to bpmp_message_req_deserialize, and when cleaning up a transaction.
+ * This must be called with ctx->lock held.
+ */
+static void bpmp_transaction_free_msg_buffers(struct bpmp_transaction_ctx *ctx)
+{
+	if (ctx->msg.tx.data) {
+		kfree(ctx->msg.tx.data);
+		ctx->msg.tx.data = NULL;
+	}
+	if (ctx->msg.rx.data) {
+		kfree(ctx->msg.rx.data);
+		ctx->msg.rx.data = NULL;
+	}
+}
 
 static int tegra_bpmp_clk_get_info(struct tegra_bpmp *bpmp, unsigned int id,
 				   struct cmd_clk_get_all_info_response *info)
@@ -173,13 +190,15 @@ static ssize_t write(struct file *filep, const char *buffer, size_t len,
 		return -EBUSY;
 
 	ctx->transfer_status = TRANSFER_PREPARE;
+	/* In case userspace called write() twice in a row without reading the response. (which is
+	   an incorrect but allowed use of the driver) */
+	bpmp_transaction_free_msg_buffers(ctx);
 
 	if (!bpmp) {
 		pr_err("host device not initialised, can't do transfer!");
 		ret = -ENODEV;
 		goto unlock;
 	}
-
 	if (len != sizeof(req)) {
 		pr_err("expected packed message of size %lu, got %zu",
 		       sizeof(req), len);
@@ -201,13 +220,11 @@ static ssize_t write(struct file *filep, const char *buffer, size_t len,
 
 	print_hex_dump_bytes("msg: ", DUMP_PREFIX_OFFSET, &ctx->msg,
 			     sizeof(ctx->msg));
-	// hexDump(DEVICE_NAME ": msg", &ctx->msg, sizeof(ctx->msg));
 
 	if (!check_if_allowed(&ctx->msg)) {
 		ret = -EPERM;
 		goto unlock;
 	}
-
 	ctx->transfer_status = TRANSFER_START;
 	ret = tegra_bpmp_transfer(bpmp, &ctx->msg);
 	if (!ret)
@@ -277,14 +294,7 @@ static ssize_t read(struct file *filep, char *buffer, size_t len,
 	if (ret)
 		goto unlock;
 
-	if (ctx->msg.tx.data) {
-		kfree(ctx->msg.tx.data);
-		ctx->msg.tx.data = NULL;
-	}
-	if (ctx->msg.rx.data) {
-		kfree(ctx->msg.rx.data);
-		ctx->msg.rx.data = NULL;
-	}
+	bpmp_transaction_free_msg_buffers(ctx);
 	ctx->transfer_status = TRANSFER_NONE;
 	ctx->write_status = 0;
 	ret = sizeof(resp);
@@ -305,6 +315,7 @@ static int open(struct inode *inodep, struct file *filep)
 	ctx = kzalloc(sizeof(struct bpmp_transaction_ctx), GFP_KERNEL);
 	if (!ctx)
 		return -ENOMEM;
+
 	mutex_init(&ctx->lock);
 	ctx->transfer_status = TRANSFER_NONE;
 
@@ -313,11 +324,19 @@ static int open(struct inode *inodep, struct file *filep)
 	return 0;
 }
 
-static int close(struct inode *inodep, struct file *filep)
+static int release(struct inode *inodep, struct file *filep)
 {
-	if (filep->private_data)
-		kfree(filep->private_data);
+	struct bpmp_transaction_ctx *ctx = filep->private_data;
 	filep->private_data = NULL;
+
+	if (ctx) {
+		mutex_lock(&ctx->lock);
+		bpmp_transaction_free_msg_buffers(ctx);
+		mutex_unlock(&ctx->lock);
+
+		mutex_destroy(&ctx->lock);
+		kfree(ctx);
+	}
 	pr_info("device closed.\n");
 	return 0;
 }
@@ -325,7 +344,7 @@ static int close(struct inode *inodep, struct file *filep)
 static struct file_operations fops = {
 	.owner = THIS_MODULE,
 	.open = open,
-	.release = close,
+	.release = release,
 	.read = read,
 	.write = write,
 };
