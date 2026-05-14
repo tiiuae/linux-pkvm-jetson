@@ -115,7 +115,7 @@ static bool check_if_allowed(struct tegra_bpmp_message *msg)
 	case MRQ_PG:
 		pg_req = (struct mrq_pg_request *)msg->tx.data;
 
-		pr_alert("got powergate MRQ: cmd = %d, id = %d\n", pg_req->cmd,
+		pr_debug("got powergate MRQ: cmd = %d, id = %d\n", pg_req->cmd,
 			 pg_req->id);
 		/* allow everything except SET_STATE */
 		if (pg_req->cmd == CMD_PG_QUERY_ABI ||
@@ -133,7 +133,7 @@ static bool check_if_allowed(struct tegra_bpmp_message *msg)
 				return true;
 			}
 		}
-		pr_err("Error, reset not allowed for: %d", reset_req->reset_id);
+		pr_warn("Error, reset not allowed for: %d", reset_req->reset_id);
 		break;
 
 	case MRQ_CLK:
@@ -141,7 +141,7 @@ static bool check_if_allowed(struct tegra_bpmp_message *msg)
 		clk_id = clock_req->cmd_and_id & 0x0FFF;
 		clk_cmd = (clock_req->cmd_and_id >> 24) & 0x000F;
 
-		pr_info("Got command: %d for clock %d", clk_cmd, clk_id);
+		pr_debug("Got command: %d for clock %d", clk_cmd, clk_id);
 
 		for (i = 0; i < bpmp_ares.clocks_size; i++) {
 			if (bpmp_ares.clock[i] == clk_id)
@@ -161,12 +161,12 @@ static bool check_if_allowed(struct tegra_bpmp_message *msg)
 			return true;
 		}
 
-		pr_err("Error, clock not allowed for: %d, with command: %d",
+		pr_warn("Error, clock not allowed for: %d, with command: %d",
 		       clk_id, clk_cmd);
 		break;
 
 	default:
-		pr_err("Error, msg->mrq %d not allowed", msg->mrq);
+		pr_warn("Error, msg->mrq %d not allowed", msg->mrq);
 		break;
 	}
 
@@ -206,11 +206,11 @@ static ssize_t write(struct file *filep, const char *buffer, size_t len,
 		goto unlock;
 	}
 
-	pr_info("wants to write %zu bytes\n", len);
+	pr_debug("wants to write %zu bytes\n", len);
 
 	ret = copy_from_user(&req, buffer, len);
 	if (ret) {
-		pr_err("copy_from_user(1) failed\n");
+		pr_err("copy_from_user of %lu bytes failed\n", len);
 		goto unlock;
 	}
 
@@ -231,7 +231,7 @@ static ssize_t write(struct file *filep, const char *buffer, size_t len,
 		ret = len;
 
 unlock:
-	pr_info("write: ret = %d\n", ret);
+	pr_debug("write: ret = %d\n", ret);
 	ctx->write_status = ret;
 	mutex_unlock(&ctx->lock);
 	return ret;
@@ -320,7 +320,7 @@ static int open(struct inode *inodep, struct file *filep)
 	ctx->transfer_status = TRANSFER_NONE;
 
 	filep->private_data = ctx;
-	pr_info("device opened.\n");
+	pr_debug("device opened.\n");
 	return 0;
 }
 
@@ -337,7 +337,7 @@ static int release(struct inode *inodep, struct file *filep)
 		mutex_destroy(&ctx->lock);
 		kfree(ctx);
 	}
-	pr_info("device closed.\n");
+	pr_debug("device closed.\n");
 	return 0;
 }
 
@@ -375,7 +375,7 @@ static int bpmp_host_proxy_probe(struct platform_device *pdev)
 		goto bpmp_put;
 	}
 
-	dev_info(&pdev->dev, "bpmp_ares.clocks_size: %d",
+	dev_dbg(&pdev->dev, "bpmp_ares.clocks_size: %d",
 		 bpmp_ares.clocks_size);
 
 	bpmp_ares.clock_parents_size = 0;
@@ -388,7 +388,7 @@ static int bpmp_host_proxy_probe(struct platform_device *pdev)
 		struct cmd_clk_get_all_info_response info;
 		uint32_t clk_id = bpmp_ares.clock[i];
 
-		dev_info(&pdev->dev, "bpmp_ares.clock %d", clk_id);
+		dev_dbg(&pdev->dev, "bpmp_ares.clock %d", clk_id);
 
 		err = tegra_bpmp_clk_get_info(bpmp, clk_id, &info);
 		if (err)
@@ -401,7 +401,7 @@ static int bpmp_host_proxy_probe(struct platform_device *pdev)
 		}
 
 		for (j = 0; j < info.num_parents; j++) {
-			dev_info(&pdev->dev, "clock %u parent: %u", clk_id,
+			dev_dbg(&pdev->dev, "clock %u parent: %u", clk_id,
 				 info.parents[j]);
 			bpmp_ares.clock_parents[bpmp_ares.clock_parents_size +
 						j] = info.parents[j];
@@ -419,10 +419,10 @@ static int bpmp_host_proxy_probe(struct platform_device *pdev)
 		goto bpmp_put;
 	}
 
-	dev_info(&pdev->dev, "bpmp_ares.resets_size: %d",
+	dev_dbg(&pdev->dev, "bpmp_ares.resets_size: %d",
 		 bpmp_ares.resets_size);
 	for (i = 0; i < bpmp_ares.resets_size; i++) {
-		dev_info(&pdev->dev, "bpmp_ares.reset %d", bpmp_ares.reset[i]);
+		dev_dbg(&pdev->dev, "bpmp_ares.reset %d", bpmp_ares.reset[i]);
 	}
 
 	major_number = register_chrdev(0, DEVICE_NAME, &fops);
@@ -440,7 +440,7 @@ static int bpmp_host_proxy_probe(struct platform_device *pdev)
 		dev_err(&pdev->dev, "Failed to register device class\n");
 		goto fail_class;
 	}
-	dev_info(&pdev->dev, "device class registered correctly\n");
+	dev_dbg(&pdev->dev, "device class registered correctly\n");
 
 	bpmp_host_proxy_device = device_create(bpmp_host_proxy_class, NULL,
 					       MKDEV(major_number, 0), NULL,
