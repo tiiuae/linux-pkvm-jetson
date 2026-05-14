@@ -84,7 +84,7 @@ tegra_bpmp_channel_get_thread_index(struct tegra_bpmp_channel *channel)
 	return index;
 }
 
-static bool tegra_bpmp_message_valid(const struct tegra_bpmp_message *msg)
+bool tegra_bpmp_message_valid(const struct tegra_bpmp_message *msg)
 {
 	return (msg->tx.size <= MSG_DATA_MIN_SZ) &&
 	       (msg->rx.size <= MSG_DATA_MIN_SZ) &&
