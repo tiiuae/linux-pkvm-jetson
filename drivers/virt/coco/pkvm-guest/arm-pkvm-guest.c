@@ -120,6 +120,8 @@ static int mmio_guard_ioremap_hook(phys_addr_t phys, size_t size,
 	end = ALIGN(phys + size, pkvm_granule);
 	phys = ALIGN_DOWN(phys, pkvm_granule);
 
+	pr_info("[arm-pkvm-guest] mmio_guard_ioremap_hook: func_id 0x%x, phys %pa, numpages %llu, pkvm_func_range %d",
+		func_id, &phys, (end - phys) >> PAGE_SHIFT, pkvm_func_range);
 	WARN_ON_ONCE(arm_smccc_do_range(func_id, phys, (end - phys) >> PAGE_SHIFT,
 					pkvm_func_range));
 	return 0;
@@ -202,10 +204,17 @@ void pkvm_init_hyp_services(void)
 
 	pkvm_granule = res.a0;
 	pkvm_func_range = !!res.a1;
+	pr_info("arm-pkvm-guest: pkvm_func_range = %d", pkvm_func_range);
 
 	if (kvm_arm_hyp_service_available(ARM_SMCCC_KVM_FUNC_MEM_SHARE) &&
 	    kvm_arm_hyp_service_available(ARM_SMCCC_KVM_FUNC_MEM_UNSHARE))
 	    arm64_mem_crypt_ops_register(&pkvm_crypt_ops);
+
+	/* Enroll guest to MMIO guard hypervisor extension automatically */
+	WARN_ON(!kvm_arm_hyp_service_available(ARM_SMCCC_KVM_FUNC_MMIO_GUARD_ENROLL));
+	memset(&res, 0, sizeof(res));
+	arm_smccc_1_1_invoke(ARM_SMCCC_VENDOR_HYP_KVM_MMIO_GUARD_ENROLL_FUNC_ID, &res);
+	WARN_ON((long)res.a0 < 0);
 
 	if (kvm_arm_hyp_service_available(ARM_SMCCC_KVM_FUNC_MMIO_GUARD_MAP) &&
 	    __dram_is_aligned(pkvm_granule))

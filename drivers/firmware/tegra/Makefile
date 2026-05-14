@@ -9,3 +9,4 @@ tegra-bpmp-$(CONFIG_DEBUG_FS)	+= bpmp-debugfs.o
 obj-$(CONFIG_TEGRA_BPMP)	+= tegra-bpmp.o
 obj-$(CONFIG_TEGRA_IVC)		+= ivc.o
 obj-$(CONFIG_TEGRA_BPMP_HOST_PROXY)	+= bpmp-protocol.o bpmp-host-proxy.o
+obj-$(CONFIG_VIRTIO_BPMP)	+= bpmp-protocol.o virtio-bpmp.o

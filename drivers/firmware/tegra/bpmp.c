@@ -309,8 +309,8 @@ static ssize_t tegra_bpmp_channel_write(struct tegra_bpmp_channel *channel,
 
 static int __maybe_unused tegra_bpmp_resume(struct device *dev);
 
-int tegra_bpmp_transfer_atomic(struct tegra_bpmp *bpmp,
-			       struct tegra_bpmp_message *msg)
+static int tegra_bpmp_transfer_atomic_internal(struct tegra_bpmp *bpmp,
+					       struct tegra_bpmp_message *msg)
 {
 	struct tegra_bpmp_channel *channel;
 	int err;
@@ -353,10 +353,18 @@ int tegra_bpmp_transfer_atomic(struct tegra_bpmp *bpmp,
 	return __tegra_bpmp_channel_read(channel, msg->rx.data, msg->rx.size,
 					 &msg->rx.ret);
 }
+
+int tegra_bpmp_transfer_atomic(struct tegra_bpmp *bpmp,
+			       struct tegra_bpmp_message *msg)
+{
+	if (bpmp->transfer_ops && !(WARN_ON_ONCE(!bpmp->transfer_ops->transfer_atomic)))
+		return bpmp->transfer_ops->transfer_atomic(bpmp, msg);
+	return -ENODEV;
+}
 EXPORT_SYMBOL_GPL(tegra_bpmp_transfer_atomic);
 
-int tegra_bpmp_transfer(struct tegra_bpmp *bpmp,
-			struct tegra_bpmp_message *msg)
+static int tegra_bpmp_transfer_internal(struct tegra_bpmp *bpmp,
+					struct tegra_bpmp_message *msg)
 {
 	struct tegra_bpmp_channel *channel;
 	unsigned long timeout;
@@ -393,6 +401,13 @@ int tegra_bpmp_transfer(struct tegra_bpmp *bpmp,
 
 	return tegra_bpmp_channel_read(channel, msg->rx.data, msg->rx.size,
 				       &msg->rx.ret);
+}
+
+int tegra_bpmp_transfer(struct tegra_bpmp *bpmp, struct tegra_bpmp_message *msg)
+{
+	if (bpmp->transfer_ops && !(WARN_ON_ONCE(!bpmp->transfer_ops->transfer)))
+		return bpmp->transfer_ops->transfer(bpmp, msg);
+	return -ENODEV;
 }
 EXPORT_SYMBOL_GPL(tegra_bpmp_transfer);
 
@@ -551,7 +566,7 @@ static void tegra_bpmp_mrq_handle_ping(unsigned int mrq,
 	tegra_bpmp_mrq_return(channel, 0, &response, sizeof(response));
 }
 
-static int tegra_bpmp_ping(struct tegra_bpmp *bpmp)
+int tegra_bpmp_ping(struct tegra_bpmp *bpmp)
 {
 	struct mrq_ping_response response;
 	struct mrq_ping_request request;
@@ -626,8 +641,7 @@ static int tegra_bpmp_get_firmware_tag_old(struct tegra_bpmp *bpmp, char *tag,
 	return err;
 }
 
-static int tegra_bpmp_get_firmware_tag(struct tegra_bpmp *bpmp, char *tag,
-				       size_t size)
+int tegra_bpmp_get_firmware_tag(struct tegra_bpmp *bpmp, char *tag, size_t size)
 {
 	if (tegra_bpmp_mrq_is_supported(bpmp, MRQ_QUERY_FW_TAG)) {
 		struct mrq_query_fw_tag_response resp;
@@ -699,6 +713,11 @@ void tegra_bpmp_handle_rx(struct tegra_bpmp *bpmp)
 	spin_unlock(&bpmp->lock);
 }
 
+static const struct tegra_bpmp_transfer_ops tegra_bpmp_transfer_ops = {
+	.transfer_atomic = tegra_bpmp_transfer_atomic_internal,
+	.transfer = tegra_bpmp_transfer_internal,
+};
+
 static int tegra_bpmp_probe(struct platform_device *pdev)
 {
 	struct tegra_bpmp *bpmp;
@@ -711,6 +730,7 @@ static int tegra_bpmp_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	bpmp->soc = of_device_get_match_data(&pdev->dev);
+	bpmp->transfer_ops = &tegra_bpmp_transfer_ops;
 	bpmp->dev = &pdev->dev;
 
 	INIT_LIST_HEAD(&bpmp->mrqs);
