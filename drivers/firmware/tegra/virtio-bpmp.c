@@ -1,9 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Author: Hugo Ros <Hugo.Ros@tii.ae>
- *
- * ---
- *
  * Device driver for Tegra BPMP over virtio.
  *
  * This driver employs a single virtio queue to handle both send and recv.
@@ -35,6 +31,7 @@
  *         place buffer on virtio used queue indicating how many bytes written.
  */
 
+#include <linux/arm-smccc.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/virtio_config.h>
@@ -95,8 +92,16 @@ static int virtio_bpmp_send(struct tegra_bpmp *bpmp,
 {
 	struct bpmp_virtio_device *dev = bpmp->priv;
 	struct scatterlist *sgs[2], sg_req, sg_resp;
+	struct arm_smccc_res smcc_res;
 	unsigned long flags;
 	int rc;
+
+	arm_smccc_1_1_invoke(ARM_SMCCC_VENDOR_HYP_KVM_AUDIT_OP_FUNC_ID,
+			     KVM_AUDIT_OP_TARGET_BPMP, msg->mrq, 1, 1, &smcc_res);
+	if (smcc_res.a0 != SMCCC_RET_SUCCESS) {
+		dev_warn(bpmp->dev, "hypervisor replied with error %ld\n",
+			 smcc_res.a0);
+	}
 
 	/*
 	* pack the message into req struct.
