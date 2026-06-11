@@ -122,6 +122,7 @@ static int tegra186_bpmp_channel_init(struct tegra_bpmp_channel *channel,
 	message_size = tegra_ivc_align(MSG_MIN_SZ);
 	queue_size = tegra_ivc_total_queue_size(message_size);
 	offset = queue_size * index;
+	pr_debug("bpmp channel, offset is at %x\n", offset);
 
 	if (priv->rx.pool) {
 		iosys_map_set_vaddr_iomem(&rx, priv->rx.sram + offset);
@@ -130,6 +131,9 @@ static int tegra186_bpmp_channel_init(struct tegra_bpmp_channel *channel,
 		iosys_map_set_vaddr(&rx, priv->rx.dram + offset);
 		iosys_map_set_vaddr(&tx, priv->tx.dram + offset);
 	}
+
+	pr_debug("priv->rx.sram + offset = %p\n", priv->rx.sram + offset);
+	pr_debug("priv->tx.sram + offset = %p\n", priv->tx.sram + offset);
 
 	err = tegra_ivc_init(channel->ivc, NULL, &rx, priv->rx.phys + offset, &tx,
 			     priv->tx.phys + offset, 1, message_size, tegra186_bpmp_ivc_notify,
@@ -281,11 +285,13 @@ static int tegra186_bpmp_setup_channels(struct tegra_bpmp *bpmp)
 			return err;
 	}
 
+	pr_debug("bpmp: tx channel\n");
 	err = tegra186_bpmp_channel_init(bpmp->tx_channel, bpmp,
 					 bpmp->soc->channels.cpu_tx.offset);
 	if (err < 0)
 		return err;
 
+	pr_debug("bpmp: rx channel\n");
 	err = tegra186_bpmp_channel_init(bpmp->rx_channel, bpmp,
 					 bpmp->soc->channels.cpu_rx.offset);
 	if (err < 0) {
@@ -296,6 +302,7 @@ static int tegra186_bpmp_setup_channels(struct tegra_bpmp *bpmp)
 	for (i = 0; i < bpmp->threaded.count; i++) {
 		unsigned int index = bpmp->soc->channels.thread.offset + i;
 
+		pr_debug("bpmp: threaded channel nr %d\n", i);
 		err = tegra186_bpmp_channel_init(&bpmp->threaded_channels[i],
 						 bpmp, index);
 		if (err < 0)
