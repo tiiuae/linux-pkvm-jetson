@@ -66,6 +66,12 @@ ifeq ($(CONFIG_SERIAL_PKVM_PL011),y)
 hyp-obj-$(CONFIG_SERIAL_PKVM_PL011) += $(HYP_PL011_DRV_PATH)/hyp/pl011-hyp.o
 endif
 
+HYP_BPMP_DRV_PATH = ../../../../../drivers/firmware/tegra/bpmp-pkvm
+
+ifeq ($(CONFIG_TEGRA_BPMP_PKVM),y)
+hyp-obj-$(CONFIG_TEGRA_BPMP_PKVM) += $(HYP_BPMP_DRV_PATH)/hyp/bpmp-hyp.o
+endif
+
 $(obj)/hyp.lds: $(src)/hyp.lds.S FORCE
 	$(call if_changed_dep,cpp_lds_S)
 
