@@ -66,6 +66,12 @@ subdir-ccflags-y += -I$(srctree)/drivers/iommu/arm/arm-smmu/pkvm
 hyp-obj-$(CONFIG_TEGRA_MC_PKVM) += $(HYP_TEGRA_MC_PATH)/pkvm/tegra234-mc-pkvm.o
 endif
 
+HYP_BPMP_DRV_PATH = ../../../../../drivers/firmware/tegra/bpmp-pkvm
+
+ifeq ($(CONFIG_TEGRA_BPMP_PKVM),y)
+hyp-obj-$(CONFIG_TEGRA_BPMP_PKVM) += $(HYP_BPMP_DRV_PATH)/hyp/bpmp-hyp.o
+endif
+
 $(obj)/hyp.lds: $(src)/hyp.lds.S FORCE
 	$(call if_changed_dep,cpp_lds_S)
 

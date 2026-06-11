@@ -45,4 +45,10 @@ config VIRTIO_BPMP
 	  Expects the host to act as a proxy for BPMP commands sent by the guest for passthrough
 	  devices.
 
+config TEGRA_BPMP_PKVM
+	bool "Protected KVM BPMP access control module"
+	depends on ARM64 && KVM
+	help
+	  Enable BPMP command auditing and filtering in pKVM hypervisor.
+
 endmenu
