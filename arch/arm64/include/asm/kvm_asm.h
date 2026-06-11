@@ -75,6 +75,7 @@ enum __kvm_host_smccc_func {
 	__KVM_HOST_SMCCC_FUNC___pkvm_iommu_register_ops,
 	__KVM_HOST_SMCCC_FUNC___pkvm_serial_register_ops,
 	__KVM_HOST_SMCCC_FUNC___pkvm_devices_init,
+	__KVM_HOST_SMCCC_FUNC___pkvm_device_audit_init,
 	__KVM_HOST_SMCCC_FUNC___pkvm_prot_finalize,
 
 	/* Hypercalls available after pKVM finalisation */

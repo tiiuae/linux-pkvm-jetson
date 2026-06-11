@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0
 
-lib-objs := clear_page.o copy_page.o memcpy.o memset.o
+lib-objs := clear_page.o copy_page.o memcpy.o memset.o strcmp.o
 lib-objs := $(addprefix ../../../lib/, $(lib-objs))
 
 CFLAGS_switch.nvhe.o += -Wno-override-init
@@ -8,7 +8,7 @@ CFLAGS_switch.nvhe.o += -Wno-override-init
 hyp-obj-y := timer-sr.o sysreg-sr.o debug-sr.o switch.o tlb.o hyp-init.o host.o \
 	 hyp-main.o hyp-smp.o psci-relay.o alloc.o early_alloc.o page_alloc.o \
 	 cache.o setup.o mm.o mem_protect.o sys_regs.o pkvm.o stacktrace.o ffa.o \
-	 serial.o alloc_mgt.o iommu/iommu.o power/hvc.o  device/device.o
+	 serial.o alloc_mgt.o iommu/iommu.o power/hvc.o  device/device.o device/audit.o
 hyp-obj-y += ../vgic-v3-sr.o ../aarch32.o ../vgic-v2-cpuif-proxy.o ../entry.o \
 	 ../fpsimd.o ../hyp-entry.o ../exception.o ../pgtable.o ../../config.o
 hyp-obj-y += ../../../kernel/smccc-call.o  iommu/pviommu-host.o iommu/pviommu.o
@@ -64,6 +64,12 @@ HYP_PL011_DRV_PATH = ../../../../../drivers/tty/serial/pkvm-pl011
 
 ifeq ($(CONFIG_SERIAL_PKVM_PL011),y)
 hyp-obj-$(CONFIG_SERIAL_PKVM_PL011) += $(HYP_PL011_DRV_PATH)/hyp/pl011-hyp.o
+endif
+
+HYP_BPMP_DRV_PATH = ../../../../../drivers/firmware/tegra/bpmp-pkvm
+
+ifeq ($(CONFIG_TEGRA_BPMP_PKVM),y)
+hyp-obj-$(CONFIG_TEGRA_BPMP_PKVM) += $(HYP_BPMP_DRV_PATH)/hyp/bpmp-hyp.o
 endif
 
 $(obj)/hyp.lds: $(src)/hyp.lds.S FORCE

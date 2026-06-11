@@ -19,6 +19,7 @@
 
 #include <nvhe/alloc.h>
 #include <nvhe/alloc_mgt.h>
+#include <nvhe/audit.h>
 #include <nvhe/iommu.h>
 #include <nvhe/ffa.h>
 #include <nvhe/mem_protect.h>
@@ -1720,6 +1721,11 @@ static void handle___pkvm_devices_init(struct kvm_cpu_context *host_ctxt)
 	cpu_reg(host_ctxt, 1) = pkvm_init_devices();
 }
 
+static void handle___pkvm_device_audit_init(struct kvm_cpu_context *host_ctxt)
+{
+	cpu_reg(host_ctxt, 1) = pkvm_audit_init();
+}
+
 static void handle___pkvm_host_iommu_alloc_domain(struct kvm_cpu_context *host_ctxt)
 {
 	int ret;
@@ -1975,6 +1981,7 @@ static const hcall_t host_hcall[] = {
 	HANDLE_FUNC(__pkvm_iommu_register_ops),
 	HANDLE_FUNC(__pkvm_serial_register_ops),
 	HANDLE_FUNC(__pkvm_devices_init),
+	HANDLE_FUNC(__pkvm_device_audit_init),
 	HANDLE_FUNC(__pkvm_prot_finalize),
 
 	HANDLE_FUNC(__pkvm_host_share_hyp),

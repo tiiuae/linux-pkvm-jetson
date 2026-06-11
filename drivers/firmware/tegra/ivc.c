@@ -68,11 +68,16 @@ struct tegra_ivc_header {
 	} rx;
 };
 
+static inline unsigned long iosys_map_get_address(const struct iosys_map *map);
+
 #define tegra_ivc_header_read_field(hdr, field) \
 	iosys_map_rd_field(hdr, 0, struct tegra_ivc_header, field)
 
 #define tegra_ivc_header_write_field(hdr, field, value) \
-	iosys_map_wr_field(hdr, 0, struct tegra_ivc_header, field, value)
+	do { \
+		pr_debug_ratelimited("write to hdr (%lx) " #field ": 0x%x\n", iosys_map_get_address(hdr), value); \
+		iosys_map_wr_field(hdr, 0, struct tegra_ivc_header, field, value); \
+	} while(0)
 
 static inline void tegra_ivc_invalidate(struct tegra_ivc *ivc, dma_addr_t phys)
 {
@@ -689,6 +694,13 @@ int tegra_ivc_init(struct tegra_ivc *ivc, struct device *peer, const struct iosy
 
 	iosys_map_copy(&ivc->rx.map, rx);
 	iosys_map_copy(&ivc->tx.map, tx);
+	pr_debug("tx.map is iomem? %d, rx.map is iomem? %d\n",
+		ivc->tx.map.is_iomem, ivc->rx.map.is_iomem);
+	pr_debug("tx.map is at %lx, rx.map is at %lx\n",
+		iosys_map_get_address(&ivc->tx.map),
+		iosys_map_get_address(&ivc->rx.map));
+	pr_debug("tx.phys is at %llx, rx.phys is at %llx\n", ivc->tx.phys,
+		ivc->rx.phys);
 	ivc->peer = peer;
 	ivc->notify = notify;
 	ivc->notify_data = data;
