@@ -20,6 +20,7 @@
 #include <linux/of_fdt.h>
 #include <linux/of_reserved_mem.h>
 #include <linux/platform_device.h>
+#include <linux/list_sort.h>
 #include <linux/sort.h>
 
 #include <asm/kvm_host.h>
@@ -48,6 +49,7 @@
 #define VM_AVAILABILITY_RETRY_SLEEP_MS	10
 
 #define PKVM_DEVICE_ASSIGN_COMPAT	"pkvm,device-assignment"
+#define PKVM_MEDIATED_DEVICE_COMPAT 	"pkvm,mediated-device"
 
 DEFINE_STATIC_KEY_FALSE(kvm_protected_mode_initialized);
 
@@ -63,6 +65,9 @@ phys_addr_t hyp_mem_size;
 
 extern struct pkvm_device *kvm_nvhe_sym(registered_devices);
 extern u32 kvm_nvhe_sym(registered_devices_nr);
+
+extern struct pkvm_mediated_device *kvm_nvhe_sym(mediated_devices);
+extern u32 kvm_nvhe_sym(mediated_devices_nr);
 
 static int __init register_memblock_regions(void)
 {
@@ -618,6 +623,148 @@ out_free:
 	return ret;
 }
 
+static int pkvm_register_audit_resource(struct pkvm_mediated_device *dev,
+					struct of_phandle_args *args)
+{
+	struct device_node *np = args->np;
+	struct resource res;
+	u64 size;
+	unsigned int j = 0, res_idx = dev->nr_resources;
+
+	/* Parse regs */
+	while (!of_address_to_resource(np, j, &res)) {
+		if (res_idx >= PKVM_AUDIT_MAX_RESOURCE)
+			return -E2BIG;
+
+		size = resource_size(&res);
+		if (!PAGE_ALIGNED(res.start) || !PAGE_ALIGNED(size))
+			return -EINVAL;
+
+		dev->resources[res_idx].base = res.start;
+		dev->resources[res_idx].size = size;
+		dev->resources[res_idx].el2_map = 0;
+		res_idx++;
+		j++;
+	}
+	dev->nr_resources += j;
+	return 0;
+}
+
+static int pkvm_resource_list_cmp(void *priv, const struct list_head *a,
+				  const struct list_head *b)
+{
+	const struct pkvm_monitored_resource *ra, *rb;
+	ra = list_entry(a, struct pkvm_monitored_resource, node);
+	rb = list_entry(b, struct pkvm_monitored_resource, node);
+
+	return ra->base - rb->base;
+}
+
+static int pkvm_check_resource_overlaps(struct pkvm_mediated_device *devs,
+					int dev_cnt)
+{
+	struct pkvm_monitored_resource *prev = NULL, *cur;
+	int i, ri, ret = 0;
+	LIST_HEAD(res_list);
+
+	for (i = 0; i < dev_cnt; i++) {
+		for (ri = 0; ri < devs[i].nr_resources; ri++) {
+			list_add(&devs[i].resources[ri].node, &res_list);
+		}
+	}
+
+	list_sort(NULL, &res_list, pkvm_resource_list_cmp);
+
+	list_for_each_entry(cur, &res_list, node) {
+		if (prev && prev->base + prev->size > cur->base) {
+			kvm_err("mediated device resource [%llx+%llx) overlaps resource [%llx+%llx)\n",
+				prev->base, prev->size, cur->base, cur->size);
+			ret = -EINVAL;
+			break;
+		}
+		prev = cur;
+	}
+	return ret;
+}
+
+static int pkvm_init_device_audit(void)
+{
+	struct device_node *np;
+	int ret = 0, dev_cnt = 0, idx;
+	size_t dev_sz;
+	struct pkvm_mediated_device *dev_base;
+
+	for_each_compatible_node(np, NULL, PKVM_MEDIATED_DEVICE_COMPAT) {
+		dev_cnt += 1;
+	}
+	kvm_info("Found %d mediated devices", dev_cnt);
+
+	if (!dev_cnt)
+		return 0;
+
+	dev_sz = PAGE_ALIGN(size_mul(sizeof(struct pkvm_mediated_device), dev_cnt));
+	dev_base = alloc_pages_exact(dev_sz, GFP_KERNEL_ACCOUNT | __GFP_ZERO);
+
+	if (!dev_base)
+		return -ENOMEM;
+
+	idx = 0;
+	for_each_compatible_node(np, NULL, PKVM_MEDIATED_DEVICE_COMPAT) {
+		struct of_phandle_args args;
+		struct pkvm_mediated_device *dev;
+		const char *drv_name;
+		int cnt = 0;
+
+		dev = &dev_base[idx];
+		dev->nr_resources = 0; /* increased in pkvm_register_audit_resource */
+
+		/* Only support memory pools for now (for Tegra234 BPMP). This can be extended to
+		 * also parse normal memory regions. */
+		while (!of_parse_phandle_with_fixed_args(np, "memory-pools", 0,
+							 cnt, &args)) {
+			ret = pkvm_register_audit_resource(dev, &args);
+			of_node_put(args.np);
+			if (ret) {
+				of_node_put(np);
+				goto out_free;
+			}
+			cnt++;
+		}
+
+		ret = of_property_read_string(np, "pkvm,driver", &drv_name);
+		if (ret) {
+			of_node_put(np);
+			goto out_free;
+		}
+		if (strlen(drv_name) >= sizeof(dev->drv_name)) {
+			ret = -EINVAL;
+			of_node_put(np);
+			goto out_free;
+		}
+		strncpy(dev->drv_name, drv_name, sizeof(dev->drv_name));
+
+		idx++;
+	}
+
+	/*
+	 * Error on memory range overlap. It will cause problems when trying to map the faulting
+	 * address in EL2 to its corresponding device. This is a DT configuration error:
+	 * the same memory resource is referenced by multiple "pkvm,mediated-device" nodes.
+	 */
+	ret = pkvm_check_resource_overlaps(dev_base, dev_cnt);
+	if (ret)
+		goto out_free;
+
+	kvm_info("pkvm: no overlap detected in audit resources\n");
+	kvm_nvhe_sym(mediated_devices_nr) = dev_cnt;
+	kvm_nvhe_sym(mediated_devices) = dev_base;
+	return ret;
+
+out_free:
+	free_pages_exact(dev_base, dev_sz);
+	return ret;
+}
+
 static void __init _kvm_host_prot_finalize(void *arg)
 {
 	int *err = arg;
@@ -669,7 +816,17 @@ static int __init finalize_pkvm(void)
 
 	ret = kvm_call_hyp_nvhe(__pkvm_devices_init);
 	if (ret)
-		pr_warn("Assignable devices failed to initialize in the hypervisor %d", ret);
+		pr_warn("Assignable devices failed to initialize in the hypervisor %d\n", ret);
+
+	ret = pkvm_init_device_audit();
+	if (ret) {
+		pr_err("Failed to init pkvm audit system %d\n", ret);
+		pkvm_firmware_rmem_clear();
+	}
+
+	ret = kvm_call_hyp_nvhe(__pkvm_device_audit_init);
+	if (ret)
+		pr_warn("Audited devices failed to initialize in the hypervisor %d\n", ret);
 
 	/*
 	 * Exclude HYP sections from kmemleak so that they don't get peeked
