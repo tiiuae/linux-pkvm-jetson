@@ -331,6 +331,8 @@ static int tegra_bpmp_transfer_atomic_internal(struct tegra_bpmp *bpmp,
 
 	channel = bpmp->tx_channel;
 
+	pr_debug_ratelimited("bpmp transfer atomic: mrq = %d\n", msg->mrq);
+
 	spin_lock(&bpmp->atomic_tx_lock);
 
 	err = tegra_bpmp_channel_write(channel, msg->mrq, MSG_ACK,
@@ -383,6 +385,8 @@ static int tegra_bpmp_transfer_internal(struct tegra_bpmp *bpmp,
 		else
 			return -EAGAIN;
 	}
+
+	pr_debug_ratelimited("bpmp transfer: mrq = %d\n", msg->mrq);
 
 	channel = tegra_bpmp_write_threaded(bpmp, msg->mrq, msg->tx.data,
 					    msg->tx.size);
