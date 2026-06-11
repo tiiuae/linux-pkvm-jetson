@@ -106,7 +106,6 @@ static bool check_if_allowed(struct tegra_bpmp_message *msg)
 
 	switch (msg->mrq) {
 	case MRQ_PING:
-	case MRQ_QUERY_TAG:
 	case MRQ_THREADED_PING:
 	case MRQ_QUERY_ABI:
 	case MRQ_QUERY_FW_TAG:
