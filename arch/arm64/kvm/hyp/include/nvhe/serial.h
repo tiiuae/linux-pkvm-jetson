@@ -3,6 +3,8 @@
 #ifndef __ARM64_KVM_NVHE_SERIAL_H__
 #define __ARM64_KVM_NVHE_SERIAL_H__
 
+#include <asm/types.h>
+
 struct kvm_serial_ops {
         int (*init)(void);
 };
@@ -52,5 +54,14 @@ int pkvm_serial_register_ops(struct kvm_serial_ops *ops);
 
 #define hyp_warn(fmt, ...) \
 	hyp_printf("[hyp-warn] " fmt "\n", ##__VA_ARGS__)
+
+#ifndef HYP_DEBUG
+#define HYP_DEBUG 0
+#endif
+#define hyp_debug(fmt, ...)                          \
+	do {                                         \
+		if (HYP_DEBUG)                       \
+			hyp_dbg(fmt, ##__VA_ARGS__); \
+	} while (0)
 
 #endif
