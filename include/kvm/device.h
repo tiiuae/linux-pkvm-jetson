@@ -40,6 +40,17 @@ struct pkvm_device {
 	unsigned short refcount;
 	int (*reset_handler)(void *cookie, bool host_to_guest);
 	void *cookie; /* cookie from drivers. */
+
+	/*
+	 * MSI-X table info, populated at boot before prot_finalize.
+	 * EL2 uses these to validate and perform hyp-mediated MSI-X access.
+	 * nr_msix_entries == 0 means device has no MSI-X capability.
+	 */
+	u64 msix_table_phys;	/* BAR[bir].start + table_offset */
+	u32 msix_table_size;	/* nr_entries * PCI_MSIX_ENTRY_SIZE */
+	u16 nr_msix_entries;	/* (PCI_MSIX_FLAGS & 0x7FF) + 1, or 0 */
+	u8  msix_bir;		/* BAR Indicator Register */
+	u8  msix_pad;
 };
 
 struct pkvm_monitored_resource {

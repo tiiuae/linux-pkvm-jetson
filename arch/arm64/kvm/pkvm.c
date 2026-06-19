@@ -2147,6 +2147,24 @@ int kvm_arch_assign_device(struct device *dev, struct kvm *kvm)
 	return ret;
 }
 
+static int __pkvm_arch_set_msix_hyp(struct device *dev, void *data)
+{
+	if (dev_is_pci(dev)) {
+		struct pci_dev *pdev = to_pci_dev(dev);
+
+		if (pdev->msix_cap)
+			pdev->pkvm_msix_hyp = 1;
+	}
+	return 0;
+}
+
+static int __pkvm_arch_clear_msix_hyp(struct device *dev, void *data)
+{
+	if (dev_is_pci(dev))
+		to_pci_dev(dev)->pkvm_msix_hyp = 0;
+	return 0;
+}
+
 int kvm_arch_assign_group(struct iommu_group *group, struct kvm *kvm)
 {
 	int ret;
@@ -2191,5 +2209,52 @@ void kvm_arch_reclaim_group(struct iommu_group *group, struct kvm *kvm)
 	if (!kvm_vm_is_protected(kvm))
 		return;
 
+	iommu_group_for_each_dev(group, NULL, __pkvm_arch_clear_msix_hyp);
 	iommu_group_for_each_dev(group, NULL, __pkvm_arch_reclaim_device);
+}
+
+/*
+ * Hyp-mediated MSI-X access wrappers.
+ * These HVCs allow the host to read/write MSI-X table entries on devices
+ * whose BARs have been donated to EL2 (protected VM passthrough).
+ * EL2 validates all accesses against boot-time registration data.
+ */
+int pkvm_msix_hyp_read_entry(u32 dev_idx, u32 entry_idx,
+			     u32 *addr_lo, u32 *addr_hi,
+			     u32 *data, u32 *ctrl)
+{
+	struct arm_smccc_res res;
+
+	res = kvm_call_hyp_nvhe_smccc(__pkvm_msix_read_entry,
+				      dev_idx, entry_idx, 0, 0);
+	if (res.a1)
+		return res.a1;
+
+	*addr_lo = (u32)res.a2;
+	*addr_hi = (u32)(res.a2 >> 32);
+	*data    = (u32)res.a3;
+	*ctrl    = (u32)(res.a3 >> 32);
+
+	return 0;
+}
+
+int pkvm_msix_hyp_write_entry(u32 dev_idx, u32 entry_idx,
+			      u32 addr_lo, u32 addr_hi,
+			      u32 data, u32 ctrl, u32 field_mask)
+{
+	u64 packed_addr = ((u64)addr_hi << 32) | addr_lo;
+	u64 packed_data_ctrl = ((u64)ctrl << 32) | data;
+	int ret;
+
+	ret = kvm_call_hyp_nvhe(__pkvm_msix_write_entry,
+				 dev_idx, entry_idx,
+				 packed_addr, packed_data_ctrl,
+				 field_mask, 0);
+
+	return ret;
+}
+
+int pkvm_msix_hyp_mask_all(u32 dev_idx)
+{
+	return kvm_call_hyp_nvhe(__pkvm_msix_mask_all, dev_idx, 0);
 }

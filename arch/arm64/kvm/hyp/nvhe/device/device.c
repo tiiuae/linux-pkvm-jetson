@@ -438,6 +438,174 @@ int pkvm_device_register_reset(u64 phys, void *cookie,
 	return ret;
 }
 
+/*
+ * PCI MSI-X table entry layout (from PCI 3.0 spec).
+ * Defined locally to avoid pulling in full PCI headers in EL2.
+ */
+#define MSIX_ENTRY_SIZE		16
+#define MSIX_ENTRY_LOWER_ADDR	0x0
+#define MSIX_ENTRY_UPPER_ADDR	0x4
+#define MSIX_ENTRY_DATA		0x8
+#define MSIX_ENTRY_VECTOR_CTRL	0xc
+#define MSIX_ENTRY_CTRL_MASKBIT	0x1
+
+/* Device MMIO accessors for EL2 (PAGE_HYP_DEVICE = Device-nGnRE) */
+static inline u32 hyp_readl(void *addr)
+{
+	return *(volatile u32 *)addr;
+}
+
+static inline void hyp_writel(u32 val, void *addr)
+{
+	*(volatile u32 *)addr = val;
+}
+
+/*
+ * Validate an MSI-X table access request from the host.
+ * Returns the device pointer and computes the entry's virtual address.
+ * Caller must hold device_spinlock.
+ *
+ * Security: The host provides indices (device_idx, entry_idx), never
+ * physical addresses. EL2 computes the address from immutable boot-time
+ * registration data. This prevents a compromised host from tricking
+ * EL2 into arbitrary memory access.
+ */
+static struct pkvm_device *
+pkvm_validate_msix_access(u32 device_idx, u32 entry_idx, void **entry_addr)
+{
+	struct pkvm_device *dev;
+	u64 phys;
+
+	hyp_assert_lock_held(&device_spinlock);
+
+	if (device_idx >= registered_devices_nr)
+		return NULL;
+
+	dev = &registered_devices[device_idx];
+
+	if (!dev->nr_msix_entries || entry_idx >= dev->nr_msix_entries)
+		return NULL;
+
+	/* Address computed from boot-time data, not host-provided */
+	phys = dev->msix_table_phys + (u64)entry_idx * MSIX_ENTRY_SIZE;
+
+	/* Defense in depth: verify the page is hyp-owned */
+	if (hyp_check_range_owned(phys & PAGE_MASK, PAGE_SIZE))
+		return NULL;
+
+	*entry_addr = __hyp_va(phys);
+	return dev;
+}
+
+/*
+ * Read one MSI-X table entry.
+ * Returns all 4 fields packed into two u64 return values.
+ */
+int pkvm_msix_read_entry(u32 device_idx, u32 entry_idx,
+			 u64 *packed_addr, u64 *packed_data_ctrl)
+{
+	struct pkvm_device *dev;
+	void *addr;
+	u32 lo, hi, data, ctrl;
+	int ret = -EINVAL;
+
+	hyp_spin_lock(&device_spinlock);
+
+	dev = pkvm_validate_msix_access(device_idx, entry_idx, &addr);
+	if (!dev)
+		goto out_unlock;
+
+	lo   = hyp_readl(addr + MSIX_ENTRY_LOWER_ADDR);
+	hi   = hyp_readl(addr + MSIX_ENTRY_UPPER_ADDR);
+	data = hyp_readl(addr + MSIX_ENTRY_DATA);
+	ctrl = hyp_readl(addr + MSIX_ENTRY_VECTOR_CTRL);
+
+	*packed_addr = ((u64)hi << 32) | lo;
+	*packed_data_ctrl = ((u64)ctrl << 32) | data;
+	ret = 0;
+
+out_unlock:
+	hyp_spin_unlock(&device_spinlock);
+	return ret;
+}
+
+/*
+ * Write selected fields of one MSI-X table entry.
+ * field_mask bits: 0=addr_lo, 1=addr_hi, 2=data, 3=vector_ctrl.
+ */
+int pkvm_msix_write_entry(u32 device_idx, u32 entry_idx,
+			  u64 packed_addr, u64 packed_data_ctrl,
+			  u32 field_mask)
+{
+	struct pkvm_device *dev;
+	void *addr;
+	int ret = -EINVAL;
+
+	if (field_mask & ~0xFu)
+		return -EINVAL;
+
+	hyp_spin_lock(&device_spinlock);
+
+	dev = pkvm_validate_msix_access(device_idx, entry_idx, &addr);
+	if (!dev)
+		goto out_unlock;
+
+	if (field_mask & BIT(0))
+		hyp_writel((u32)packed_addr, addr + MSIX_ENTRY_LOWER_ADDR);
+	if (field_mask & BIT(1))
+		hyp_writel((u32)(packed_addr >> 32), addr + MSIX_ENTRY_UPPER_ADDR);
+	if (field_mask & BIT(2))
+		hyp_writel((u32)packed_data_ctrl, addr + MSIX_ENTRY_DATA);
+	if (field_mask & BIT(3))
+		hyp_writel((u32)(packed_data_ctrl >> 32), addr + MSIX_ENTRY_VECTOR_CTRL);
+
+	/* Flush: read back to ensure writes reach device */
+	hyp_readl(addr + MSIX_ENTRY_DATA);
+	ret = 0;
+
+out_unlock:
+	hyp_spin_unlock(&device_spinlock);
+	return ret;
+}
+
+/*
+ * Mask all MSI-X vectors for a device (bulk operation).
+ * Avoids N individual HVCs for msix_mask_all().
+ */
+int pkvm_msix_mask_all(u32 device_idx)
+{
+	struct pkvm_device *dev;
+	void *base;
+	int i;
+
+	hyp_spin_lock(&device_spinlock);
+
+	if (device_idx >= registered_devices_nr)
+		goto out_err;
+
+	dev = &registered_devices[device_idx];
+	if (!dev->nr_msix_entries)
+		goto out_err;
+
+	/* Verify the entire MSI-X table range is hyp-owned */
+	if (hyp_check_range_owned(dev->msix_table_phys & PAGE_MASK,
+			PAGE_ALIGN(dev->msix_table_size +
+				   (dev->msix_table_phys & ~PAGE_MASK))))
+		goto out_err;
+
+	base = __hyp_va(dev->msix_table_phys);
+	for (i = 0; i < dev->nr_msix_entries; i++)
+		hyp_writel(MSIX_ENTRY_CTRL_MASKBIT,
+			   base + i * MSIX_ENTRY_SIZE + MSIX_ENTRY_VECTOR_CTRL);
+
+	hyp_spin_unlock(&device_spinlock);
+	return 0;
+
+out_err:
+	hyp_spin_unlock(&device_spinlock);
+	return -EINVAL;
+}
+
 bool pkvm_device_request_dma(struct pkvm_hyp_vcpu *hyp_vcpu, u64 *exit_code)
 {
 	int ret;

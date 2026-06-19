@@ -488,6 +488,10 @@ struct pci_dev {
 	unsigned int	rom_attr_enabled:1;	/* Display of ROM attribute enabled? */
 	unsigned int	non_mappable_bars:1;	/* BARs can't be mapped to user-space  */
 	pci_dev_flags_t dev_flags;
+#if IS_ENABLED(CONFIG_KVM)
+	unsigned int	pkvm_msix_hyp:1; /* MSI-X access via EL2 HVCs */
+	u32		pkvm_dev_idx;	 /* Index into registered_devices[] */
+#endif
 	atomic_t	enable_cnt;	/* pci_enable_device has been called */
 
 	spinlock_t	pcie_cap_lock;		/* Protects RMW ops in capability accessors */
@@ -788,6 +792,23 @@ static inline bool pci_dev_msi_enabled(struct pci_dev *pci_dev)
 }
 #else
 static inline bool pci_dev_msi_enabled(struct pci_dev *pci_dev) { return false; }
+#endif
+
+/* pKVM hyp-mediated MSI-X: EL2 proxies table reads/writes */
+#if IS_ENABLED(CONFIG_KVM)
+static inline bool pci_msix_use_hyp(struct pci_dev *dev)
+{
+	return dev->pkvm_msix_hyp;
+}
+int pkvm_msix_hyp_read_entry(u32 dev_idx, u32 entry_idx,
+			     u32 *addr_lo, u32 *addr_hi,
+			     u32 *data, u32 *ctrl);
+int pkvm_msix_hyp_write_entry(u32 dev_idx, u32 entry_idx,
+			      u32 addr_lo, u32 addr_hi,
+			      u32 data, u32 ctrl, u32 field_mask);
+int pkvm_msix_hyp_mask_all(u32 dev_idx);
+#else
+static inline bool pci_msix_use_hyp(struct pci_dev *dev) { return false; }
 #endif
 
 /* Error values that may be returned by PCI functions */

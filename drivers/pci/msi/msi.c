@@ -158,14 +158,24 @@ void __pci_read_msi_msg(struct msi_desc *entry, struct msi_msg *msg)
 	BUG_ON(dev->current_state != PCI_D0);
 
 	if (entry->pci.msi_attrib.is_msix) {
-		void __iomem *base = pci_msix_desc_addr(entry);
-
 		if (WARN_ON_ONCE(entry->pci.msi_attrib.is_virtual))
 			return;
 
-		msg->address_lo = readl(base + PCI_MSIX_ENTRY_LOWER_ADDR);
-		msg->address_hi = readl(base + PCI_MSIX_ENTRY_UPPER_ADDR);
-		msg->data = readl(base + PCI_MSIX_ENTRY_DATA);
+		if (unlikely(pci_msix_use_hyp(dev))) {
+			u32 ctrl;
+
+			pkvm_msix_hyp_read_entry(dev->pkvm_dev_idx,
+						 entry->msi_index,
+						 &msg->address_lo,
+						 &msg->address_hi,
+						 &msg->data, &ctrl);
+		} else {
+			void __iomem *base = pci_msix_desc_addr(entry);
+
+			msg->address_lo = readl(base + PCI_MSIX_ENTRY_LOWER_ADDR);
+			msg->address_hi = readl(base + PCI_MSIX_ENTRY_UPPER_ADDR);
+			msg->data = readl(base + PCI_MSIX_ENTRY_DATA);
+		}
 	} else {
 		int pos = dev->msi_cap;
 		u16 data;
@@ -208,7 +218,7 @@ static inline void pci_write_msg_msi(struct pci_dev *dev, struct msi_desc *desc,
 
 static inline void pci_write_msg_msix(struct msi_desc *desc, struct msi_msg *msg)
 {
-	void __iomem *base = pci_msix_desc_addr(desc);
+	struct pci_dev *dev = msi_desc_to_pci_dev(desc);
 	u32 ctrl = desc->pci.msix_ctrl;
 	bool unmasked = !(ctrl & PCI_MSIX_ENTRY_CTRL_MASKBIT);
 
@@ -225,15 +235,24 @@ static inline void pci_write_msg_msix(struct msi_desc *desc, struct msi_msg *msg
 	if (unmasked)
 		pci_msix_write_vector_ctrl(desc, ctrl | PCI_MSIX_ENTRY_CTRL_MASKBIT);
 
-	writel(msg->address_lo, base + PCI_MSIX_ENTRY_LOWER_ADDR);
-	writel(msg->address_hi, base + PCI_MSIX_ENTRY_UPPER_ADDR);
-	writel(msg->data, base + PCI_MSIX_ENTRY_DATA);
+	if (unlikely(pci_msix_use_hyp(dev))) {
+		/* Write addr + data via HVC (flush done internally) */
+		pkvm_msix_hyp_write_entry(dev->pkvm_dev_idx,
+					  desc->msi_index,
+					  msg->address_lo, msg->address_hi,
+					  msg->data, 0, 0x7);
+	} else {
+		void __iomem *base = pci_msix_desc_addr(desc);
+
+		writel(msg->address_lo, base + PCI_MSIX_ENTRY_LOWER_ADDR);
+		writel(msg->address_hi, base + PCI_MSIX_ENTRY_UPPER_ADDR);
+		writel(msg->data, base + PCI_MSIX_ENTRY_DATA);
+		/* Ensure that the writes are visible in the device */
+		readl(base + PCI_MSIX_ENTRY_DATA);
+	}
 
 	if (unmasked)
 		pci_msix_write_vector_ctrl(desc, ctrl);
-
-	/* Ensure that the writes are visible in the device */
-	readl(base + PCI_MSIX_ENTRY_DATA);
 }
 
 void __pci_write_msi_msg(struct msi_desc *entry, struct msi_msg *msg)
@@ -609,13 +628,23 @@ void msix_prepare_msi_desc(struct pci_dev *dev, struct msi_desc *desc)
 
 	if (!pci_msi_domain_supports(dev, MSI_FLAG_NO_MASK, DENY_LEGACY) &&
 	    !desc->pci.msi_attrib.is_virtual) {
-		void __iomem *addr = pci_msix_desc_addr(desc);
-
 		desc->pci.msi_attrib.can_mask = 1;
-		/* Workaround for SUN NIU insanity, which requires write before read */
-		if (dev->dev_flags & PCI_DEV_FLAGS_MSIX_TOUCH_ENTRY_DATA_FIRST)
-			writel(0, addr + PCI_MSIX_ENTRY_DATA);
-		desc->pci.msix_ctrl = readl(addr + PCI_MSIX_ENTRY_VECTOR_CTRL);
+
+		if (unlikely(pci_msix_use_hyp(dev))) {
+			u32 lo, hi, data, ctrl;
+
+			pkvm_msix_hyp_read_entry(dev->pkvm_dev_idx,
+						 desc->msi_index,
+						 &lo, &hi, &data, &ctrl);
+			desc->pci.msix_ctrl = ctrl;
+		} else {
+			void __iomem *addr = pci_msix_desc_addr(desc);
+
+			/* SUN NIU workaround: write before read */
+			if (dev->dev_flags & PCI_DEV_FLAGS_MSIX_TOUCH_ENTRY_DATA_FIRST)
+				writel(0, addr + PCI_MSIX_ENTRY_DATA);
+			desc->pci.msix_ctrl = readl(addr + PCI_MSIX_ENTRY_VECTOR_CTRL);
+		}
 	}
 }
 
@@ -751,7 +780,10 @@ static int msix_capability_init(struct pci_dev *dev, struct msix_entry *entries,
 		 * which takes the MSI-X mask bits into account even
 		 * when MSI-X is disabled, which prevents MSI delivery.
 		 */
-		msix_mask_all(dev->msix_base, tsize);
+		if (unlikely(pci_msix_use_hyp(dev)))
+			pkvm_msix_hyp_mask_all(dev->pkvm_dev_idx);
+		else
+			msix_mask_all(dev->msix_base, tsize);
 	}
 	pci_msix_clear_and_set_ctrl(dev, PCI_MSIX_FLAGS_MASKALL, 0);
 
@@ -959,8 +991,9 @@ int pci_msix_write_tph_tag(struct pci_dev *pdev, unsigned int index, u16 tag)
 	msi_desc->pci.msix_ctrl &= ~PCI_MSIX_ENTRY_CTRL_ST;
 	msi_desc->pci.msix_ctrl |= FIELD_PREP(PCI_MSIX_ENTRY_CTRL_ST, tag);
 	pci_msix_write_vector_ctrl(msi_desc, msi_desc->pci.msix_ctrl);
-	/* Flush the write */
-	readl(pci_msix_desc_addr(msi_desc));
+	/* Flush the write (HVC path flushes internally) */
+	if (!pci_msix_use_hyp(pdev))
+		readl(pci_msix_desc_addr(msi_desc));
 	return 0;
 }
 #endif

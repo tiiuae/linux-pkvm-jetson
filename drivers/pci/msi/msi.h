@@ -34,18 +34,29 @@ static inline void __iomem *pci_msix_desc_addr(struct msi_desc *desc)
  */
 static inline void pci_msix_write_vector_ctrl(struct msi_desc *desc, u32 ctrl)
 {
-	void __iomem *desc_addr = pci_msix_desc_addr(desc);
+	if (!desc->pci.msi_attrib.can_mask)
+		return;
 
-	if (desc->pci.msi_attrib.can_mask)
+	if (unlikely(pci_msix_use_hyp(msi_desc_to_pci_dev(desc)))) {
+		struct pci_dev *dev = msi_desc_to_pci_dev(desc);
+
+		pkvm_msix_hyp_write_entry(dev->pkvm_dev_idx,
+					  desc->msi_index,
+					  0, 0, 0, ctrl, 0x8);
+	} else {
+		void __iomem *desc_addr = pci_msix_desc_addr(desc);
+
 		writel(ctrl, desc_addr + PCI_MSIX_ENTRY_VECTOR_CTRL);
+	}
 }
 
 static inline void pci_msix_mask(struct msi_desc *desc)
 {
 	desc->pci.msix_ctrl |= PCI_MSIX_ENTRY_CTRL_MASKBIT;
 	pci_msix_write_vector_ctrl(desc, desc->pci.msix_ctrl);
-	/* Flush write to device */
-	readl(desc->pci.mask_base);
+	/* Flush write to device (HVC path flushes internally) */
+	if (!pci_msix_use_hyp(msi_desc_to_pci_dev(desc)))
+		readl(desc->pci.mask_base);
 }
 
 static inline void pci_msix_unmask(struct msi_desc *desc)
