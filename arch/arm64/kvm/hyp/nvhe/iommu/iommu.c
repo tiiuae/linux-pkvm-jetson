@@ -16,7 +16,6 @@
 #include <nvhe/mem_protect.h>
 #include <nvhe/mm.h>
 #include <nvhe/rwlock.h>
-#include <nvhe/serial.h>
 #include <nvhe/spinlock.h>
 
 #define KVM_IOMMU_MAX_DRV	5
@@ -225,15 +224,11 @@ void kvm_iommu_host_stage2_idmap(phys_addr_t start, phys_addr_t end,
 	hyp_assert_lock_held(&host_mmu.lock);
 
 	trace_iommu_idmap(start, end, prot);
-	hyp_info("iommu_idmap: enter start=0x%llx end=0x%llx prot=0x%x",
-		 (u64)start, (u64)end, (unsigned int)prot);
 	kvm_iommu_drv_lock();
 	for_each_drv(kvm_iommu_ops) {
 		kvm_iommu_ops->host_stage2_idmap(start, end, pkvm_to_iommu_prot(prot));
 	}
 	kvm_iommu_drv_unlock();
-	hyp_info("iommu_idmap: exit  start=0x%llx end=0x%llx prot=0x%x",
-		 (u64)start, (u64)end, (unsigned int)prot);
 }
 
 /* Return current vcpu or NULL for host. */

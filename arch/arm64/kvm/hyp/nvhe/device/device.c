@@ -126,20 +126,31 @@ int pkvm_device_hyp_assign_mmio(u64 pfn, u64 nr_pages)
 	u64 phys = pfn << PAGE_SHIFT;
 
 	dev = pkvm_get_device(phys, size);
-	if (!dev)
+	if (!dev) {
+		hyp_err("assign_mmio: no dev for phys=0x%llx size=0x%zx",
+			(u64)phys, size);
 		return -ENODEV;
+	}
 
 	hyp_spin_lock(&device_spinlock);
 	/* A VM already have this device, no take backs. */
 	if (dev->ctxt || dev->refcount) {
+		hyp_err("assign_mmio EBUSY phys=0x%llx size=0x%zx idx=%ld ctxt=%p refcount=%u group_id=%u nr_res=%u",
+			(u64)phys, size, (long)(dev - registered_devices),
+			dev->ctxt, (unsigned int)dev->refcount,
+			dev->group_id, dev->nr_resources);
 		ret = -EBUSY;
 		goto out_unlock;
 	}
 
 	ret = ___pkvm_host_donate_hyp_prot(pfn, nr_pages, true, PAGE_HYP_DEVICE);
-	/* Hyp have device mapping, while host may have issue cacheable writes.*/
-	if (false)
-		kvm_flush_dcache_to_poc(__hyp_va(phys), PAGE_SIZE);
+	/*
+	 * No dcache flush here: hyp's mapping is PAGE_HYP_DEVICE (non-cacheable)
+	 * and the host's BAR view is also Device via ioremap, so there are no
+	 * cacheable writes to push out. dc cvac on a Device-mapped VA is
+	 * constrained-unpredictable on some implementations and was observed
+	 * to trap-loop in EL2 on Tegra234 for high MMIO (0x20a8000000).
+	 */
 
 out_unlock:
 	hyp_spin_unlock(&device_spinlock);

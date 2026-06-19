@@ -645,7 +645,6 @@ static int pkvm_init_devices(unsigned long *out_nr, struct pkvm_device **out_dev
 
 	dev_sz = PAGE_ALIGN(size_mul(sizeof(struct pkvm_device), dev_cnt));
 	dev_base = alloc_pages_exact(dev_sz, GFP_KERNEL_ACCOUNT | __GFP_ZERO);
-
 	if (!dev_base)
 		return -ENOMEM;
 
