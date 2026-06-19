@@ -393,6 +393,7 @@ static struct iommu_ops pviommu_ops = {
 	.release_device		= pviommu_release_device,
 	.domain_alloc_paging		= pviommu_domain_alloc_paging,
 	.owner			= THIS_MODULE,
+	.msi_iova_bypass	= true,
 	.default_domain_ops = &(const struct iommu_domain_ops) {
 		.attach_dev	= pviommu_attach_dev,
 		.map_pages	= pviommu_map_pages,

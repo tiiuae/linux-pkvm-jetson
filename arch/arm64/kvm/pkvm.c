@@ -15,6 +15,7 @@
 #include <linux/iommu.h>
 #include <linux/kmemleak.h>
 #include <linux/kvm_host.h>
+#include <linux/irqchip/arm-gic-v3.h>
 #include <linux/memblock.h>
 #include <linux/mutex.h>
 #include <linux/of_address.h>
@@ -602,6 +603,19 @@ static int __pkvm_create_hyp_vm(struct kvm *kvm)
 	atomic64_add(pgd_sz, &kvm->stat.protected_hyp_mem);
 
 	init_hyp_stage2_memcache(&kvm->arch.pkvm.stage2_teardown_mc);
+
+	/* Populate ITS doorbell info for pviommu MSI mapping */
+	{
+		gpa_t guest_its_base = kvm_vgic_its_get_base(kvm);
+		phys_addr_t phys_doorbell = gic_its_get_doorbell_phys();
+
+		if (guest_its_base != (gpa_t)-1 && phys_doorbell) {
+			kvm->arch.pkvm.its_doorbell_guest_ipa =
+				(guest_its_base + GITS_TRANSLATER) & PAGE_MASK;
+			kvm->arch.pkvm.its_doorbell_phys_addr =
+				phys_doorbell & PAGE_MASK;
+		}
+	}
 
 	ret = kvm_call_refill_hyp_nvhe(__pkvm_init_vm, kvm, pgd);
 	if (ret)

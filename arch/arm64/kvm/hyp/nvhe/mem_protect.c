@@ -3728,8 +3728,18 @@ static int __pkvm_use_dma_locked(phys_addr_t phys, size_t size, struct pkvm_hyp_
 	if (!reg) {
 		enum kvm_pgtable_prot prot;
 
-		if (vm)
-			return -EINVAL;
+		if (vm) {
+			/*
+			 * VMs generally cannot create IOMMU mappings to MMIO.
+			 * Exception: the pviommu substitutes the guest's virtual
+			 * ITS address with the physical ITS doorbell for MSI
+			 * delivery. Verify the address matches.
+			 */
+			if (!vm->its_doorbell_phys_addr ||
+			    phys != vm->its_doorbell_phys_addr ||
+			    size != PAGE_SIZE)
+				return -EINVAL;
+		}
 		for (i = 0; i < nr_pages; i++) {
 			u64 addr = phys + i * PAGE_SIZE;
 
@@ -3799,7 +3809,12 @@ int __pkvm_unuse_dma(phys_addr_t phys, size_t size, struct pkvm_hyp_vm *vm)
 		return -EINVAL;
 
 	if (!range_is_memory(phys, phys + size)) {
-		WARN_ON(vm);
+		if (vm) {
+			/* Allow ITS doorbell MMIO unuse for VMs */
+			WARN_ON(!vm->its_doorbell_phys_addr ||
+				phys != vm->its_doorbell_phys_addr ||
+				size != PAGE_SIZE);
+		}
 		return 0;
 	}
 	host_lock_component();
