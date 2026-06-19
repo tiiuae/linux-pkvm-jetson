@@ -27,19 +27,20 @@ unsigned long registered_devices_nr;
  */
 static DEFINE_HYP_SPINLOCK(device_spinlock);
 
-int pkvm_init_devices(void)
+int pkvm_init_devices(unsigned long nr_devs, struct pkvm_device *devs)
 {
 	size_t dev_sz;
 	int ret;
 
-	registered_devices = kern_hyp_va(registered_devices);
-	dev_sz = PAGE_ALIGN(size_mul(sizeof(struct pkvm_device),
-				     registered_devices_nr));
+	registered_devices_nr = nr_devs;
+	registered_devices = kern_hyp_va(devs);
+	dev_sz = PAGE_ALIGN(size_mul(sizeof(struct pkvm_device), nr_devs));
 
 	ret = __pkvm_host_donate_hyp(hyp_virt_to_phys(registered_devices) >> PAGE_SHIFT,
 				     dev_sz >> PAGE_SHIFT);
 	if (ret)
 		registered_devices_nr = 0;
+
 	return ret;
 }
 
@@ -160,6 +161,11 @@ static int pkvm_device_reset(struct pkvm_device *dev, bool host_to_guest)
 
 	hyp_assert_lock_held(&device_spinlock);
 
+	/*
+	 * TODO: IOMMU modules should register per-device reset handlers via
+	 * pkvm_device_register_reset() to clear device state during assignment
+	 * transitions. Until then, skip reset if no handler is registered.
+	 */
 	if (dev->reset_handler) {
 		ret = dev->reset_handler(dev->cookie, host_to_guest);
 		if (ret)
@@ -239,7 +245,8 @@ static int __pkvm_group_assign(u32 group_id, struct pkvm_hyp_vm *vm)
 int pkvm_host_map_guest_mmio(struct pkvm_hyp_vcpu *hyp_vcpu, u64 pfn, u64 gfn)
 {
 	int ret = 0;
-	struct pkvm_device *dev = pkvm_get_device_by_addr(hyp_pfn_to_phys(pfn));
+	u64 phys = hyp_pfn_to_phys(pfn);
+	struct pkvm_device *dev = pkvm_get_device_by_addr(phys);
 	struct pkvm_hyp_vm *vm = pkvm_hyp_vcpu_to_hyp_vm(hyp_vcpu);
 
 	if (!dev)
@@ -253,12 +260,12 @@ int pkvm_host_map_guest_mmio(struct pkvm_hyp_vcpu *hyp_vcpu, u64 pfn, u64 gfn)
 		 * group is assigned to the hypervisor.
 		 */
 		ret = __pkvm_group_assign(dev->group_id, vm);
+		if (ret)
+			goto out_ret;
 	} else if (dev->ctxt != vm) {
-		ret = -EBUSY;
-	}
-
-	if (ret)
+		ret = -EBUSY; /* device owned by another VM */
 		goto out_ret;
+	}
 
 	ret = __pkvm_install_guest_mmio(hyp_vcpu, pfn, gfn);
 
@@ -379,10 +386,20 @@ int pkvm_devices_get_context(u64 iommu_id, u32 endpoint_id, struct pkvm_hyp_vm *
 		return 0;
 
 	hyp_spin_lock(&device_spinlock);
-	if (dev->ctxt != vm)
+	if (dev->ctxt == NULL && vm) {
+		/*
+		 * Device not yet assigned to any VM. Assign the whole group
+		 * now, matching what pkvm_host_map_guest_mmio and
+		 * pkvm_device_request_dma do on first access.
+		 */
+		ret = __pkvm_group_assign(dev->group_id, vm);
+		if (!ret)
+			hyp_refcount_inc(dev->refcount);
+	} else if (dev->ctxt != vm) {
 		ret = -EPERM;
-	else
+	} else {
 		hyp_refcount_inc(dev->refcount);
+	}
 	hyp_spin_unlock(&device_spinlock);
 	return ret;
 }

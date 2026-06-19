@@ -215,7 +215,7 @@ static inline int pkvm_init_power_domain(struct kvm_power_domain *pd,
 	}
 }
 
-int pkvm_init_devices(void);
+int pkvm_init_devices(unsigned long nr_devs, struct pkvm_device *devs);
 int pkvm_device_hyp_assign_mmio(u64 pfn, u64 nr_pages);
 int pkvm_device_reclaim_mmio(u64 pfn, u64 nr_pages);
 int pkvm_host_map_guest_mmio(struct pkvm_hyp_vcpu *hyp_vcpu, u64 pfn, u64 gfn);

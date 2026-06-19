@@ -1708,26 +1708,29 @@ static inline bool kvm_arch_has_noncoherent_dma(struct kvm *kvm)
 #endif
 
 #ifdef __KVM_HAVE_ARCH_ASSIGNED_DEVICE_GROUP
-int kvm_arch_assign_device(struct device *dev);
-int kvm_arch_assign_group(struct iommu_group *group);
-void kvm_arch_reclaim_device(struct device *dev);
-void kvm_arch_reclaim_group(struct iommu_group *group);
+int kvm_arch_assign_device(struct device *dev, struct kvm *kvm);
+int kvm_arch_assign_group(struct iommu_group *group, struct kvm *kvm);
+void kvm_arch_reclaim_device(struct device *dev, struct kvm *kvm);
+void kvm_arch_reclaim_group(struct iommu_group *group, struct kvm *kvm);
 #else
-static inline int kvm_arch_assign_device(struct device *dev)
+static inline int kvm_arch_assign_device(struct device *dev, struct kvm *kvm)
 {
 	return 0;
 }
 
-static inline int kvm_arch_assign_group(struct iommu_group *group)
+static inline int kvm_arch_assign_group(struct iommu_group *group,
+					struct kvm *kvm)
 {
 	return 0;
 }
 
-static inline void kvm_arch_reclaim_device(struct device *dev)
+static inline void kvm_arch_reclaim_device(struct device *dev,
+					   struct kvm *kvm)
 {
 }
 
-static inline void kvm_arch_reclaim_group(struct iommu_group *group)
+static inline void kvm_arch_reclaim_group(struct iommu_group *group,
+					  struct kvm *kvm)
 {
 }
 #endif

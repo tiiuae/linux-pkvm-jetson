@@ -19,6 +19,7 @@
 #include <linux/of_address.h>
 #include <linux/of_fdt.h>
 #include <linux/of_reserved_mem.h>
+#include <linux/pci.h>
 #include <linux/platform_device.h>
 #include <linux/list_sort.h>
 #include <linux/sort.h>
@@ -64,7 +65,7 @@ phys_addr_t hyp_mem_base;
 phys_addr_t hyp_mem_size;
 
 extern struct pkvm_device *kvm_nvhe_sym(registered_devices);
-extern u32 kvm_nvhe_sym(registered_devices_nr);
+extern unsigned long kvm_nvhe_sym(registered_devices_nr);
 
 extern struct pkvm_mediated_device *kvm_nvhe_sym(mediated_devices);
 extern u32 kvm_nvhe_sym(mediated_devices_nr);
@@ -506,117 +507,147 @@ int pkvm_init_host_vm(struct kvm *kvm, unsigned long type)
 	return 0;
 }
 
-static int pkvm_register_device(struct of_phandle_args *args,
-				struct pkvm_device *dev)
+/*
+ * Register a device for pKVM assignment using the IOMMU driver's
+ * get_device_iommu_id callback. Works for PCI devices behind iommu-map.
+ */
+static int pkvm_register_device_from_dev(struct device *dev, u32 group_id,
+					 struct pkvm_device *pkvm_dev)
 {
-	struct device_node *np = args->np;
-	struct of_phandle_args iommu_spec;
-	u32 group_id = args->args[0];
-	struct resource res;
-	u64 base, size;
-	pkvm_handle_t iommu_id;
+	int num_ids, i, ret;
+	struct resource *res;
+	struct pci_dev *pdev;
 	unsigned int j = 0;
-	int ret;
 
-	/* Parse regs */
-	while (!of_address_to_resource(np, j, &res)) {
-		if (j >= PKVM_DEVICE_MAX_RESOURCE)
-			return -E2BIG;
+	num_ids = kvm_iommu_device_num_ids(dev);
+	if (num_ids <= 0)
+		return -ENOENT;
 
-		base = res.start;
-		size = resource_size(&res);
-		if (!PAGE_ALIGNED(base) || !PAGE_ALIGNED(size))
-			return -EINVAL;
-
-		dev->resources[j].base = base;
-		dev->resources[j].size = size;
-		j++;
+	/* For PCI devices, extract BAR resources */
+	if (dev_is_pci(dev)) {
+		pdev = to_pci_dev(dev);
+		for (i = 0; i < PCI_STD_NUM_BARS && j < PKVM_DEVICE_MAX_RESOURCE; i++) {
+			res = &pdev->resource[i];
+			if (!resource_size(res))
+				continue;
+			if (!(res->flags & (IORESOURCE_MEM | IORESOURCE_IO)))
+				continue;
+			if (PAGE_ALIGNED(res->start) && PAGE_ALIGNED(resource_size(res))) {
+				pkvm_dev->resources[j].base = res->start;
+				pkvm_dev->resources[j].size = resource_size(res);
+				j++;
+			}
+		}
 	}
-	dev->nr_resources = j;
+	pkvm_dev->nr_resources = j;
 
-	/* Parse iommus */
-	j = 0;
-	while (!of_parse_phandle_with_args(np, "iommus",
-					   "#iommu-cells",
-					   j, &iommu_spec)) {
-		if (iommu_spec.args_count != 1) {
-			kvm_err("[Devices] Unsupported binding for %s, expected <&iommu id>",
-				np->full_name);
-			return -EINVAL;
+	/* Extract MSI-X table location for hyp-mediated access */
+	if (dev_is_pci(dev) && pdev->msix_cap) {
+		u32 table_reg;
+		u16 flags;
+		u8 bir;
+		u32 table_offset;
+		u16 nr_entries;
+
+		pci_read_config_word(pdev, pdev->msix_cap + PCI_MSIX_FLAGS,
+				     &flags);
+		pci_read_config_dword(pdev, pdev->msix_cap + PCI_MSIX_TABLE,
+				      &table_reg);
+
+		bir = table_reg & PCI_MSIX_TABLE_BIR;
+		table_offset = table_reg & PCI_MSIX_TABLE_OFFSET;
+		nr_entries = (flags & PCI_MSIX_FLAGS_QSIZE) + 1;
+
+		if (bir < PCI_STD_NUM_BARS && pci_resource_start(pdev, bir)) {
+			pkvm_dev->msix_table_phys =
+				pci_resource_start(pdev, bir) + table_offset;
+			pkvm_dev->nr_msix_entries = nr_entries;
+			pkvm_dev->msix_table_size =
+				nr_entries * PCI_MSIX_ENTRY_SIZE;
+			pkvm_dev->msix_bir = bir;
 		}
+	}
 
-		if (j >= PKVM_DEVICE_MAX_RESOURCE) {
-			of_node_put(iommu_spec.np);
-			return -E2BIG;
-		}
+	/* Get IOMMU stream IDs via driver callback */
+	for (i = 0; i < num_ids && i < PKVM_DEVICE_MAX_IOMMU; i++) {
+		pkvm_handle_t iommu_id;
+		u32 sid;
 
-		ret = kvm_get_iommu_id_by_of(iommu_spec.np, &iommu_id);
+		ret = kvm_iommu_device_id(dev, i, &iommu_id, &sid);
 		if (ret)
 			return ret;
-
-		dev->iommus[j].id = iommu_id;
-		dev->iommus[j].endpoint = iommu_spec.args[0];
-		of_node_put(iommu_spec.np);
-		j++;
+		pkvm_dev->iommus[i].id = iommu_id;
+		pkvm_dev->iommus[i].endpoint = sid;
 	}
-
-	dev->nr_iommus = j;
-	dev->ctxt = NULL;
-	dev->refcount = 0;
-	dev->reset_handler = NULL;
-	dev->group_id = group_id;
+	pkvm_dev->nr_iommus = i;
+	pkvm_dev->ctxt = NULL;
+	pkvm_dev->refcount = 0;
+	pkvm_dev->reset_handler = NULL;
+	pkvm_dev->group_id = group_id;
 
 	return 0;
 }
 
 static int pkvm_init_devices(void)
 {
-	struct device_node *np;
+	struct pci_dev *pdev = NULL;
 	int idx = 0, ret = 0, dev_cnt = 0;
 	size_t dev_sz;
 	struct pkvm_device *dev_base;
+	u32 auto_group_id = 0;
 
-	for_each_compatible_node (np, NULL, PKVM_DEVICE_ASSIGN_COMPAT) {
-		struct of_phandle_args args;
-		int cnt = 0;
+	/*
+	 * Auto-discover all PCI devices that have IOMMU (SMMU) bindings.
+	 * This makes every SMMU-backed PCI device assignable to pKVM
+	 * protected guests without requiring "pkvm,device-assignment" DT nodes.
+	 */
 
-		while (!of_parse_phandle_with_fixed_args(np, "devices", 1, cnt, &args)) {
-			cnt++;
-			of_node_put(args.np);
-		}
-		dev_cnt += cnt;
+	/* Pass 1: count PCI devices with IOMMU IDs */
+	for_each_pci_dev(pdev) {
+		if (kvm_iommu_device_num_ids(&pdev->dev) > 0)
+			dev_cnt++;
 	}
-	kvm_info("Found %d assignable devices", dev_cnt);
+
+	kvm_info("Found %d assignable devices (auto-discovered)", dev_cnt);
 
 	if (!dev_cnt)
 		return 0;
 
 	dev_sz = PAGE_ALIGN(size_mul(sizeof(struct pkvm_device), dev_cnt));
-
 	dev_base = alloc_pages_exact(dev_sz, GFP_KERNEL_ACCOUNT | __GFP_ZERO);
 
 	if (!dev_base)
 		return -ENOMEM;
 
-	for_each_compatible_node(np, NULL, PKVM_DEVICE_ASSIGN_COMPAT) {
-		struct of_phandle_args args;
-		int cnt = 0;
+	/* Pass 2: register each device */
+	pdev = NULL;
+	for_each_pci_dev(pdev) {
+		if (kvm_iommu_device_num_ids(&pdev->dev) <= 0)
+			continue;
 
-		while (!of_parse_phandle_with_fixed_args(np, "devices", 1, cnt, &args)) {
-			ret = pkvm_register_device(&args, &dev_base[idx]);
-			of_node_put(args.np);
-			if (ret) {
-				of_node_put(np);
-				goto out_free;
+		ret = pkvm_register_device_from_dev(&pdev->dev,
+						    auto_group_id++,
+						    &dev_base[idx]);
+		if (ret) {
+			if (ret == -ENOENT) {
+				ret = 0;
+				continue;
 			}
-			cnt++;
-			idx++;
+			kvm_err("Failed to register %s: %d", dev_name(&pdev->dev), ret);
+			goto out_free;
 		}
+		pdev->pkvm_dev_idx = idx;
+		kvm_info("Registered %s (group %u, %d stream IDs, %d MSI-X, %d resources) for assignment",
+			 dev_name(&pdev->dev), auto_group_id - 1,
+			 dev_base[idx].nr_iommus,
+			 dev_base[idx].nr_msix_entries,
+			 dev_base[idx].nr_resources);
+		idx++;
 	}
 
-	kvm_nvhe_sym(registered_devices_nr) = dev_cnt;
+	kvm_nvhe_sym(registered_devices_nr) = idx;
 	kvm_nvhe_sym(registered_devices) = dev_base;
-	return ret;
+	return 0;
 
 out_free:
 	free_pages_exact(dev_base, dev_sz);
@@ -808,13 +839,22 @@ static int __init finalize_pkvm(void)
 	if (ret)
 		pkvm_firmware_rmem_clear();
 
+	/*
+	 * The pKVM IOMMU driver just probed the SMMU. PCI devices that
+	 * were deferred (waiting for their IOMMU) need to be re-probed
+	 * so they get iommu_fwspec before we scan for assignable devices.
+	 */
+	wait_for_device_probe();
+
 	ret = pkvm_init_devices();
 	if (ret) {
 		pr_err("Failed to init kvm devices %d\n", ret);
 		pkvm_firmware_rmem_clear();
 	}
 
-	ret = kvm_call_hyp_nvhe(__pkvm_devices_init);
+	ret = kvm_call_hyp_nvhe(__pkvm_devices_init,
+			       (unsigned long)kvm_nvhe_sym(registered_devices_nr),
+			       (unsigned long)kvm_nvhe_sym(registered_devices));
 	if (ret)
 		pr_warn("Assignable devices failed to initialize in the hypervisor %d\n", ret);
 
@@ -1990,84 +2030,151 @@ static int __pkvm_reclaim_resource(struct resource *r)
 
 static int __pkvm_arch_assign_device(struct device *dev, void *data)
 {
-	struct platform_device *pdev;
-	struct resource *r;
-	int index = 0;
 	int ret = 0;
 
-	if (!dev_is_platform(dev))
-		return -EOPNOTSUPP;
+	if (dev_is_platform(dev)) {
+		struct platform_device *pdev = to_platform_device(dev);
+		struct resource *r;
+		int index = 0;
 
-	pdev = to_platform_device(dev);
-
-	while ((r = platform_get_resource(pdev, IORESOURCE_MEM, index++))) {
-		ret = __pkvm_donate_resource(r);
-		if (ret)
-			break;
-	}
-
-	if (ret) {
-		while (index--) {
-			r = platform_get_resource(pdev, IORESOURCE_MEM, index);
-			__pkvm_reclaim_resource(r);
+		while ((r = platform_get_resource(pdev, IORESOURCE_MEM, index++))) {
+			ret = __pkvm_donate_resource(r);
+			if (ret)
+				break;
 		}
+
+		if (ret) {
+			while (index--) {
+				r = platform_get_resource(pdev, IORESOURCE_MEM, index);
+				__pkvm_reclaim_resource(r);
+			}
+		}
+	} else if (dev_is_pci(dev)) {
+		struct pci_dev *pdev = to_pci_dev(dev);
+		int i;
+
+		for (i = 0; i < PCI_STD_NUM_BARS; i++) {
+			struct resource *r = &pdev->resource[i];
+
+			if (!resource_size(r))
+				continue;
+			if (!(r->flags & IORESOURCE_MEM))
+				continue;
+
+			ret = __pkvm_donate_resource(r);
+			if (ret)
+				break;
+		}
+
+		if (ret) {
+			while (i--) {
+				struct resource *r = &pdev->resource[i];
+
+				if (!resource_size(r))
+					continue;
+				if (!(r->flags & IORESOURCE_MEM))
+					continue;
+
+				__pkvm_reclaim_resource(r);
+			}
+		}
+	} else {
+		return -EOPNOTSUPP;
 	}
+
 	return ret;
 }
 
 static int __pkvm_arch_reclaim_device(struct device *dev, void *data)
 {
-	struct platform_device *pdev;
-	struct resource *r;
-	int index = 0;
+	if (dev_is_platform(dev)) {
+		struct platform_device *pdev = to_platform_device(dev);
+		struct resource *r;
+		int index = 0;
 
-	if (!dev)
-		return -EINVAL;
-	if (!dev_is_platform(dev))
-		return -EOPNOTSUPP;
+		while ((r = platform_get_resource(pdev, IORESOURCE_MEM, index++)))
+			__pkvm_reclaim_resource(r);
+	} else if (dev_is_pci(dev)) {
+		struct pci_dev *pdev = to_pci_dev(dev);
+		int i;
 
-	pdev = to_platform_device(dev);
+		for (i = 0; i < PCI_STD_NUM_BARS; i++) {
+			struct resource *r = &pdev->resource[i];
 
-	while ((r = platform_get_resource(pdev, IORESOURCE_MEM, index++)))
-		__pkvm_reclaim_resource(r);
+			if (!resource_size(r))
+				continue;
+			if (!(r->flags & IORESOURCE_MEM))
+				continue;
+
+			__pkvm_reclaim_resource(r);
+		}
+	}
 
 	return 0;
 }
 
-int kvm_arch_assign_device(struct device *dev)
-{
-	if (!is_protected_kvm_enabled())
-		return 0;
-
-	return __pkvm_arch_assign_device(dev, NULL);
-}
-
-int kvm_arch_assign_group(struct iommu_group *group)
+int kvm_arch_assign_device(struct device *dev, struct kvm *kvm)
 {
 	int ret;
 
 	if (!is_protected_kvm_enabled())
 		return 0;
 
-	ret = iommu_group_for_each_dev(group, NULL, __pkvm_arch_assign_device);
+	if (!kvm_vm_is_protected(kvm))
+		return 0;
 
-	if (ret)
-		iommu_group_for_each_dev(group, NULL, __pkvm_arch_reclaim_device);
+	ret = __pkvm_arch_assign_device(dev, NULL);
+	if (!ret && dev_is_pci(dev)) {
+		struct pci_dev *pdev = to_pci_dev(dev);
 
+		if (pdev->msix_cap)
+			pdev->pkvm_msix_hyp = 1;
+	}
 	return ret;
 }
 
-void kvm_arch_reclaim_device(struct device *dev)
+int kvm_arch_assign_group(struct iommu_group *group, struct kvm *kvm)
+{
+	int ret;
+
+	if (!is_protected_kvm_enabled())
+		return 0;
+
+	if (!kvm_vm_is_protected(kvm))
+		return 0;
+
+	ret = iommu_group_for_each_dev(group, NULL, __pkvm_arch_assign_device);
+
+	if (ret) {
+		iommu_group_for_each_dev(group, NULL, __pkvm_arch_reclaim_device);
+		return ret;
+	}
+
+	iommu_group_for_each_dev(group, NULL, __pkvm_arch_set_msix_hyp);
+
+	return 0;
+}
+
+void kvm_arch_reclaim_device(struct device *dev, struct kvm *kvm)
 {
 	if (!is_protected_kvm_enabled())
 		return;
 
+	if (!kvm_vm_is_protected(kvm))
+		return;
+
 	__pkvm_arch_reclaim_device(dev, NULL);
+
+	if (dev_is_pci(dev))
+		to_pci_dev(dev)->pkvm_msix_hyp = 0;
 }
 
-void kvm_arch_reclaim_group(struct iommu_group *group)
+void kvm_arch_reclaim_group(struct iommu_group *group, struct kvm *kvm)
 {
 	if (!is_protected_kvm_enabled())
+		return;
+
+	if (!kvm_vm_is_protected(kvm))
 		return;
 
 	iommu_group_for_each_dev(group, NULL, __pkvm_arch_reclaim_device);

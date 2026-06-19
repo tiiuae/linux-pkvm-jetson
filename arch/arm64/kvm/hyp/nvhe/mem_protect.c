@@ -19,6 +19,7 @@
 #include <nvhe/iommu.h>
 #include <nvhe/memory.h>
 #include <nvhe/mem_protect.h>
+#include <nvhe/pkvm.h>
 #include <nvhe/mm.h>
 #include <nvhe/modules.h>
 
@@ -2259,8 +2260,15 @@ unlock:
 	return ret;
 }
 
-int __pkvm_host_share_guest(u64 pfn, u64 gfn, u64 nr_pages, struct pkvm_hyp_vcpu *vcpu,
-			    enum kvm_pgtable_prot prot)
+/*
+ * Share host MMIO with a non-protected guest. Unlike RAM sharing, MMIO pages
+ * don't have vmemmap entries, so we validate host ownership via the host
+ * stage-2 page table (___host_check_page_state_range walks host stage-2 PTEs
+ * for non-memory addresses via host_get_mmio_page_state).
+ */
+static int __pkvm_host_share_guest_mmio(u64 pfn, u64 gfn, u64 nr_pages,
+					struct pkvm_hyp_vcpu *vcpu,
+					enum kvm_pgtable_prot prot)
 {
 	struct pkvm_hyp_vm *vm = pkvm_hyp_vcpu_to_hyp_vm(vcpu);
 	u64 phys = hyp_pfn_to_phys(pfn);
@@ -2268,7 +2276,9 @@ int __pkvm_host_share_guest(u64 pfn, u64 gfn, u64 nr_pages, struct pkvm_hyp_vcpu
 	u64 size;
 	int ret;
 
-	if (prot & ~KVM_PGTABLE_PROT_RWX)
+	/* MMIO prot includes DEVICE or NORMAL_NC bits beyond RWX — allow them */
+	if (prot & ~(KVM_PGTABLE_PROT_RWX | KVM_PGTABLE_PROT_DEVICE |
+		     KVM_PGTABLE_PROT_NORMAL_NC))
 		return -EINVAL;
 
 	if (!pfn_range_is_valid(pfn, nr_pages))
@@ -2279,6 +2289,63 @@ int __pkvm_host_share_guest(u64 pfn, u64 gfn, u64 nr_pages, struct pkvm_hyp_vcpu
 		return ret;
 
 	if (phys >= phys + size || ipa >= ipa + size)
+		return -EINVAL;
+
+	host_lock_component();
+
+	/* Verify host owns this MMIO range (checks host stage-2 PTE state) */
+	ret = ___host_check_page_state_range(phys, size, PKVM_PAGE_OWNED, 0);
+	if (ret)
+		goto unlock;
+
+	guest_lock_component(vm);
+
+	ret = __guest_check_page_state_range(vm, ipa, size, PKVM_NOPAGE);
+	if (ret)
+		goto unlock_guest;
+
+	/* Map MMIO into guest stage-2 — no vmemmap state tracking for MMIO */
+	WARN_ON(kvm_pgtable_stage2_map(&vm->pgt, ipa, size, phys,
+				       pkvm_mkstate(prot, PKVM_PAGE_SHARED_BORROWED),
+				       &vcpu->vcpu.arch.stage2_mc, 0));
+
+unlock_guest:
+	guest_unlock_component(vm);
+unlock:
+	host_unlock_component();
+
+	return ret;
+}
+
+int __pkvm_host_share_guest(u64 pfn, u64 gfn, u64 nr_pages, struct pkvm_hyp_vcpu *vcpu,
+			    enum kvm_pgtable_prot prot)
+{
+	struct pkvm_hyp_vm *vm = pkvm_hyp_vcpu_to_hyp_vm(vcpu);
+	u64 phys = hyp_pfn_to_phys(pfn);
+	u64 ipa = hyp_pfn_to_phys(gfn);
+	u64 size;
+	int ret;
+
+	if (!pfn_range_is_valid(pfn, nr_pages))
+		return -EINVAL;
+
+	ret = __guest_check_transition_size(phys, ipa, nr_pages, &size);
+	if (ret)
+		return ret;
+
+	if (phys >= phys + size || ipa >= ipa + size)
+		return -EINVAL;
+
+	/*
+	 * If the range is entirely non-memory (MMIO), route to the MMIO
+	 * share path which validates via host stage-2 instead of vmemmap.
+	 * Must be checked before the prot filter below, since MMIO mappings
+	 * carry KVM_PGTABLE_PROT_DEVICE or KVM_PGTABLE_PROT_NORMAL_NC.
+	 */
+	if (!addr_is_memory(phys) && !addr_is_memory(phys + size - 1))
+		return __pkvm_host_share_guest_mmio(pfn, gfn, nr_pages, vcpu, prot);
+
+	if (prot & ~KVM_PGTABLE_PROT_RWX)
 		return -EINVAL;
 
 	ret = check_range_allowed_memory(phys, phys + size);
@@ -2357,7 +2424,7 @@ static int __check_host_shared_guest(struct pkvm_hyp_vm *vm, u64 *__phys, u64 ip
 		return -EINVAL;
 
 	ret = check_range_allowed_memory(phys, phys + size);
-	if (WARN_ON(ret))
+	if (ret)
 		return ret;
 
 	for_each_hyp_page(page, phys, size) {
@@ -2386,8 +2453,26 @@ int __pkvm_host_unshare_guest(u64 gfn, u64 nr_pages, struct pkvm_hyp_vm *vm)
 	guest_lock_component(vm);
 
 	ret = __check_host_shared_guest(vm, &phys, ipa, size);
-	if (ret)
+	if (ret) {
+		/*
+		 * RAM unshare check failed. This might be an MMIO mapping
+		 * created by __pkvm_host_share_guest_mmio() which doesn't
+		 * use page state tracking. Look up the guest PTE to check.
+		 */
+		kvm_pte_t pte;
+		s8 level;
+
+		if (!kvm_pgtable_get_leaf(&vm->pgt, ipa, &pte, &level) &&
+		    kvm_pte_valid(pte)) {
+			phys = kvm_pte_to_phys(pte);
+			if (!addr_is_memory(phys)) {
+				ret = kvm_pgtable_stage2_unmap(&vm->pgt,
+							      ipa, size);
+				goto unlock;
+			}
+		}
 		goto unlock;
+	}
 
 	ret = kvm_pgtable_stage2_unmap(&vm->pgt, ipa, size);
 	if (ret)
@@ -2669,9 +2754,16 @@ int __pkvm_install_guest_mmio(struct pkvm_hyp_vcpu *hyp_vcpu, u64 pfn, u64 gfn)
 
 	hyp_lock_component();
 	guest_lock_component(vm);
-	ret = __pkvm_remove_ioguard_page(vm, ipa);
-	if (ret)
-		goto out_unlock;
+	/*
+	 * If MMIO guard is enrolled, remove the ioguard annotation first
+	 * to transition the IPA from NOPAGE|MMIO to NOPAGE before donation.
+	 * Without MMIO guard, the IPA is already in NOPAGE state.
+	 */
+	if (test_bit(KVM_ARCH_FLAG_MMIO_GUARD, &vm->kvm.arch.flags)) {
+		ret = __pkvm_remove_ioguard_page(vm, ipa);
+		if (ret)
+			goto out_unlock;
+	}
 	ret = pkvm_hyp_donate_guest(hyp_vcpu, pfn, gfn);
 out_unlock:
 	guest_unlock_component(vm);
