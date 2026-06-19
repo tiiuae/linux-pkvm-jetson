@@ -2502,21 +2502,23 @@ static int smmu_host_stage2_idmap(phys_addr_t start, phys_addr_t end, int prot)
 			start += mapped;
 		}
 	} else {
-		drv_info("idmap unmap: enter start=0x%llx end=0x%llx size=0x%zx",
-			 (u64)start, (u64)end, size);
+		/* Trace only larger ranges (BAR-sized) to skip routine 4K page noise. */
+		bool trace = size > PAGE_SIZE;
+
+		if (trace)
+			drv_info("idmap unmap: enter start=0x%llx end=0x%llx size=0x%zx",
+				 (u64)start, (u64)end, size);
 		while (size) {
 			iommu_iotlb_gather_init(&gather);
 			pgsize = smmu_pgsize_idmap(size, start, pgtable->cfg.pgsize_bitmap);
 			if (!pgsize) {
-				drv_info("idmap unmap: pgsize=0, stop size=0x%zx", size);
+				if (trace)
+					drv_info("idmap unmap: pgsize=0, stop size=0x%zx", size);
 				return 0;
 			}
 			pgcount = size / pgsize;
-			drv_info("idmap unmap: before start=0x%llx pgsize=0x%zx pgcount=0x%zx",
-				 (u64)start, pgsize, pgcount);
 			unmapped = pgtable->ops.unmap_pages(&pgtable->ops, start,
 							    pgsize, pgcount, &gather);
-			drv_info("idmap unmap: after  unmapped=0x%zx", unmapped);
 			/*
 			 * io-pgtable-arm returns -ENOENT (cast to size_t as
 			 * 0xfff..fe) when the entry doesn't exist. The NO_WARN
@@ -2526,15 +2528,17 @@ static int smmu_host_stage2_idmap(phys_addr_t start, phys_addr_t end, int prot)
 			 * never faulted in.
 			 */
 			if ((ssize_t)unmapped <= 0) {
-				drv_info("idmap unmap: no-op/err return unmapped=0x%zx size_remaining=0x%zx",
-					 unmapped, size);
+				if (trace)
+					drv_info("idmap unmap: no-op/err unmapped=0x%zx remaining=0x%zx",
+						 unmapped, size);
 				return 0;
 			}
 
 			size -= unmapped;
 			start += unmapped;
 		}
-		drv_info("idmap unmap: exit clean");
+		if (trace)
+			drv_info("idmap unmap: exit clean");
 	}
 
 	return 0;
