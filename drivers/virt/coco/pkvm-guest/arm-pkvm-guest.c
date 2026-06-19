@@ -206,6 +206,9 @@ void pkvm_init_hyp_services(void)
 	pkvm_func_range = !!res.a1;
 	pr_info("arm-pkvm-guest: pkvm_func_range = %d", pkvm_func_range);
 
+	pr_info("pKVM guest: granule=%lu func_range=%d\n",
+		(unsigned long)pkvm_granule, pkvm_func_range);
+
 	if (kvm_arm_hyp_service_available(ARM_SMCCC_KVM_FUNC_MEM_SHARE) &&
 	    kvm_arm_hyp_service_available(ARM_SMCCC_KVM_FUNC_MEM_UNSHARE))
 	    arm64_mem_crypt_ops_register(&pkvm_crypt_ops);
@@ -216,9 +219,15 @@ void pkvm_init_hyp_services(void)
 	arm_smccc_1_1_invoke(ARM_SMCCC_VENDOR_HYP_KVM_MMIO_GUARD_ENROLL_FUNC_ID, &res);
 	WARN_ON((long)res.a0 < 0);
 
-	if (kvm_arm_hyp_service_available(ARM_SMCCC_KVM_FUNC_MMIO_GUARD_MAP) &&
-	    __dram_is_aligned(pkvm_granule))
+	if (!kvm_arm_hyp_service_available(ARM_SMCCC_KVM_FUNC_MMIO_GUARD_MAP)) {
+		pr_warn("pKVM guest: MMIO_GUARD_MAP not available\n");
+	} else if (!__dram_is_aligned(pkvm_granule)) {
+		pr_warn("pKVM guest: DRAM not aligned to granule %lu, MMIO guard hook NOT registered\n",
+			(unsigned long)pkvm_granule);
+	} else {
+		pr_info("pKVM guest: registering MMIO guard ioremap hook\n");
 		arm64_ioremap_prot_hook_register(&mmio_guard_ioremap_hook);
+	}
 
 #ifdef CONFIG_VIRTIO_BALLOON_HYP_OPS
 	virtio_balloon_hyp_ops = &pkvm_virtio_balloon_hyp_ops;
