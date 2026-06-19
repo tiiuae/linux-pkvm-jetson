@@ -199,6 +199,7 @@ int pkvm_host_hvc_pd(u64 device_id, u64 on);
 
 bool pkvm_device_request_mmio(struct pkvm_hyp_vcpu *hyp_vcpu, u64 *exit_code);
 bool pkvm_device_request_dma(struct pkvm_hyp_vcpu *hyp_vcpu, u64 *exit_code);
+bool pkvm_hyp_handle_msix_page_dabt(struct kvm_vcpu *vcpu);
 void pkvm_devices_teardown(struct pkvm_hyp_vm *vm);
 int pkvm_devices_get_context(u64 iommu_id, u32 endpoint_id, struct pkvm_hyp_vm *vm);
 void pkvm_devices_put_context(u64 iommu_id, u32 endpoint_id);
