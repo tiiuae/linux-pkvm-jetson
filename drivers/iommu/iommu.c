@@ -3912,8 +3912,10 @@ int iommu_dma_prepare_msi(struct msi_desc *desc, phys_addr_t msi_addr)
 		return 0;
 
 	mutex_lock(&group->mutex);
-	/* An IDENTITY domain must pass through */
-	if (group->domain && group->domain->type != IOMMU_DOMAIN_IDENTITY) {
+	/* An IDENTITY domain must pass through; so must drivers that
+	 * manage MSI doorbell mappings externally (e.g. pviommu). */
+	if (group->domain && group->domain->type != IOMMU_DOMAIN_IDENTITY &&
+	    !(group->domain->owner && group->domain->owner->msi_iova_bypass)) {
 		switch (group->domain->cookie_type) {
 		case IOMMU_COOKIE_DMA_MSI:
 		case IOMMU_COOKIE_DMA_IOVA:
@@ -3921,6 +3923,14 @@ int iommu_dma_prepare_msi(struct msi_desc *desc, phys_addr_t msi_addr)
 			break;
 		case IOMMU_COOKIE_IOMMUFD:
 			ret = iommufd_sw_msi(group->domain, desc, msi_addr);
+			break;
+		case IOMMU_COOKIE_NONE:
+			/*
+			 * No host-side DMA cookie — skip IOMMU MSI remapping.
+			 * This occurs with pKVM VFIO passthrough where the
+			 * blocking domain has no DMA management layer; IOMMU
+			 * MSI doorbell mappings are not managed by the host.
+			 */
 			break;
 		default:
 			ret = -EOPNOTSUPP;

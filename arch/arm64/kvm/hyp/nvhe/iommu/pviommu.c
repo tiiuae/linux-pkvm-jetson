@@ -12,6 +12,19 @@
 #include <nvhe/pkvm.h>
 #include <nvhe/pviommu.h>
 #include <nvhe/pviommu-host.h>
+#include <nvhe/serial.h>
+
+/*
+ * Diagnostic for pviommu HVC failures. The SMCCC return (a0) always carries a
+ * standard status so the host's smccc_to_linux_ret() can decode it; the
+ * per-stage detail is logged here instead of being packed into magic a0
+ * values, and is compiled out of production builds.
+ */
+#ifdef CONFIG_PKVM_DEBUG
+#define pviommu_fail_dbg(fmt, ...)	hyp_err("pviommu: " fmt, ##__VA_ARGS__)
+#else
+#define pviommu_fail_dbg(fmt, ...)	do { } while (0)
+#endif
 
 struct pviommu_guest_domain {
 	pkvm_handle_t		id;
@@ -85,8 +98,12 @@ static bool pkvm_guest_iommu_attach_dev(struct pkvm_hyp_vcpu *hyp_vcpu, u64 *exi
 	struct pkvm_hyp_vm *vm = pkvm_hyp_vcpu_to_hyp_vm(hyp_vcpu);
 
 	ret = pkvm_pviommu_get_route(vm, iommu_id, sid, &route);
-	if (ret)
-		goto out_ret;
+	if (ret) {
+		pviommu_fail_dbg("attach: get_route(iommu=%llu sid=%llu) failed: %d\n",
+				 iommu_id, sid, ret);
+		smccc_set_retval(vcpu, SMCCC_RET_INVALID_PARAMETER, 0, 0, 0);
+		return true;
+	}
 	iommu_id = route.iommu;
 	sid = route.sid;
 
@@ -95,7 +112,10 @@ static bool pkvm_guest_iommu_attach_dev(struct pkvm_hyp_vcpu *hyp_vcpu, u64 *exi
 		pkvm_pviommu_hyp_req(exit_code);
 		return false;
 	} else if (ret) {
-		goto out_ret;
+		pviommu_fail_dbg("attach: alloc_domain(%llu) failed: %d\n",
+				 domain_id, ret);
+		smccc_set_retval(vcpu, SMCCC_RET_INVALID_PARAMETER, 0, 0, 0);
+		return true;
 	}
 
 	ret = kvm_iommu_attach_dev(iommu_id, domain_id, sid, pasid, pasid_bits, 0);
@@ -108,8 +128,51 @@ static bool pkvm_guest_iommu_attach_dev(struct pkvm_hyp_vcpu *hyp_vcpu, u64 *exi
 		pkvm_pviommu_hyp_req(exit_code);
 		return false;
 	}
-out_ret:
-	smccc_set_retval(vcpu, ret ?  SMCCC_RET_INVALID_PARAMETER : SMCCC_RET_SUCCESS,
+
+	/*
+	 * Identity-map the physical ITS doorbell page (PA -> PA) in this
+	 * domain so that device MSI writes through the SMMU reach the
+	 * physical ITS.  The guest kernel's DMA layer bypasses MSI IOVA
+	 * allocation for pviommu (msi_iova_bypass), so this mapping is
+	 * not triggered by guest iommu_map calls.
+	 */
+	if (!ret && vm->its_doorbell_phys_addr && !vm->its_doorbell_mapped) {
+		size_t mapped = 0;
+		int map_ret = kvm_iommu_map_pages(domain_id,
+					vm->its_doorbell_phys_addr,
+					vm->its_doorbell_phys_addr,
+					PAGE_SIZE, 1,
+					IOMMU_WRITE | IOMMU_NOEXEC | IOMMU_MMIO,
+					&mapped);
+		if (map_ret) {
+			/* Real error (not ENOMEM — that is masked to 0). */
+			pviommu_fail_dbg("attach: ITS doorbell map failed: %d\n",
+					 map_ret);
+			smccc_set_retval(vcpu, SMCCC_RET_INVALID_PARAMETER, 0, 0, 0);
+			return true;
+		}
+		if (!mapped) {
+			/*
+			 * kvm_iommu_map_pages masks -ENOMEM → 0 with mapped=0.
+			 * Undo attach+domain, request memory, and let the
+			 * guest retry the entire attach HVC.
+			 */
+			kvm_iommu_detach_dev(iommu_id, domain_id, sid, pasid);
+			WARN_ON(kvm_iommu_free_domain(domain_id));
+			if (!__need_req(vcpu)) {
+				smccc_set_retval(vcpu, SMCCC_RET_INVALID_PARAMETER,
+						 0, 0, 0);
+				return true;
+			}
+			pkvm_pviommu_hyp_req(exit_code);
+			return false;
+		}
+		vm->its_doorbell_mapped = true;
+	}
+
+	if (ret)
+		pviommu_fail_dbg("attach: attach_dev failed: %d\n", ret);
+	smccc_set_retval(vcpu, ret ? SMCCC_RET_INVALID_PARAMETER : SMCCC_RET_SUCCESS,
 			 0, 0, 0);
 	return true;
 }
@@ -271,6 +334,21 @@ static bool pkvm_guest_iommu_map(struct pkvm_hyp_vcpu *hyp_vcpu, u64 *exit_code)
 
 	while (size) {
 		size_t mapped = 0;
+
+		/*
+		 * ITS doorbell mapping is now handled at device-attach time
+		 * (see pkvm_guest_iommu_attach_dev).  Skip the doorbell IPA
+		 * so the guest's regular IOVA mapping is not applied to it.
+		 */
+		struct pkvm_hyp_vm *vm = pkvm_hyp_vcpu_to_hyp_vm(hyp_vcpu);
+		if (vm->its_doorbell_phys_addr &&
+		    (ipa & PAGE_MASK) == vm->its_doorbell_guest_ipa) {
+			ipa += PAGE_SIZE;
+			iova += PAGE_SIZE;
+			total_mapped += PAGE_SIZE;
+			size -= PAGE_SIZE;
+			continue;
+		}
 
 		/*
 		 * We need to get the PA and atomically use the page temporarily to avoid

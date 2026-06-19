@@ -655,6 +655,7 @@ static inline bool gic_enable_sre(void)
 
 	return !!(val & ICC_SRE_EL1_SRE);
 }
+phys_addr_t gic_its_get_doorbell_phys(void);
 
 #endif
 

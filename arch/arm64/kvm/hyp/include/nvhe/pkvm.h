@@ -89,6 +89,11 @@ struct pkvm_hyp_vm {
 	struct kvm_ffa_buffers ffa_buf;
 	struct list_head vm_list;
 
+	/* ITS MSI doorbell mapping info for pviommu */
+	u64 its_doorbell_guest_ipa;
+	u64 its_doorbell_phys_addr;
+	bool its_doorbell_mapped;
+
 	/* Array of the hyp vCPU structures for this VM. */
 	struct pkvm_hyp_vcpu *vcpus[];
 };

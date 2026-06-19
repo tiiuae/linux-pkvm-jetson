@@ -2813,3 +2813,18 @@ int kvm_vgic_register_its_device(void)
 	return kvm_register_device_ops(&kvm_arm_vgic_its_ops,
 				       KVM_DEV_TYPE_ARM_VGIC_ITS);
 }
+
+gpa_t kvm_vgic_its_get_base(struct kvm *kvm)
+{
+	struct kvm_device *dev;
+
+	list_for_each_entry(dev, &kvm->devices, vm_node) {
+		if (dev->ops == &kvm_arm_vgic_its_ops) {
+			struct vgic_its *its = dev->private;
+
+			if (!IS_VGIC_ADDR_UNDEF(its->vgic_its_base))
+				return its->vgic_its_base;
+		}
+	}
+	return VGIC_ADDR_UNDEF;
+}
