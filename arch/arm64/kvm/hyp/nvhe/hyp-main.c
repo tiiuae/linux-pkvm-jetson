@@ -2223,7 +2223,19 @@ void handle_trap(struct kvm_cpu_context *host_ctxt)
 		handle_host_mem_abort(host_ctxt);
 		break;
 	default:
-		BUG_ON(!READ_ONCE(default_trap_handler) || !default_trap_handler(&host_ctxt->regs));
+		if (!READ_ONCE(default_trap_handler) ||
+		    !default_trap_handler(&host_ctxt->regs)) {
+			if (IS_ENABLED(CONFIG_PKVM_DEBUG)) {
+				u64 elr = read_sysreg_el2(SYS_ELR);
+
+				hyp_err("unhandled EL2 trap: EC=0x%llx ESR=0x%llx ELR=0x%llx FAR=0x%llx",
+					(unsigned long long)ESR_ELx_EC(esr),
+					(unsigned long long)esr,
+					(unsigned long long)elr,
+					(unsigned long long)read_sysreg_el2(SYS_FAR));
+			}
+			BUG();
+		}
 	}
 
 	__hyp_exit();

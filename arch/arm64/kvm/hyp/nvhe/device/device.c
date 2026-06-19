@@ -31,22 +31,51 @@ static DEFINE_HYP_SPINLOCK(device_spinlock);
 
 #define PKVM_LATE_DEVICES_MAX	256
 
+static bool pkvm_mmio_in_assign_region(u64 base, u64 size)
+{
+	unsigned int i;
+
+	for (i = 0; i < pkvm_moveable_regs_nr; i++) {
+		struct pkvm_moveable_reg *r = &pkvm_moveable_regs[i];
+
+		if (r->type != PKVM_MREG_ASSIGN_MMIO)
+			continue;
+		if (base >= r->start && (base + size) <= (r->start + r->size))
+			return true;
+	}
+	return false;
+}
+
 int pkvm_init_devices(unsigned long nr_devs, struct pkvm_device *devs)
 {
-	void *kern_devs = kern_hyp_va(devs);
+	struct pkvm_device *table = kern_hyp_va(devs);
+	u64 pfn = hyp_virt_to_phys(table) >> PAGE_SHIFT;
 	size_t dev_sz;
-	int ret;
+	int ret, i, j;
 
 	if (!nr_devs || nr_devs > PKVM_LATE_DEVICES_MAX)
 		return -EINVAL;
 
 	dev_sz = PAGE_ALIGN(size_mul(sizeof(struct pkvm_device), nr_devs));
-	ret = __pkvm_host_donate_hyp(hyp_virt_to_phys(kern_devs) >> PAGE_SHIFT,
-				     dev_sz >> PAGE_SHIFT);
+	ret = __pkvm_host_donate_hyp(pfn, dev_sz >> PAGE_SHIFT);
 	if (ret)
 		return ret;
 
-	registered_devices    = kern_devs;
+	for (i = 0; i < nr_devs; i++) {
+		for (j = 0; j < table[i].nr_resources; j++) {
+			struct pkvm_dev_resource *res = &table[i].resources[j];
+
+			if (pkvm_mmio_in_assign_region(res->base, res->size))
+				continue;
+
+			hyp_err("pkvm_init_devices: dev[%d] BAR[%d] base=0x%llx size=0x%llx not in any PKVM_MREG_ASSIGN_MMIO region",
+				i, j, res->base, res->size);
+			__pkvm_hyp_donate_host(pfn, dev_sz >> PAGE_SHIFT);
+			return -EPERM;
+		}
+	}
+
+	registered_devices    = table;
 	registered_devices_nr = nr_devs;
 	return 0;
 }
@@ -438,11 +467,16 @@ int pkvm_devices_get_context(u64 iommu_id, u32 endpoint_id, struct pkvm_hyp_vm *
 		return 0;
 
 	hyp_spin_lock(&device_spinlock);
-	if (dev->ctxt == NULL && vm) {
+	if (IS_ENABLED(CONFIG_PKVM_GUEST_SELF_ASSIGN_DEVICE) &&
+	    dev->ctxt == NULL && vm) {
 		/*
 		 * Device not yet assigned to any VM. Assign the whole group
 		 * now, matching what pkvm_host_map_guest_mmio and
 		 * pkvm_device_request_dma do on first access.
+		 *
+		 * Gated by CONFIG_PKVM_GUEST_SELF_ASSIGN_DEVICE: when off,
+		 * pvmfw (or another trusted entity) must pre-assign the
+		 * device before the guest attaches via pviommu.
 		 */
 		ret = __pkvm_group_assign(dev->group_id, vm);
 		if (!ret)
