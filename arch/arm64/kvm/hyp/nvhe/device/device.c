@@ -166,6 +166,12 @@ out_unlock:
  *   the hypervisor preparing for the VM to access it, in that case the host
  *   will use this function from an HVC to reclaim the MMIO from KVM/VFIO
  *   file release context or incase of failure at initialization.
+ *
+ * TODO: the case-2 path delegates to __pkvm_hyp_donate_host(), whose initial
+ * PKVM_PAGE_OWNED check fails for MMIO ranges (they stay at PKVM_NOPAGE on
+ * the hyp side). Switch to __pkvm_hyp_reclaim_host_mmio() for MMIO ranges
+ * once that path needs to be exercised; today only the VM-dying teardown
+ * path is reachable in practice.
  */
 int pkvm_device_reclaim_mmio(u64 pfn, u64 nr_pages)
 {
@@ -374,9 +380,8 @@ static void pkvm_devices_reclaim_device(struct pkvm_device *dev)
 	for (i = 0 ; i < dev->nr_resources ; ++i) {
 		struct pkvm_dev_resource *res = &dev->resources[i];
 
-		hyp_spin_lock(&host_mmu.lock);
-		WARN_ON(host_stage2_set_owner_locked(res->base, res->size, PKVM_ID_HOST));
-		hyp_spin_unlock(&host_mmu.lock);
+		WARN_ON(__pkvm_hyp_reclaim_host_mmio(res->base >> PAGE_SHIFT,
+						     res->size >> PAGE_SHIFT));
 	}
 }
 
@@ -392,6 +397,12 @@ void pkvm_devices_teardown(struct pkvm_hyp_vm *vm)
 			continue;
 		WARN_ON(pkvm_device_reset(dev, false));
 		dev->ctxt = NULL;
+		if (hyp_refcount_get(dev->refcount)) {
+			hyp_info("teardown: forcing refcount %u -> 0 on dev idx=%d (group=%u)",
+				 (unsigned int)hyp_refcount_get(dev->refcount),
+				 i, dev->group_id);
+			WRITE_ONCE(dev->refcount, 0);
+		}
 		pkvm_devices_reclaim_device(dev);
 	}
 	hyp_spin_unlock(&device_spinlock);

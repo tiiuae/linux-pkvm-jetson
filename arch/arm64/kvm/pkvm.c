@@ -2245,6 +2245,8 @@ static int __pkvm_arch_assign_device(struct device *dev, void *data)
 
 static int __pkvm_arch_reclaim_device(struct device *dev, void *data)
 {
+	int err = 0, ret;
+
 	/* Mirror the assign-side gate: only reclaim what we donated. */
 	if (!dev->pkvm_registered)
 		return 0;
@@ -2254,8 +2256,21 @@ static int __pkvm_arch_reclaim_device(struct device *dev, void *data)
 		struct resource *r;
 		int index = 0;
 
-		while ((r = platform_get_resource(pdev, IORESOURCE_MEM, index++)))
-			__pkvm_reclaim_resource(r);
+		while ((r = platform_get_resource(pdev, IORESOURCE_MEM, index++))) {
+			ret = __pkvm_reclaim_resource(r);
+			/*
+			 * -EBUSY = VM still owns the device; pkvm_devices_teardown()
+			 * will reclaim eagerly when the VM dies. Other return codes
+			 * are real failures worth surfacing.
+			 */
+			if (ret == -EBUSY)
+				continue;
+			if (ret) {
+				pr_warn("pkvm_reclaim: %s res%d reclaim failed ret=%d\n",
+					dev_name(dev), index - 1, ret);
+				err = err ?: ret;
+			}
+		}
 	} else if (dev_is_pci(dev)) {
 		struct pci_dev *pdev = to_pci_dev(dev);
 		int i;
@@ -2268,11 +2283,18 @@ static int __pkvm_arch_reclaim_device(struct device *dev, void *data)
 			if (!(r->flags & IORESOURCE_MEM))
 				continue;
 
-			__pkvm_reclaim_resource(r);
+			ret = __pkvm_reclaim_resource(r);
+			if (ret == -EBUSY)
+				continue;
+			if (ret) {
+				pr_warn("pkvm_reclaim: %s BAR%d reclaim failed ret=%d\n",
+					dev_name(dev), i, ret);
+				err = err ?: ret;
+			}
 		}
 	}
 
-	return 0;
+	return err;
 }
 
 int kvm_arch_assign_device(struct device *dev, struct kvm *kvm)

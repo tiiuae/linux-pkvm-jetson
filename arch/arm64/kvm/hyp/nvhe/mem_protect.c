@@ -1638,6 +1638,67 @@ unlock:
 }
 
 /*
+ * Inverse of the MMIO branch of __pkvm_host_donate_hyp_locked().
+ *
+ * The donate side mapped the BAR into hyp's pgtable and flipped host
+ * stage-2 ownership from PKVM_ID_HOST to PKVM_ID_HYP, but skipped the
+ * hyp PKVM_PAGE_OWNED bookkeeping (the "if (range_is_memory(...))"
+ * guard). __pkvm_hyp_donate_host therefore cannot be used to undo MMIO
+ * donations: its initial PKVM_PAGE_OWNED check fails for ranges that
+ * stayed at PKVM_NOPAGE on the hyp side. This helper performs the two
+ * steps that actually need reversing — drop the hyp pgtable mapping
+ * and flip host stage-2 ownership back — without touching the hyp
+ * page-state tracker.
+ *
+ * Refuses non-MMIO ranges and ranges the host can still see (i.e. not
+ * currently donated): both invariants must hold for a no-op-symmetric
+ * reversal of the donate-mmio path.
+ */
+int __pkvm_hyp_reclaim_host_mmio(u64 pfn, u64 nr_pages)
+{
+	u64 size, phys = hyp_pfn_to_phys(pfn);
+	u64 virt = (u64)__hyp_va(phys);
+	u64 off;
+	int ret;
+
+	if (check_shl_overflow(nr_pages, PAGE_SHIFT, &size))
+		return -EINVAL;
+
+	if (!pfn_range_is_valid(pfn, nr_pages))
+		return -EINVAL;
+
+	if (range_is_memory(phys, phys + size))
+		return -EPERM;
+
+	host_lock_component();
+	hyp_lock_component();
+
+	ret = ___host_check_page_state_range(phys, size, PKVM_NOPAGE, 0);
+	if (ret)
+		goto unlock;
+
+	/*
+	 * Per-page unmap: pages of an assigned BAR can be partially
+	 * unmapped from pkvm_pgtable while the guest is alive (each
+	 * pkvm_hyp_donate_guest() steals one page out of the linear
+	 * map). The hyp_unmap_walker bails with -EINVAL on the first
+	 * invalid PTE, so a single range-unmap call would stop at the
+	 * first hole and leave subsequent valid entries behind. Walking
+	 * page-by-page keeps each visit isolated — valid pages get
+	 * unmapped, holes return 0 without aborting the next iteration.
+	 */
+	for (off = 0; off < size; off += PAGE_SIZE)
+		kvm_pgtable_hyp_unmap(&pkvm_pgtable, virt + off, PAGE_SIZE);
+	WARN_ON(host_stage2_set_owner_locked(phys, size, PKVM_ID_HOST));
+
+unlock:
+	hyp_unlock_component();
+	host_unlock_component();
+
+	return ret;
+}
+
+/*
  * Rejects MMIO regions and does not update the IOMMU. Use with care!
  */
 int __pkvm_host_donate_ffa(u64 pfn, u64 nr_pages)
