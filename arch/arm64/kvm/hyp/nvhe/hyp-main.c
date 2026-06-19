@@ -1730,6 +1730,20 @@ static void handle___pkvm_device_audit_init(struct kvm_cpu_context *host_ctxt)
 	cpu_reg(host_ctxt, 1) = pkvm_audit_init();
 }
 
+static void handle___pkvm_devices_register_late(struct kvm_cpu_context *host_ctxt)
+{
+	DECLARE_REG(unsigned long, nr_devs, host_ctxt, 1);
+	DECLARE_REG(unsigned long, dev_ptr, host_ctxt, 2);
+
+	/*
+	 * Post-finalize one-shot device registration. Used on platforms (e.g.
+	 * Tegra234) where PCI enumeration finishes after stage-2 lockdown.
+	 * EL2 enforces the one-shot guarantee internally.
+	 */
+	cpu_reg(host_ctxt, 1) = pkvm_devices_register_late(nr_devs,
+						(struct pkvm_device *)dev_ptr);
+}
+
 static void handle___pkvm_host_iommu_alloc_domain(struct kvm_cpu_context *host_ctxt)
 {
 	int ret;
@@ -2112,6 +2126,7 @@ static const hcall_t host_hcall[] = {
 #ifdef CONFIG_ARM_SMMU_V2_PKVM
 	HANDLE_FUNC(__pkvm_mc_register_sid),
 #endif
+	HANDLE_FUNC(__pkvm_devices_register_late),
 #ifdef CONFIG_ARM_SMMU_V2_PKVM_DEBUGFS
 	HANDLE_FUNC(__pkvm_host_iommu_debug),
 #endif

@@ -142,6 +142,7 @@ enum __kvm_host_smccc_func {
 	__KVM_HOST_SMCCC_FUNC___pkvm_pviommu_attach,
 	__KVM_HOST_SMCCC_FUNC___pkvm_pviommu_add_vsid,
 	__KVM_HOST_SMCCC_FUNC___pkvm_mc_register_sid,
+	__KVM_HOST_SMCCC_FUNC___pkvm_devices_register_late,
 #ifdef CONFIG_ARM_SMMU_V2_PKVM_DEBUGFS
 	__KVM_HOST_SMCCC_FUNC___pkvm_host_iommu_debug,
 #endif

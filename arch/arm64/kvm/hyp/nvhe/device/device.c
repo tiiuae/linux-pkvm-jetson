@@ -44,6 +44,33 @@ int pkvm_init_devices(unsigned long nr_devs, struct pkvm_device *devs)
 	return ret;
 }
 
+/*
+ * Late, post-finalize device registration. The host calls this once after
+ * PCI enumeration has settled. Wrapped in a one-shot guard so a compromised
+ * host cannot re-register or overwrite the device table.
+ */
+#define PKVM_LATE_DEVICES_MAX	256
+
+static bool late_devices_done;
+
+int pkvm_devices_register_late(unsigned long nr_devs, struct pkvm_device *devs)
+{
+	int ret;
+
+	if (late_devices_done)
+		return -EBUSY;
+	/* Defense in depth: never overwrite an already-populated table */
+	if (registered_devices_nr)
+		return -EBUSY;
+	if (!nr_devs || nr_devs > PKVM_LATE_DEVICES_MAX)
+		return -EINVAL;
+
+	ret = pkvm_init_devices(nr_devs, devs);
+	if (!ret)
+		late_devices_done = true;
+	return ret;
+}
+
 /* return device from a resource, addr and size must match. */
 static struct pkvm_device *pkvm_get_device(u64 addr, size_t size)
 {

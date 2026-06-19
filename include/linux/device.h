@@ -688,6 +688,9 @@ struct device {
 #ifdef CONFIG_IOMMU_DMA
 	bool			dma_iommu:1;
 #endif
+#if IS_ENABLED(CONFIG_KVM)
+	bool			pkvm_registered:1; /* Enrolled in pKVM registered_devices[] */
+#endif
 };
 
 /**

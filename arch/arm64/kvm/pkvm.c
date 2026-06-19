@@ -17,6 +17,7 @@
 #include <asm/kvm_mmu.h>
 #include <linux/memblock.h>
 #include <linux/mutex.h>
+#include <linux/notifier.h>
 #include <linux/of_address.h>
 #include <linux/of_fdt.h>
 #include <linux/of_reserved_mem.h>
@@ -24,6 +25,7 @@
 #include <linux/platform_device.h>
 #include <linux/list_sort.h>
 #include <linux/sort.h>
+#include <linux/workqueue.h>
 
 #include <asm/kvm_host.h>
 #include <asm/kvm_hyp.h>
@@ -599,16 +601,28 @@ static int pkvm_register_device_from_dev(struct device *dev, u32 group_id,
 	pkvm_dev->reset_handler = NULL;
 	pkvm_dev->group_id = group_id;
 
+	/*
+	 * Mark the device as enrolled in the pKVM registered_devices[] table.
+	 * The assign/reclaim paths walk iommu_group_for_each_dev() which
+	 * also visits sibling devices that share an IOMMU group purely due
+	 * to hardware SID constraints (e.g. the Tegra234 PCIe host
+	 * controller in the same group as its downstream PCI endpoints).
+	 * Donating those siblings' MMIO would steal it from the host.
+	 */
+	dev->pkvm_registered = true;
+
 	return 0;
 }
 
-static int pkvm_init_devices(void)
+static int pkvm_init_devices(unsigned long *out_nr, struct pkvm_device **out_devs)
 {
 	struct pci_dev *pdev = NULL;
 	int idx = 0, ret = 0, dev_cnt = 0;
 	size_t dev_sz;
 	struct pkvm_device *dev_base;
-	u32 auto_group_id = 0;
+
+	*out_nr = 0;
+	*out_devs = NULL;
 
 	/*
 	 * Auto-discover all PCI devices that have IOMMU (SMMU) bindings.
@@ -618,7 +632,9 @@ static int pkvm_init_devices(void)
 
 	/* Pass 1: count PCI devices with IOMMU IDs */
 	for_each_pci_dev(pdev) {
-		if (kvm_iommu_device_num_ids(&pdev->dev) > 0)
+		int n = kvm_iommu_device_num_ids(&pdev->dev);
+
+		if (n > 0)
 			dev_cnt++;
 	}
 
@@ -639,9 +655,16 @@ static int pkvm_init_devices(void)
 		if (kvm_iommu_device_num_ids(&pdev->dev) <= 0)
 			continue;
 
-		ret = pkvm_register_device_from_dev(&pdev->dev,
-						    auto_group_id++,
-						    &dev_base[idx]);
+		{
+			struct iommu_group *grp = iommu_group_get(&pdev->dev);
+			u32 grp_id = grp ? iommu_group_id(grp) : idx;
+
+			if (grp)
+				iommu_group_put(grp);
+			ret = pkvm_register_device_from_dev(&pdev->dev,
+							    grp_id,
+							    &dev_base[idx]);
+		}
 		if (ret) {
 			if (ret == -ENOENT) {
 				ret = 0;
@@ -652,15 +675,15 @@ static int pkvm_init_devices(void)
 		}
 		pdev->pkvm_dev_idx = idx;
 		kvm_info("Registered %s (group %u, %d stream IDs, %d MSI-X, %d resources) for assignment",
-			 dev_name(&pdev->dev), auto_group_id - 1,
+			 dev_name(&pdev->dev), dev_base[idx].group_id,
 			 dev_base[idx].nr_iommus,
 			 dev_base[idx].nr_msix_entries,
 			 dev_base[idx].nr_resources);
 		idx++;
 	}
 
-	kvm_nvhe_sym(registered_devices_nr) = idx;
-	kvm_nvhe_sym(registered_devices) = dev_base;
+	*out_nr = idx;
+	*out_devs = dev_base;
 	return 0;
 
 out_free:
@@ -854,24 +877,14 @@ static int __init finalize_pkvm(void)
 		pkvm_firmware_rmem_clear();
 
 	/*
-	 * The pKVM IOMMU driver just probed the SMMU. PCI devices that
-	 * were deferred (waiting for their IOMMU) need to be re-probed
-	 * so they get iommu_fwspec before we scan for assignable devices.
+	 * Device registration is deferred to a post-finalize HVC. On platforms
+	 * like Tegra234, the PCIe RC probe is gated on async BPMP power-domain
+	 * callbacks and only completes well after device_initcall_sync, so
+	 * scanning for assignable devices here would always find zero.
+	 * pkvm_late_devices_init() (registered as late_initcall_sync below)
+	 * arms a PCI bus notifier and calls __pkvm_devices_register_late once
+	 * enumeration has settled.
 	 */
-	wait_for_device_probe();
-
-	ret = pkvm_init_devices();
-	if (ret) {
-		pr_err("Failed to init kvm devices %d\n", ret);
-		pkvm_firmware_rmem_clear();
-	}
-
-	ret = kvm_call_hyp_nvhe(__pkvm_devices_init,
-			       (unsigned long)kvm_nvhe_sym(registered_devices_nr),
-			       (unsigned long)kvm_nvhe_sym(registered_devices));
-	if (ret)
-		pr_warn("Assignable devices failed to initialize in the hypervisor %d\n", ret);
-
 	ret = pkvm_init_device_audit();
 	if (ret) {
 		pr_err("Failed to init pkvm audit system %d\n", ret);
@@ -902,6 +915,112 @@ static int __init finalize_pkvm(void)
 	return 0;
 }
 device_initcall_sync(finalize_pkvm);
+
+/*
+ * Late, post-finalize device registration.
+ *
+ * On platforms where PCI enumeration only completes well after
+ * device_initcall_sync (e.g. Tegra234, where the PCIe RC waits on async
+ * BPMP power-domain callbacks and finishes around 13s into boot), the
+ * scan in finalize_pkvm() finds zero assignable devices. Instead, we arm
+ * a PCI bus notifier here and debounce: every BUS_NOTIFY_BOUND_DRIVER
+ * event pushes a delayed_work out by LATE_DEBOUNCE_MS, and once the bus
+ * goes quiet for that long we run the scan and issue a one-shot HVC.
+ *
+ * EL2 enforces the one-shot guarantee in pkvm_devices_register_late();
+ * the late_submitted flag here is just a host-side optimization so we
+ * don't keep rescheduling work after the table has been committed.
+ */
+#define PKVM_LATE_DEBOUNCE_MS	2000
+
+static DEFINE_MUTEX(pkvm_late_lock);
+static bool pkvm_late_submitted;
+static struct delayed_work pkvm_late_dw;
+static struct notifier_block pkvm_late_nb;
+
+static void pkvm_late_register_work(struct work_struct *w)
+{
+	unsigned long nr_devs = 0;
+	struct pkvm_device *devs = NULL;
+	size_t dev_sz;
+	int ret;
+
+	mutex_lock(&pkvm_late_lock);
+	if (pkvm_late_submitted)
+		goto out;
+
+	ret = pkvm_init_devices(&nr_devs, &devs);
+	if (ret) {
+		pr_err("pkvm: late device scan failed: %d\n", ret);
+		goto out;
+	}
+
+	if (!nr_devs) {
+		pr_warn("pkvm: late scan found 0 assignable devices, skipping HVC\n");
+		WRITE_ONCE(pkvm_late_submitted, true);
+		goto out;
+	}
+
+	/*
+	 * Pass the device array directly to EL2 via the HVC. We must NOT
+	 * write to kvm_nvhe_sym(registered_devices*) here — those live in
+	 * hyp BSS which is stage-2 protected after pkvm_drop_host_privileges().
+	 * EL2 will kern_hyp_va() and donate the pages itself.
+	 */
+	ret = kvm_call_hyp_nvhe(__pkvm_devices_register_late,
+				(unsigned long)nr_devs,
+				(unsigned long)devs);
+	if (ret) {
+		pr_err("pkvm: late device HVC failed: %d\n", ret);
+		dev_sz = PAGE_ALIGN(size_mul(sizeof(struct pkvm_device), nr_devs));
+		free_pages_exact(devs, dev_sz);
+		goto out;
+	}
+
+	pr_info("pkvm: registered %lu device(s) via late HVC\n", nr_devs);
+	WRITE_ONCE(pkvm_late_submitted, true);
+out:
+	mutex_unlock(&pkvm_late_lock);
+}
+
+static int pkvm_late_pci_notify(struct notifier_block *nb,
+				unsigned long action, void *data)
+{
+	if (action != BUS_NOTIFY_BOUND_DRIVER)
+		return NOTIFY_DONE;
+
+	/*
+	 * No locking here: notifier callbacks may run with driver-core locks
+	 * held, and pkvm_late_submitted is only an optimization. The
+	 * authoritative one-shot check is inside pkvm_late_register_work()
+	 * (and ultimately in EL2 via pkvm_devices_register_late()).
+	 */
+	if (READ_ONCE(pkvm_late_submitted))
+		return NOTIFY_DONE;
+
+	mod_delayed_work(system_wq, &pkvm_late_dw,
+			 msecs_to_jiffies(PKVM_LATE_DEBOUNCE_MS));
+	return NOTIFY_DONE;
+}
+
+static int __init pkvm_late_devices_init(void)
+{
+	if (!is_protected_kvm_enabled() || !is_kvm_arm_initialised())
+		return 0;
+
+	INIT_DELAYED_WORK(&pkvm_late_dw, pkvm_late_register_work);
+	pkvm_late_nb.notifier_call = pkvm_late_pci_notify;
+	bus_register_notifier(&pci_bus_type, &pkvm_late_nb);
+
+	/*
+	 * Schedule an initial fire so we still commit (with zero devices)
+	 * even on systems where no PCI device ever binds.
+	 */
+	mod_delayed_work(system_wq, &pkvm_late_dw,
+			 msecs_to_jiffies(PKVM_LATE_DEBOUNCE_MS));
+	return 0;
+}
+late_initcall_sync(pkvm_late_devices_init);
 
 int pkvm_enable_smc_forwarding(struct file *kvm_file)
 {
@@ -2023,13 +2142,18 @@ int __pkvm_topup_hyp_alloc_mgt_gfp(unsigned long id, unsigned long nr_pages,
 
 static int __pkvm_donate_resource(struct resource *r)
 {
-	if (!PAGE_ALIGNED(resource_size(r)) || !PAGE_ALIGNED(r->start))
+	int ret;
+
+	if (!PAGE_ALIGNED(resource_size(r)) || !PAGE_ALIGNED(r->start)) {
+		pr_warn("pkvm_donate: NOT page-aligned (start=0x%llx size=0x%llx) -> EINVAL\n",
+			(u64)r->start, (u64)resource_size(r));
 		return -EINVAL;
+	}
 
-	return kvm_call_hyp_nvhe(__pkvm_host_donate_hyp_mmio,
-				 __phys_to_pfn(r->start),
-				 resource_size(r) >> PAGE_SHIFT);
-
+	ret = kvm_call_hyp_nvhe(__pkvm_host_donate_hyp_mmio,
+				__phys_to_pfn(r->start),
+				resource_size(r) >> PAGE_SHIFT);
+	return ret;
 }
 
 static int __pkvm_reclaim_resource(struct resource *r)
@@ -2046,6 +2170,19 @@ static int __pkvm_arch_assign_device(struct device *dev, void *data)
 {
 	int ret = 0;
 
+	/*
+	 * iommu_group_for_each_dev() visits every member of the IOMMU group,
+	 * including siblings that share the group purely due to hardware SID
+	 * constraints (e.g. Tegra234 PCIe host controller 14100000.pcie shares
+	 * group 5 with its downstream PCI endpoints). Those siblings were
+	 * never enrolled in EL2's registered_devices[], so the donate HVC
+	 * would fail with -ENODEV and abort the whole assign. Skip them
+	 * silently — their MMIO belongs to the host (this mirrors regular
+	 * KVM/VFIO, which never relocates MMIO of unclaimed group members).
+	 */
+	if (!dev->pkvm_registered)
+		return 0;
+
 	if (dev_is_platform(dev)) {
 		struct platform_device *pdev = to_platform_device(dev);
 		struct resource *r;
@@ -2053,8 +2190,11 @@ static int __pkvm_arch_assign_device(struct device *dev, void *data)
 
 		while ((r = platform_get_resource(pdev, IORESOURCE_MEM, index++))) {
 			ret = __pkvm_donate_resource(r);
-			if (ret)
+			if (ret) {
+				pr_warn("pkvm_assign_dev: %s platform res[%d] donate ret=%d -> abort\n",
+					dev_name(dev), index - 1, ret);
 				break;
+			}
 		}
 
 		if (ret) {
@@ -2076,8 +2216,11 @@ static int __pkvm_arch_assign_device(struct device *dev, void *data)
 				continue;
 
 			ret = __pkvm_donate_resource(r);
-			if (ret)
+			if (ret) {
+				pr_warn("pkvm_assign_dev: %s BAR%d donate ret=%d -> abort\n",
+					dev_name(dev), i, ret);
 				break;
+			}
 		}
 
 		if (ret) {
@@ -2093,6 +2236,8 @@ static int __pkvm_arch_assign_device(struct device *dev, void *data)
 			}
 		}
 	} else {
+		pr_warn("pkvm_assign_dev: %s unsupported bus type -> EOPNOTSUPP\n",
+			dev_name(dev));
 		return -EOPNOTSUPP;
 	}
 
@@ -2101,6 +2246,10 @@ static int __pkvm_arch_assign_device(struct device *dev, void *data)
 
 static int __pkvm_arch_reclaim_device(struct device *dev, void *data)
 {
+	/* Mirror the assign-side gate: only reclaim what we donated. */
+	if (!dev->pkvm_registered)
+		return 0;
+
 	if (dev_is_platform(dev)) {
 		struct platform_device *pdev = to_platform_device(dev);
 		struct resource *r;
