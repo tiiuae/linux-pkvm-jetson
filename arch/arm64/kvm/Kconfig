@@ -75,6 +75,23 @@ config IOMMU_POOL_PAGES
 	help
 	  IOMMU pool is used with protected mode to allocated IOMMU drivers page tables.
 
+config PKVM_GUEST_SELF_ASSIGN_DEVICE
+	bool "Allow pKVM guest to self-assign passthrough devices via pviommu attach"
+	depends on KVM
+	default n
+	help
+	  When set, the first guest pviommu ATTACH_DEV hypercall for an
+	  unassigned passthrough device causes EL2 to assign the device's
+	  group to the calling VM. This lets a guest boot without pvmfw
+	  having pre-assigned its devices, which is useful for hypervisor
+	  development and debugging.
+
+	  When unset, EL2 returns -EPERM unless pvmfw (or another trusted
+	  entity) has already assigned the device to the calling VM
+	  before the attach hypercall arrives.
+
+	  If unsure, say N.
+
 menuconfig PKVM_DEBUG
 	bool "Debug mode for Protected KVM hypervisor"
 	help

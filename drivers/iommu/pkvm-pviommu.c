@@ -150,18 +150,7 @@ static int pviommu_map_pages(struct iommu_domain *domain, unsigned long iova,
 		pviommu_domain_insert_map(pv_domain, iova - *mapped, iova - 1,
 					  paddr - *mapped, gfp);
 
-	{
-		int final_ret = smccc_to_linux_ret(res.a0);
-
-		pr_err("pviommu_map_pages: domain=%lu iova=%lx paddr=%pa size=%zx prot=%x mapped=%zx ret=%d\n",
-		       pv_domain->id, iova - *mapped, &paddr, requested_size, prot,
-		       *mapped, final_ret);
-		/* Doorbell path encodes debug info in a2/a3 on failure */
-		if (final_ret && (res.a2 || res.a3))
-			pr_err("  doorbell_debug: subst_paddr=%lx el2_ret=%ld el2_mapped=%lx\n",
-			       res.a2, (long)(res.a3 >> 32), res.a3 & 0xFFFFFFFF);
-		return final_ret;
-	}
+	return smccc_to_linux_ret(res.a0);
 }
 
 static size_t pviommu_unmap_pages(struct iommu_domain *domain, unsigned long iova,
