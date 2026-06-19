@@ -251,4 +251,10 @@ int pkvm_device_hyp_assign_mmio(u64 pfn, u64 nr_pages);
 int pkvm_device_reclaim_mmio(u64 pfn, u64 nr_pages);
 int pkvm_host_map_guest_mmio(struct pkvm_hyp_vcpu *hyp_vcpu, u64 pfn, u64 gfn);
 int pkvm_device_register_ops(u64 phys, struct pkvm_device_ops *ops, void *cookie);
+int pkvm_msix_read_entry(u32 device_idx, u32 entry_idx,
+			 u64 *packed_addr, u64 *packed_data_ctrl);
+int pkvm_msix_write_entry(u32 device_idx, u32 entry_idx,
+			  u64 packed_addr, u64 packed_data_ctrl,
+			  u32 field_mask);
+int pkvm_msix_mask_all(u32 device_idx);
 #endif /* __ARM64_KVM_NVHE_PKVM_H__ */
