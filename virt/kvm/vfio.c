@@ -195,8 +195,10 @@ static int kvm_vfio_assign_file(struct file *file, struct kvm *kvm)
 	int ret;
 
 	dev = kvm_vfio_file_get_device(file);
-	if (dev)
-		return kvm_arch_assign_device(dev, kvm);
+	if (dev) {
+		ret = kvm_arch_assign_device(dev, kvm);
+		return ret;
+	}
 	group = kvm_vfio_file_iommu_group(file);
 	if (group) {
 		ret = kvm_arch_assign_group(group, kvm);
