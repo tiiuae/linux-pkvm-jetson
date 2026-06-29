@@ -89,6 +89,11 @@ struct pkvm_hyp_vm {
 	struct kvm_ffa_buffers ffa_buf;
 	struct list_head vm_list;
 
+	/* ITS MSI doorbell mapping info for pviommu */
+	u64 its_doorbell_guest_ipa;
+	u64 its_doorbell_phys_addr;
+	bool its_doorbell_mapped;
+
 	/* Array of the hyp vCPU structures for this VM. */
 	struct pkvm_hyp_vcpu *vcpus[];
 };
@@ -194,6 +199,7 @@ int pkvm_host_hvc_pd(u64 device_id, u64 on);
 
 bool pkvm_device_request_mmio(struct pkvm_hyp_vcpu *hyp_vcpu, u64 *exit_code);
 bool pkvm_device_request_dma(struct pkvm_hyp_vcpu *hyp_vcpu, u64 *exit_code);
+bool pkvm_hyp_handle_msix_page_dabt(struct kvm_vcpu *vcpu);
 void pkvm_devices_teardown(struct pkvm_hyp_vm *vm);
 int pkvm_devices_get_context(u64 iommu_id, u32 endpoint_id, struct pkvm_hyp_vm *vm);
 void pkvm_devices_put_context(u64 iommu_id, u32 endpoint_id);
@@ -215,11 +221,18 @@ static inline int pkvm_init_power_domain(struct kvm_power_domain *pd,
 	}
 }
 
-int pkvm_init_devices(void);
+int pkvm_init_devices(unsigned long nr_devs, struct pkvm_device *devs);
+int pkvm_devices_register_late(unsigned long nr_devs, struct pkvm_device *devs);
 int pkvm_device_hyp_assign_mmio(u64 pfn, u64 nr_pages);
 int pkvm_device_reclaim_mmio(u64 pfn, u64 nr_pages);
 int pkvm_host_map_guest_mmio(struct pkvm_hyp_vcpu *hyp_vcpu, u64 pfn, u64 gfn);
 int pkvm_device_register_reset(u64 phys, void *cookie,
 			       int (*cb)(void *cookie, bool host_to_guest));
+int pkvm_msix_read_entry(u32 device_idx, u32 entry_idx,
+			 u64 *packed_addr, u64 *packed_data_ctrl);
+int pkvm_msix_write_entry(u32 device_idx, u32 entry_idx,
+			  u64 packed_addr, u64 packed_data_ctrl,
+			  u32 field_mask);
+int pkvm_msix_mask_all(u32 device_idx);
 
 #endif /* __ARM64_KVM_NVHE_PKVM_H__ */

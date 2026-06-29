@@ -5868,3 +5868,14 @@ int __init its_init(struct fwnode_handle *handle, struct rdists *rdists,
 
 	return 0;
 }
+
+phys_addr_t gic_its_get_doorbell_phys(void)
+{
+	struct its_node *its;
+
+	list_for_each_entry(its, &its_nodes, entry)
+		return its->phys_base + GITS_TRANSLATER;
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(gic_its_get_doorbell_phys);

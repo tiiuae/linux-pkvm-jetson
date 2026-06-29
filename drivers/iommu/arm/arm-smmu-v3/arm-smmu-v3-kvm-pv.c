@@ -256,9 +256,14 @@ static int kvm_arm_smmu_map_pages(struct iommu_domain *domain,
 				  gfp_t gfp, size_t *total_mapped)
 {
 	struct kvm_arm_smmu_domain *kvm_smmu_domain = to_kvm_smmu_domain(domain);
+	int ret;
 
-	return kvm_iommu_map_pages(kvm_smmu_domain->id, iova, paddr,
+	if (!kvm_smmu_domain->smmu)
+		return -ENODEV;
+
+	ret = kvm_iommu_map_pages(kvm_smmu_domain->id, iova, paddr,
 				   pgsize, pgcount, prot, gfp, total_mapped);
+	return ret;
 }
 static size_t kvm_arm_smmu_unmap_pages(struct iommu_domain *domain,
 				       unsigned long iova, size_t pgsize,

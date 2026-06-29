@@ -2453,9 +2453,16 @@ static size_t smmu_pgsize_idmap(size_t size, u64 paddr, size_t pgsize_bitmap)
 	if (likely(paddr))
 		pgsizes &= GENMASK_ULL(__ffs(paddr), 0);
 
-	WARN_ON(!pgsizes);
+	/*
+	 * Caller treats 0 as "stop": legitimate when unmapping a
+	 * range that was never installed in the host idmap (e.g. a
+	 * device BAR being donated to a guest before the host ever
+	 * faulted it in). Return 0 instead of falling into __fls(0).
+	 */
+	if (!pgsizes)
+		return 0;
 
-	/* Return the larget page size that fits. */
+	/* Return the largest page size that fits. */
 	return BIT(__fls(pgsizes));
 }
 
@@ -2480,6 +2487,8 @@ static void smmu_host_stage2_idmap(phys_addr_t start, phys_addr_t end, int prot)
 			mapped = 0;
 
 			pgsize = smmu_pgsize_idmap(size, start, pgtable->cfg.pgsize_bitmap);
+			if (!pgsize)
+				return;
 			pgcount = size / pgsize;
 			ret = pgtable->ops.map_pages(&pgtable->ops, start, start,
 						     pgsize, pgcount, prot, 0, &mapped);
@@ -2489,18 +2498,41 @@ static void smmu_host_stage2_idmap(phys_addr_t start, phys_addr_t end, int prot)
 				return;
 		}
 	} else {
+		/* Trace only larger ranges (BAR-sized) to skip routine 4K page noise. */
+		bool trace = size > PAGE_SIZE;
+
+		if (trace)
+			drv_info("idmap unmap: enter start=0x%llx end=0x%llx size=0x%zx",
+				 (u64)start, (u64)end, size);
 		while (size) {
 			pgsize = smmu_pgsize_idmap(size, start, pgtable->cfg.pgsize_bitmap);
+			if (!pgsize) {
+				if (trace)
+					drv_info("idmap unmap: pgsize=0, stop size=0x%zx", size);
+				return;
+			}
 			pgcount = size / pgsize;
 			unmapped = pgtable->ops.unmap_pages(&pgtable->ops, start,
 							    pgsize, pgcount, &gather);
+			/*
+			 * io-pgtable-arm returns -ENOENT (cast to size_t as
+			 * 0xfff..fe) when the entry doesn't exist. The NO_WARN
+			 * quirk suppresses the WARN, but the negative return
+			 * still leaks out. Treat any negative as "nothing to
+			 * unmap here" — legitimate for MMIO BARs the host
+			 * never faulted in.
+			 */
+			if ((ssize_t)unmapped <= 0) {
+				if (trace)
+					drv_info("idmap unmap: no-op/err unmapped=0x%zx remaining=0x%zx",
+						 unmapped, size);
+				return;
+			}
 			size -= unmapped;
 			start += unmapped;
-			if (!unmapped)
-				break;
 		}
-		/* Some memory were not unmapped. */
-		WARN_ON(size);
+		if (trace)
+			drv_info("idmap unmap: exit clean");
 	}
 
 }

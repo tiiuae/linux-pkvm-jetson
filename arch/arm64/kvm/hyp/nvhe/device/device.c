@@ -4,6 +4,8 @@
  * Author: Mostafa Saleh <smostafa@google.com>
  */
 
+#include <hyp/adjust_pc.h>
+
 #include <nvhe/iommu.h>
 #include <nvhe/mem_protect.h>
 #include <nvhe/mm.h>
@@ -27,20 +29,78 @@ unsigned long registered_devices_nr;
  */
 static DEFINE_HYP_SPINLOCK(device_spinlock);
 
-int pkvm_init_devices(void)
+#define PKVM_LATE_DEVICES_MAX	256
+
+static bool pkvm_mmio_in_assign_region(u64 base, u64 size)
 {
+	unsigned int i;
+
+	for (i = 0; i < pkvm_moveable_regs_nr; i++) {
+		struct pkvm_moveable_reg *r = &pkvm_moveable_regs[i];
+
+		if (r->type != PKVM_MREG_ASSIGN_MMIO)
+			continue;
+		if (base >= r->start && (base + size) <= (r->start + r->size))
+			return true;
+	}
+	return false;
+}
+
+int pkvm_init_devices(unsigned long nr_devs, struct pkvm_device *devs)
+{
+	struct pkvm_device *table = kern_hyp_va(devs);
+	u64 pfn = hyp_virt_to_phys(table) >> PAGE_SHIFT;
 	size_t dev_sz;
-	int ret;
+	int ret, i, j;
 
-	registered_devices = kern_hyp_va(registered_devices);
-	dev_sz = PAGE_ALIGN(size_mul(sizeof(struct pkvm_device),
-				     registered_devices_nr));
+	if (!nr_devs || nr_devs > PKVM_LATE_DEVICES_MAX)
+		return -EINVAL;
 
-	ret = __pkvm_host_donate_hyp(hyp_virt_to_phys(registered_devices) >> PAGE_SHIFT,
-				     dev_sz >> PAGE_SHIFT);
+	dev_sz = PAGE_ALIGN(size_mul(sizeof(struct pkvm_device), nr_devs));
+	ret = __pkvm_host_donate_hyp(pfn, dev_sz >> PAGE_SHIFT);
 	if (ret)
-		registered_devices_nr = 0;
-	return ret;
+		return ret;
+
+	for (i = 0; i < nr_devs; i++) {
+		for (j = 0; j < table[i].nr_resources; j++) {
+			struct pkvm_dev_resource *res = &table[i].resources[j];
+
+			if (pkvm_mmio_in_assign_region(res->base, res->size))
+				continue;
+
+			hyp_err("pkvm_init_devices: dev[%d] BAR[%d] base=0x%llx size=0x%llx not in any PKVM_MREG_ASSIGN_MMIO region",
+				i, j, res->base, res->size);
+			__pkvm_hyp_donate_host(pfn, dev_sz >> PAGE_SHIFT);
+			return -EPERM;
+		}
+	}
+
+	registered_devices    = table;
+	registered_devices_nr = nr_devs;
+	return 0;
+}
+
+/*
+ * Late, post-finalize device registration. The host calls this once after
+ * PCI enumeration has settled. Wrapped in a one-shot guard so a compromised
+ * host cannot re-register or overwrite the device table.
+ */
+static bool late_devices_done;
+
+int pkvm_devices_register_late(unsigned long nr_devs, struct pkvm_device *devs)
+{
+	if (!nr_devs || nr_devs > PKVM_LATE_DEVICES_MAX)
+		return -EINVAL;
+
+	hyp_spin_lock(&device_spinlock);
+	if (late_devices_done || registered_devices_nr) {
+		hyp_spin_unlock(&device_spinlock);
+		return -EBUSY;
+	}
+	late_devices_done = true;
+	hyp_spin_unlock(&device_spinlock);
+
+	return pkvm_init_devices(nr_devs, devs);
 }
 
 /* return device from a resource, addr and size must match. */
@@ -98,20 +158,31 @@ int pkvm_device_hyp_assign_mmio(u64 pfn, u64 nr_pages)
 	u64 phys = pfn << PAGE_SHIFT;
 
 	dev = pkvm_get_device(phys, size);
-	if (!dev)
+	if (!dev) {
+		hyp_err("assign_mmio: no dev for phys=0x%llx size=0x%zx",
+			(u64)phys, size);
 		return -ENODEV;
+	}
 
 	hyp_spin_lock(&device_spinlock);
 	/* A VM already have this device, no take backs. */
 	if (dev->ctxt || dev->refcount) {
+		hyp_err("assign_mmio EBUSY phys=0x%llx size=0x%zx idx=%ld ctxt=%p refcount=%u group_id=%u nr_res=%u",
+			(u64)phys, size, (long)(dev - registered_devices),
+			dev->ctxt, (unsigned int)dev->refcount,
+			dev->group_id, dev->nr_resources);
 		ret = -EBUSY;
 		goto out_unlock;
 	}
 
 	ret = ___pkvm_host_donate_hyp_prot(pfn, nr_pages, true, PAGE_HYP_DEVICE);
-	/* Hyp have device mapping, while host may have issue cacheable writes.*/
-	if (false)
-		kvm_flush_dcache_to_poc(__hyp_va(phys), PAGE_SIZE);
+	/*
+	 * No dcache flush here: hyp's mapping is PAGE_HYP_DEVICE (non-cacheable)
+	 * and the host's BAR view is also Device via ioremap, so there are no
+	 * cacheable writes to push out. dc cvac on a Device-mapped VA is
+	 * constrained-unpredictable on some implementations and was observed
+	 * to trap-loop in EL2 on Tegra234 for high MMIO (0x20a8000000).
+	 */
 
 out_unlock:
 	hyp_spin_unlock(&device_spinlock);
@@ -127,6 +198,12 @@ out_unlock:
  *   the hypervisor preparing for the VM to access it, in that case the host
  *   will use this function from an HVC to reclaim the MMIO from KVM/VFIO
  *   file release context or incase of failure at initialization.
+ *
+ * TODO: the case-2 path delegates to __pkvm_hyp_donate_host(), whose initial
+ * PKVM_PAGE_OWNED check fails for MMIO ranges (they stay at PKVM_NOPAGE on
+ * the hyp side). Switch to __pkvm_hyp_reclaim_host_mmio() for MMIO ranges
+ * once that path needs to be exercised; today only the VM-dying teardown
+ * path is reachable in practice.
  */
 int pkvm_device_reclaim_mmio(u64 pfn, u64 nr_pages)
 {
@@ -160,6 +237,11 @@ static int pkvm_device_reset(struct pkvm_device *dev, bool host_to_guest)
 
 	hyp_assert_lock_held(&device_spinlock);
 
+	/*
+	 * TODO: IOMMU modules should register per-device reset handlers via
+	 * pkvm_device_register_reset() to clear device state during assignment
+	 * transitions. Until then, skip reset if no handler is registered.
+	 */
 	if (dev->reset_handler) {
 		ret = dev->reset_handler(dev->cookie, host_to_guest);
 		if (ret)
@@ -239,7 +321,8 @@ static int __pkvm_group_assign(u32 group_id, struct pkvm_hyp_vm *vm)
 int pkvm_host_map_guest_mmio(struct pkvm_hyp_vcpu *hyp_vcpu, u64 pfn, u64 gfn)
 {
 	int ret = 0;
-	struct pkvm_device *dev = pkvm_get_device_by_addr(hyp_pfn_to_phys(pfn));
+	u64 phys = hyp_pfn_to_phys(pfn);
+	struct pkvm_device *dev = pkvm_get_device_by_addr(phys);
 	struct pkvm_hyp_vm *vm = pkvm_hyp_vcpu_to_hyp_vm(hyp_vcpu);
 
 	if (!dev)
@@ -253,12 +336,12 @@ int pkvm_host_map_guest_mmio(struct pkvm_hyp_vcpu *hyp_vcpu, u64 pfn, u64 gfn)
 		 * group is assigned to the hypervisor.
 		 */
 		ret = __pkvm_group_assign(dev->group_id, vm);
+		if (ret)
+			goto out_ret;
 	} else if (dev->ctxt != vm) {
-		ret = -EBUSY;
-	}
-
-	if (ret)
+		ret = -EBUSY; /* device owned by another VM */
 		goto out_ret;
+	}
 
 	ret = __pkvm_install_guest_mmio(hyp_vcpu, pfn, gfn);
 
@@ -329,9 +412,8 @@ static void pkvm_devices_reclaim_device(struct pkvm_device *dev)
 	for (i = 0 ; i < dev->nr_resources ; ++i) {
 		struct pkvm_dev_resource *res = &dev->resources[i];
 
-		hyp_spin_lock(&host_mmu.lock);
-		WARN_ON(host_stage2_set_owner_locked(res->base, res->size, PKVM_ID_HOST));
-		hyp_spin_unlock(&host_mmu.lock);
+		WARN_ON(__pkvm_hyp_reclaim_host_mmio(res->base >> PAGE_SHIFT,
+						     res->size >> PAGE_SHIFT));
 	}
 }
 
@@ -347,6 +429,12 @@ void pkvm_devices_teardown(struct pkvm_hyp_vm *vm)
 			continue;
 		WARN_ON(pkvm_device_reset(dev, false));
 		dev->ctxt = NULL;
+		if (hyp_refcount_get(dev->refcount)) {
+			hyp_info("teardown: forcing refcount %u -> 0 on dev idx=%d (group=%u)",
+				 (unsigned int)hyp_refcount_get(dev->refcount),
+				 i, dev->group_id);
+			WRITE_ONCE(dev->refcount, 0);
+		}
 		pkvm_devices_reclaim_device(dev);
 	}
 	hyp_spin_unlock(&device_spinlock);
@@ -379,10 +467,25 @@ int pkvm_devices_get_context(u64 iommu_id, u32 endpoint_id, struct pkvm_hyp_vm *
 		return 0;
 
 	hyp_spin_lock(&device_spinlock);
-	if (dev->ctxt != vm)
+	if (IS_ENABLED(CONFIG_PKVM_GUEST_SELF_ASSIGN_DEVICE) &&
+	    dev->ctxt == NULL && vm) {
+		/*
+		 * Device not yet assigned to any VM. Assign the whole group
+		 * now, matching what pkvm_host_map_guest_mmio and
+		 * pkvm_device_request_dma do on first access.
+		 *
+		 * Gated by CONFIG_PKVM_GUEST_SELF_ASSIGN_DEVICE: when off,
+		 * pvmfw (or another trusted entity) must pre-assign the
+		 * device before the guest attaches via pviommu.
+		 */
+		ret = __pkvm_group_assign(dev->group_id, vm);
+		if (!ret)
+			hyp_refcount_inc(dev->refcount);
+	} else if (dev->ctxt != vm) {
 		ret = -EPERM;
-	else
+	} else {
 		hyp_refcount_inc(dev->refcount);
+	}
 	hyp_spin_unlock(&device_spinlock);
 	return ret;
 }
@@ -419,6 +522,307 @@ int pkvm_device_register_reset(u64 phys, void *cookie,
 	hyp_spin_unlock(&device_spinlock);
 
 	return ret;
+}
+
+/*
+ * PCI MSI-X table entry layout (from PCI 3.0 spec).
+ * Defined locally to avoid pulling in full PCI headers in EL2.
+ */
+#define MSIX_ENTRY_SIZE		16
+#define MSIX_ENTRY_LOWER_ADDR	0x0
+#define MSIX_ENTRY_UPPER_ADDR	0x4
+#define MSIX_ENTRY_DATA		0x8
+#define MSIX_ENTRY_VECTOR_CTRL	0xc
+#define MSIX_ENTRY_CTRL_MASKBIT	0x1
+
+/* Device MMIO accessors for EL2 (PAGE_HYP_DEVICE = Device-nGnRE) */
+static inline u32 hyp_readl(void *addr)
+{
+	return *(volatile u32 *)addr;
+}
+
+static inline void hyp_writel(u32 val, void *addr)
+{
+	*(volatile u32 *)addr = val;
+}
+
+/*
+ * Validate an MSI-X table access request from the host.
+ * Returns the device pointer and computes the entry's virtual address.
+ * Caller must hold device_spinlock.
+ *
+ * Security: The host provides indices (device_idx, entry_idx), never
+ * physical addresses. EL2 computes the address from immutable boot-time
+ * registration data. This prevents a compromised host from tricking
+ * EL2 into arbitrary memory access.
+ */
+static struct pkvm_device *
+pkvm_validate_msix_access(u32 device_idx, u32 entry_idx, void **entry_addr)
+{
+	struct pkvm_device *dev;
+	u64 phys;
+
+	hyp_assert_lock_held(&device_spinlock);
+
+	if (device_idx >= registered_devices_nr)
+		return NULL;
+
+	dev = &registered_devices[device_idx];
+
+	if (!dev->nr_msix_entries || entry_idx >= dev->nr_msix_entries)
+		return NULL;
+
+	/* Address computed from boot-time data, not host-provided */
+	phys = dev->msix_table_phys + (u64)entry_idx * MSIX_ENTRY_SIZE;
+
+	/* Defense in depth: verify the page is hyp-owned */
+	if (hyp_check_range_owned(phys & PAGE_MASK, PAGE_SIZE))
+		return NULL;
+
+	*entry_addr = __hyp_va(phys);
+	return dev;
+}
+
+/*
+ * Read one MSI-X table entry.
+ * Returns all 4 fields packed into two u64 return values.
+ */
+int pkvm_msix_read_entry(u32 device_idx, u32 entry_idx,
+			 u64 *packed_addr, u64 *packed_data_ctrl)
+{
+	struct pkvm_device *dev;
+	void *addr;
+	u32 lo, hi, data, ctrl;
+	int ret = -EINVAL;
+
+	hyp_spin_lock(&device_spinlock);
+
+	dev = pkvm_validate_msix_access(device_idx, entry_idx, &addr);
+	if (!dev)
+		goto out_unlock;
+
+	lo   = hyp_readl(addr + MSIX_ENTRY_LOWER_ADDR);
+	hi   = hyp_readl(addr + MSIX_ENTRY_UPPER_ADDR);
+	data = hyp_readl(addr + MSIX_ENTRY_DATA);
+	ctrl = hyp_readl(addr + MSIX_ENTRY_VECTOR_CTRL);
+
+	*packed_addr = ((u64)hi << 32) | lo;
+	*packed_data_ctrl = ((u64)ctrl << 32) | data;
+	ret = 0;
+
+out_unlock:
+	hyp_spin_unlock(&device_spinlock);
+	return ret;
+}
+
+/*
+ * Write selected fields of one MSI-X table entry.
+ * field_mask bits: 0=addr_lo, 1=addr_hi, 2=data, 3=vector_ctrl.
+ */
+int pkvm_msix_write_entry(u32 device_idx, u32 entry_idx,
+			  u64 packed_addr, u64 packed_data_ctrl,
+			  u32 field_mask)
+{
+	struct pkvm_device *dev;
+	void *addr;
+	int ret = -EINVAL;
+
+	if (field_mask & ~0xFu)
+		return -EINVAL;
+
+	hyp_spin_lock(&device_spinlock);
+
+	dev = pkvm_validate_msix_access(device_idx, entry_idx, &addr);
+	if (!dev)
+		goto out_unlock;
+
+	if (field_mask & BIT(0))
+		hyp_writel((u32)packed_addr, addr + MSIX_ENTRY_LOWER_ADDR);
+	if (field_mask & BIT(1))
+		hyp_writel((u32)(packed_addr >> 32), addr + MSIX_ENTRY_UPPER_ADDR);
+	if (field_mask & BIT(2))
+		hyp_writel((u32)packed_data_ctrl, addr + MSIX_ENTRY_DATA);
+	if (field_mask & BIT(3))
+		hyp_writel((u32)(packed_data_ctrl >> 32), addr + MSIX_ENTRY_VECTOR_CTRL);
+
+	/* Flush: read back to ensure writes reach device */
+	hyp_readl(addr + MSIX_ENTRY_DATA);
+	ret = 0;
+
+out_unlock:
+	hyp_spin_unlock(&device_spinlock);
+	return ret;
+}
+
+/*
+ * Mask all MSI-X vectors for a device (bulk operation).
+ * Avoids N individual HVCs for msix_mask_all().
+ */
+int pkvm_msix_mask_all(u32 device_idx)
+{
+	struct pkvm_device *dev;
+	void *base;
+	int i;
+
+	hyp_spin_lock(&device_spinlock);
+
+	if (device_idx >= registered_devices_nr)
+		goto out_err;
+
+	dev = &registered_devices[device_idx];
+	if (!dev->nr_msix_entries)
+		goto out_err;
+
+	/* Verify the entire MSI-X table range is hyp-owned */
+	if (hyp_check_range_owned(dev->msix_table_phys & PAGE_MASK,
+			PAGE_ALIGN(dev->msix_table_size +
+				   (dev->msix_table_phys & ~PAGE_MASK))))
+		goto out_err;
+
+	base = __hyp_va(dev->msix_table_phys);
+	for (i = 0; i < dev->nr_msix_entries; i++)
+		hyp_writel(MSIX_ENTRY_CTRL_MASKBIT,
+			   base + i * MSIX_ENTRY_SIZE + MSIX_ENTRY_VECTOR_CTRL);
+
+	hyp_spin_unlock(&device_spinlock);
+	return 0;
+
+out_err:
+	hyp_spin_unlock(&device_spinlock);
+	return -EINVAL;
+}
+
+/*
+ * Find the device assigned to @vm whose MSI-X table lives on physical page
+ * @page_phys. Returns NULL if no such device exists.
+ * Caller must hold device_spinlock.
+ */
+static struct pkvm_device *
+pkvm_find_device_by_msix_page(struct pkvm_hyp_vm *vm, u64 page_phys)
+{
+	unsigned int i;
+
+	hyp_assert_lock_held(&device_spinlock);
+
+	for (i = 0; i < registered_devices_nr; i++) {
+		struct pkvm_device *dev = &registered_devices[i];
+
+		if (!dev->nr_msix_entries)
+			continue;
+		if (dev->ctxt != vm)
+			continue;
+		if ((dev->msix_table_phys & PAGE_MASK) == page_phys)
+			return dev;
+	}
+	return NULL;
+}
+
+/*
+ * Return true if @offset (page-relative) falls within the MSI-X table of @dev
+ * on physical page @page_phys.
+ * Caller must hold device_spinlock.
+ */
+static bool pkvm_offset_in_msix_range(struct pkvm_device *dev,
+				      u64 page_phys, u64 offset)
+{
+	u64 table_page_off = dev->msix_table_phys & ~PAGE_MASK;
+	u64 table_end      = table_page_off + dev->msix_table_size;
+
+	/* The MSI-X table must be on this page for us to have been called */
+	if ((dev->msix_table_phys & PAGE_MASK) != page_phys)
+		return false;
+
+	return offset >= table_page_off && offset < table_end;
+}
+
+/*
+ * EL2 emulation of accesses to non-MSI-X registers on the MSI-X table page.
+ *
+ * When crosvm maps a pKVM-assigned device it excludes the MSI-X table page
+ * from the guest's stage-2 so that MSI-X writes trap to EL2.  Any other MMIO
+ * registers that happen to share the same 4 KB page would also fault.  The
+ * VFIO fallback in crosvm silently fails because the BAR is donated to hyp,
+ * making those registers permanently inaccessible.
+ *
+ * This handler runs inside the fixup_guest_exit() loop at EL2 before the
+ * fault is ever surfaced to EL1 or crosvm.  Returning true re-enters the
+ * guest directly.
+ *
+ * Only 32-bit aligned word accesses are emulated; other widths return false
+ * and fall through to the normal (host-visible) path.
+ */
+bool pkvm_hyp_handle_msix_page_dabt(struct kvm_vcpu *vcpu)
+{
+	u64 ipa, page_phys, offset;
+	struct pkvm_hyp_vcpu *hyp_vcpu;
+	struct pkvm_hyp_vm *hyp_vm;
+	struct pkvm_device *dev;
+	void *phys_va;
+	int rt;
+
+	if (!vcpu_is_protected(vcpu))
+		return false;
+
+	if (!kvm_vcpu_dabt_isvalid(vcpu) || kvm_vcpu_abt_issea(vcpu))
+		return false;
+
+	/* Only emulate 32-bit word accesses for now */
+	if (kvm_vcpu_dabt_get_as(vcpu) != sizeof(u32))
+		return false;
+
+	/* Fault IPA from HPFAR_EL2 (bits [63:12]) plus FAR_EL2 low 12 bits */
+	ipa = kvm_vcpu_get_fault_ipa(vcpu);
+	ipa |= FAR_TO_FIPA_OFFSET(kvm_vcpu_get_hfar(vcpu));
+
+	page_phys = ipa & PAGE_MASK;
+	offset    = ipa & ~PAGE_MASK;
+
+	hyp_vcpu = container_of(vcpu, struct pkvm_hyp_vcpu, vcpu);
+	hyp_vm   = pkvm_hyp_vcpu_to_hyp_vm(hyp_vcpu);
+
+	hyp_spin_lock(&device_spinlock);
+
+	dev = pkvm_find_device_by_msix_page(hyp_vm, page_phys);
+	if (!dev)
+		goto out_unlock_false;
+
+	/* Let MSI-X table accesses fall through to the normal path */
+	if (pkvm_offset_in_msix_range(dev, page_phys, offset))
+		goto out_unlock_false;
+
+	/* Defense in depth: verify page is hyp-owned, matching the HVC paths */
+	if (hyp_check_range_owned(page_phys, PAGE_SIZE))
+		goto out_unlock_false;
+
+	phys_va = __hyp_va(page_phys + offset);
+	rt = kvm_vcpu_dabt_get_rd(vcpu);
+
+	if (kvm_vcpu_dabt_iswrite(vcpu)) {
+		u32 val = (u32)vcpu_get_reg(vcpu, rt);
+
+		hyp_writel(val, phys_va);
+		/* TODO: remove once confirmed exercised in the field. */
+		hyp_info("msix-page emul: ipa=0x%llx W offset=0x%llx val=0x%x",
+			 ipa, offset, val);
+	} else {
+		u64 val = hyp_readl(phys_va);
+
+		if (kvm_vcpu_dabt_issext(vcpu))
+			val = sign_extend64(val, 31);
+		vcpu_set_reg(vcpu, rt, val);
+		/* TODO: remove once confirmed exercised in the field. */
+		hyp_info("msix-page emul: ipa=0x%llx R offset=0x%llx val=0x%llx",
+			 ipa, offset, val);
+	}
+
+	hyp_spin_unlock(&device_spinlock);
+
+	__kvm_skip_instr(vcpu);
+	return true;
+
+out_unlock_false:
+	hyp_spin_unlock(&device_spinlock);
+	return false;
 }
 
 bool pkvm_device_request_dma(struct pkvm_hyp_vcpu *hyp_vcpu, u64 *exit_code)

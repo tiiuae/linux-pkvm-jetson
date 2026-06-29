@@ -192,6 +192,19 @@ static const exit_handler_fn hyp_exit_handlers[] = {
 	[ESR_ELx_EC_MOPS]		= kvm_hyp_handle_mops,
 };
 
+/*
+ * Protected-guest DABT handler: emulate non-MSI-X registers on the MSI-X
+ * table page at EL2, then fall through to the shared DABT handler.
+ * The host (EL1 + crosvm) never sees these accesses.
+ */
+static bool pvm_handle_dabt_low(struct kvm_vcpu *vcpu, u64 *exit_code)
+{
+	if (pkvm_hyp_handle_msix_page_dabt(vcpu))
+		return true;
+
+	return kvm_hyp_handle_dabt_low(vcpu, exit_code);
+}
+
 static const exit_handler_fn pvm_exit_handlers[] = {
 	[0 ... ESR_ELx_EC_MAX]		= NULL,
 	[ESR_ELx_EC_HVC64]		= kvm_handle_pvm_hvc64,
@@ -201,7 +214,7 @@ static const exit_handler_fn pvm_exit_handlers[] = {
 	[ESR_ELx_EC_SME]		= kvm_handle_pvm_restricted,
 	[ESR_ELx_EC_FP_ASIMD]		= kvm_hyp_handle_fpsimd,
 	[ESR_ELx_EC_IABT_LOW]		= kvm_hyp_handle_iabt_low,
-	[ESR_ELx_EC_DABT_LOW]		= kvm_hyp_handle_dabt_low,
+	[ESR_ELx_EC_DABT_LOW]		= pvm_handle_dabt_low,
 	[ESR_ELx_EC_WATCHPT_LOW]	= kvm_hyp_handle_watchpt_low,
 	[ESR_ELx_EC_MOPS]		= kvm_hyp_handle_mops,
 };

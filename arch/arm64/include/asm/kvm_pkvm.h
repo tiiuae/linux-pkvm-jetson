@@ -362,4 +362,13 @@ enum kvm_iommu_debug_ops {
 	PKVM_IOMMU_DEBUG_EXPORT_STATE,
 };
 
+/* Hyp-mediated MSI-X access for protected VM passthrough */
+int pkvm_msix_hyp_read_entry(u32 dev_idx, u32 entry_idx,
+			     u32 *addr_lo, u32 *addr_hi,
+			     u32 *data, u32 *ctrl);
+int pkvm_msix_hyp_write_entry(u32 dev_idx, u32 entry_idx,
+			      u32 addr_lo, u32 addr_hi,
+			      u32 data, u32 ctrl, u32 field_mask);
+int pkvm_msix_hyp_mask_all(u32 dev_idx);
+
 #endif	/* __ARM64_KVM_PKVM_H__ */

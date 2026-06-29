@@ -13,15 +13,19 @@
 #include <linux/iommu.h>
 #include <linux/kmemleak.h>
 #include <linux/kvm_host.h>
+#include <linux/irqchip/arm-gic-v3.h>
 #include <asm/kvm_mmu.h>
 #include <linux/memblock.h>
 #include <linux/mutex.h>
+#include <linux/notifier.h>
 #include <linux/of_address.h>
 #include <linux/of_fdt.h>
 #include <linux/of_reserved_mem.h>
+#include <linux/pci.h>
 #include <linux/platform_device.h>
 #include <linux/list_sort.h>
 #include <linux/sort.h>
+#include <linux/workqueue.h>
 
 #include <asm/kvm_host.h>
 #include <asm/kvm_hyp.h>
@@ -51,6 +55,20 @@
 #define PKVM_DEVICE_ASSIGN_COMPAT	"pkvm,device-assignment"
 #define PKVM_MEDIATED_DEVICE_COMPAT 	"pkvm,mediated-device"
 
+/*
+ * Debug knob: when set, every PCIe device with an IOMMU binding is treated
+ * as assignable, and each PCIe host-bridge "ranges" MMIO window is registered
+ * as a PKVM_MREG_ASSIGN_MMIO region so EL2's BAR-vs-assign-region check
+ * passes. Default is the strict DT-declared mode.
+ */
+static bool pkvm_assign_permissive __ro_after_init;
+
+static int __init pkvm_assign_permissive_setup(char *str)
+{
+	return kstrtobool(str, &pkvm_assign_permissive);
+}
+early_param("pkvm.assign_permissive", pkvm_assign_permissive_setup);
+
 DEFINE_STATIC_KEY_FALSE(kvm_protected_mode_initialized);
 
 static phys_addr_t pvmfw_base;
@@ -64,7 +82,7 @@ phys_addr_t hyp_mem_base;
 phys_addr_t hyp_mem_size;
 
 extern struct pkvm_device *kvm_nvhe_sym(registered_devices);
-extern u32 kvm_nvhe_sym(registered_devices_nr);
+extern unsigned long kvm_nvhe_sym(registered_devices_nr);
 
 extern struct pkvm_mediated_device *kvm_nvhe_sym(mediated_devices);
 extern u32 kvm_nvhe_sym(mediated_devices_nr);
@@ -166,6 +184,50 @@ static int __init register_moveable_fdt_resource(struct device_node *np,
 	return 0;
 }
 
+/*
+ * Permissive-mode helper: register every MEM window from each PCIe host
+ * bridge's "ranges" property as a PKVM_MREG_ASSIGN_MMIO region. EL2 will
+ * then accept any BAR PCI core has assigned within those windows.
+ */
+static int __init register_pcie_ranges_as_assign_mmio(void)
+{
+	struct of_pci_range_parser parser;
+	struct of_pci_range range;
+	struct device_node *np;
+	unsigned int i = kvm_nvhe_sym(pkvm_moveable_regs_nr);
+
+	for_each_node_by_type(np, "pci") {
+		if (of_pci_range_parser_init(&parser, np))
+			continue;
+
+		for_each_of_pci_range(&parser, &range) {
+			u64 start, size;
+
+			if ((range.flags & IORESOURCE_TYPE_BITS) != IORESOURCE_MEM)
+				continue;
+
+			if (i >= PKVM_NR_MOVEABLE_REGS) {
+				of_node_put(np);
+				return -ENOMEM;
+			}
+
+			start = ALIGN_DOWN(range.cpu_addr, PAGE_SIZE);
+			size  = ALIGN(range.cpu_addr + range.size, PAGE_SIZE) - start;
+
+			moveable_regs[i].start = start;
+			moveable_regs[i].size  = size;
+			moveable_regs[i].type  = PKVM_MREG_ASSIGN_MMIO;
+			i++;
+
+			kvm_info("pkvm: permissive: PCIe RC %pOF range 0x%llx-0x%llx as ASSIGN_MMIO\n",
+				 np, start, start + size - 1);
+		}
+	}
+
+	kvm_nvhe_sym(pkvm_moveable_regs_nr) = i;
+	return 0;
+}
+
 static int __init register_moveable_regions(void)
 {
 	struct memblock_region *reg;
@@ -198,6 +260,12 @@ static int __init register_moveable_regions(void)
 			if (ret)
 				goto out_fail;
 		}
+	}
+
+	if (pkvm_assign_permissive) {
+		ret = register_pcie_ranges_as_assign_mmio();
+		if (ret)
+			goto out_fail;
 	}
 
 	sort_moveable_regs();
@@ -429,6 +497,19 @@ static int __pkvm_create_hyp_vm(struct kvm *kvm)
 
 	init_hyp_stage2_memcache(&kvm->arch.pkvm.stage2_teardown_mc);
 
+	/* Populate ITS doorbell info for pviommu MSI mapping */
+	{
+		gpa_t guest_its_base = kvm_vgic_its_get_base(kvm);
+		phys_addr_t phys_doorbell = gic_its_get_doorbell_phys();
+
+		if (guest_its_base != (gpa_t)-1 && phys_doorbell) {
+			kvm->arch.pkvm.its_doorbell_guest_ipa =
+				(guest_its_base + GITS_TRANSLATER) & PAGE_MASK;
+			kvm->arch.pkvm.its_doorbell_phys_addr =
+				phys_doorbell & PAGE_MASK;
+		}
+	}
+
 	ret = kvm_call_refill_hyp_nvhe(__pkvm_init_vm, kvm, pgd);
 	if (ret)
 		goto free_pgd;
@@ -506,117 +587,167 @@ int pkvm_init_host_vm(struct kvm *kvm, unsigned long type)
 	return 0;
 }
 
-static int pkvm_register_device(struct of_phandle_args *args,
-				struct pkvm_device *dev)
+/*
+ * Register a device for pKVM assignment using the IOMMU driver's
+ * get_device_iommu_id callback. Works for PCI devices behind iommu-map.
+ */
+static int pkvm_register_device_from_dev(struct device *dev, u32 group_id,
+					 struct pkvm_device *pkvm_dev)
 {
-	struct device_node *np = args->np;
-	struct of_phandle_args iommu_spec;
-	u32 group_id = args->args[0];
-	struct resource res;
-	u64 base, size;
-	pkvm_handle_t iommu_id;
+	int num_ids, i, ret;
+	struct resource *res;
+	struct pci_dev *pdev;
 	unsigned int j = 0;
-	int ret;
 
-	/* Parse regs */
-	while (!of_address_to_resource(np, j, &res)) {
-		if (j >= PKVM_DEVICE_MAX_RESOURCE)
-			return -E2BIG;
+	num_ids = kvm_iommu_device_num_ids(dev);
+	if (num_ids <= 0)
+		return -ENOENT;
 
-		base = res.start;
-		size = resource_size(&res);
-		if (!PAGE_ALIGNED(base) || !PAGE_ALIGNED(size))
-			return -EINVAL;
-
-		dev->resources[j].base = base;
-		dev->resources[j].size = size;
-		j++;
+	/* For PCI devices, extract BAR resources */
+	if (dev_is_pci(dev)) {
+		pdev = to_pci_dev(dev);
+		for (i = 0; i < PCI_STD_NUM_BARS && j < PKVM_DEVICE_MAX_RESOURCE; i++) {
+			res = &pdev->resource[i];
+			if (!resource_size(res))
+				continue;
+			if (!(res->flags & (IORESOURCE_MEM | IORESOURCE_IO)))
+				continue;
+			if (PAGE_ALIGNED(res->start) && PAGE_ALIGNED(resource_size(res))) {
+				pkvm_dev->resources[j].base = res->start;
+				pkvm_dev->resources[j].size = resource_size(res);
+				j++;
+			}
+		}
 	}
-	dev->nr_resources = j;
+	pkvm_dev->nr_resources = j;
 
-	/* Parse iommus */
-	j = 0;
-	while (!of_parse_phandle_with_args(np, "iommus",
-					   "#iommu-cells",
-					   j, &iommu_spec)) {
-		if (iommu_spec.args_count != 1) {
-			kvm_err("[Devices] Unsupported binding for %s, expected <&iommu id>",
-				np->full_name);
-			return -EINVAL;
+	/* Extract MSI-X table location for hyp-mediated access */
+	if (dev_is_pci(dev) && pdev->msix_cap) {
+		u32 table_reg;
+		u16 flags;
+		u8 bir;
+		u32 table_offset;
+		u16 nr_entries;
+
+		pci_read_config_word(pdev, pdev->msix_cap + PCI_MSIX_FLAGS,
+				     &flags);
+		pci_read_config_dword(pdev, pdev->msix_cap + PCI_MSIX_TABLE,
+				      &table_reg);
+
+		bir = table_reg & PCI_MSIX_TABLE_BIR;
+		table_offset = table_reg & PCI_MSIX_TABLE_OFFSET;
+		nr_entries = (flags & PCI_MSIX_FLAGS_QSIZE) + 1;
+
+		if (bir < PCI_STD_NUM_BARS && pci_resource_start(pdev, bir)) {
+			pkvm_dev->msix_table_phys =
+				pci_resource_start(pdev, bir) + table_offset;
+			pkvm_dev->nr_msix_entries = nr_entries;
+			pkvm_dev->msix_table_size =
+				nr_entries * PCI_MSIX_ENTRY_SIZE;
+			pkvm_dev->msix_bir = bir;
 		}
+	}
 
-		if (j >= PKVM_DEVICE_MAX_RESOURCE) {
-			of_node_put(iommu_spec.np);
-			return -E2BIG;
-		}
+	/* Get IOMMU stream IDs via driver callback */
+	for (i = 0; i < num_ids && i < PKVM_DEVICE_MAX_IOMMU; i++) {
+		pkvm_handle_t iommu_id;
+		u32 sid;
 
-		ret = kvm_get_iommu_id_by_of(iommu_spec.np, &iommu_id);
+		ret = kvm_iommu_device_id(dev, i, &iommu_id, &sid);
 		if (ret)
 			return ret;
-
-		dev->iommus[j].id = iommu_id;
-		dev->iommus[j].endpoint = iommu_spec.args[0];
-		of_node_put(iommu_spec.np);
-		j++;
+		pkvm_dev->iommus[i].id = iommu_id;
+		pkvm_dev->iommus[i].endpoint = sid;
 	}
+	pkvm_dev->nr_iommus = i;
+	pkvm_dev->ctxt = NULL;
+	pkvm_dev->refcount = 0;
+	pkvm_dev->reset_handler = NULL;
+	pkvm_dev->group_id = group_id;
 
-	dev->nr_iommus = j;
-	dev->ctxt = NULL;
-	dev->refcount = 0;
-	dev->reset_handler = NULL;
-	dev->group_id = group_id;
+	/*
+	 * Mark the device as enrolled in the pKVM registered_devices[] table.
+	 * The assign/reclaim paths walk iommu_group_for_each_dev() which
+	 * also visits sibling devices that share an IOMMU group purely due
+	 * to hardware SID constraints (e.g. the Tegra234 PCIe host
+	 * controller in the same group as its downstream PCI endpoints).
+	 * Donating those siblings' MMIO would steal it from the host.
+	 */
+	dev->pkvm_registered = true;
 
 	return 0;
 }
 
-static int pkvm_init_devices(void)
+static int pkvm_init_devices_permissive(unsigned long *out_nr,
+					struct pkvm_device **out_devs)
 {
-	struct device_node *np;
+	struct pci_dev *pdev = NULL;
 	int idx = 0, ret = 0, dev_cnt = 0;
 	size_t dev_sz;
 	struct pkvm_device *dev_base;
 
-	for_each_compatible_node (np, NULL, PKVM_DEVICE_ASSIGN_COMPAT) {
-		struct of_phandle_args args;
-		int cnt = 0;
+	*out_nr = 0;
+	*out_devs = NULL;
 
-		while (!of_parse_phandle_with_fixed_args(np, "devices", 1, cnt, &args)) {
-			cnt++;
-			of_node_put(args.np);
-		}
-		dev_cnt += cnt;
+	/*
+	 * Auto-discover every SMMU-backed PCI device. Trusted MMIO regions
+	 * for these BARs come from register_pcie_ranges_as_assign_mmio().
+	 */
+
+	/* Pass 1: count PCI devices with IOMMU IDs */
+	for_each_pci_dev(pdev) {
+		int n = kvm_iommu_device_num_ids(&pdev->dev);
+
+		if (n > 0)
+			dev_cnt++;
 	}
-	kvm_info("Found %d assignable devices", dev_cnt);
+
+	kvm_info("Found %d assignable devices (auto-discovered)", dev_cnt);
 
 	if (!dev_cnt)
 		return 0;
 
 	dev_sz = PAGE_ALIGN(size_mul(sizeof(struct pkvm_device), dev_cnt));
-
 	dev_base = alloc_pages_exact(dev_sz, GFP_KERNEL_ACCOUNT | __GFP_ZERO);
-
 	if (!dev_base)
 		return -ENOMEM;
 
-	for_each_compatible_node(np, NULL, PKVM_DEVICE_ASSIGN_COMPAT) {
-		struct of_phandle_args args;
-		int cnt = 0;
+	/* Pass 2: register each device */
+	pdev = NULL;
+	for_each_pci_dev(pdev) {
+		if (kvm_iommu_device_num_ids(&pdev->dev) <= 0)
+			continue;
 
-		while (!of_parse_phandle_with_fixed_args(np, "devices", 1, cnt, &args)) {
-			ret = pkvm_register_device(&args, &dev_base[idx]);
-			of_node_put(args.np);
-			if (ret) {
-				of_node_put(np);
-				goto out_free;
-			}
-			cnt++;
-			idx++;
+		{
+			struct iommu_group *grp = iommu_group_get(&pdev->dev);
+			u32 grp_id = grp ? iommu_group_id(grp) : idx;
+
+			if (grp)
+				iommu_group_put(grp);
+			ret = pkvm_register_device_from_dev(&pdev->dev,
+							    grp_id,
+							    &dev_base[idx]);
 		}
+		if (ret) {
+			if (ret == -ENOENT) {
+				ret = 0;
+				continue;
+			}
+			kvm_err("Failed to register %s: %d", dev_name(&pdev->dev), ret);
+			goto out_free;
+		}
+		pdev->pkvm_dev_idx = idx;
+		kvm_info("Registered %s (group %u, %d stream IDs, %d MSI-X, %d resources) for assignment",
+			 dev_name(&pdev->dev), dev_base[idx].group_id,
+			 dev_base[idx].nr_iommus,
+			 dev_base[idx].nr_msix_entries,
+			 dev_base[idx].nr_resources);
+		idx++;
 	}
 
-	kvm_nvhe_sym(registered_devices_nr) = dev_cnt;
-	kvm_nvhe_sym(registered_devices) = dev_base;
-	return ret;
+	*out_nr = idx;
+	*out_devs = dev_base;
+	return 0;
 
 out_free:
 	free_pages_exact(dev_base, dev_sz);
@@ -765,6 +896,118 @@ out_free:
 	return ret;
 }
 
+static struct pci_dev *pkvm_find_pci_dev_by_of_node(struct device_node *np)
+{
+	struct pci_dev *pdev = NULL;
+
+	for_each_pci_dev(pdev) {
+		if (pdev->dev.of_node == np)
+			return pdev;
+	}
+	return NULL;
+}
+
+static int pkvm_init_devices_strict(unsigned long *out_nr,
+				    struct pkvm_device **out_devs)
+{
+	struct device_node *np;
+	struct of_phandle_args args;
+	struct pkvm_device *dev_base;
+	int idx = 0, dev_cnt = 0, ret = 0, i;
+	size_t dev_sz;
+
+	*out_nr = 0;
+	*out_devs = NULL;
+
+	/* Pass 1: count declared devices */
+	for_each_compatible_node(np, NULL, PKVM_DEVICE_ASSIGN_COMPAT) {
+		i = 0;
+		while (!of_parse_phandle_with_fixed_args(np, "devices", 1, i,
+							 &args)) {
+			dev_cnt++;
+			i++;
+			of_node_put(args.np);
+		}
+	}
+
+	kvm_info("Found %d DT-declared assignable devices", dev_cnt);
+	if (!dev_cnt)
+		return 0;
+
+	dev_sz = PAGE_ALIGN(size_mul(sizeof(struct pkvm_device), dev_cnt));
+	dev_base = alloc_pages_exact(dev_sz, GFP_KERNEL_ACCOUNT | __GFP_ZERO);
+	if (!dev_base)
+		return -ENOMEM;
+
+	/* Pass 2: resolve each phandle and register */
+	for_each_compatible_node(np, NULL, PKVM_DEVICE_ASSIGN_COMPAT) {
+		i = 0;
+		while (!of_parse_phandle_with_fixed_args(np, "devices", 1, i,
+							 &args)) {
+			struct device_node *dev_np = args.np;
+			struct pci_dev *pdev;
+			struct iommu_group *grp;
+			u32 grp_id;
+
+			i++;
+
+			pdev = pkvm_find_pci_dev_by_of_node(dev_np);
+			if (!pdev) {
+				kvm_err("pkvm: declared device %pOF not bound; skipping\n",
+					dev_np);
+				of_node_put(dev_np);
+				continue;
+			}
+
+			grp = iommu_group_get(&pdev->dev);
+			grp_id = grp ? iommu_group_id(grp) : idx;
+			if (grp)
+				iommu_group_put(grp);
+
+			ret = pkvm_register_device_from_dev(&pdev->dev, grp_id,
+							    &dev_base[idx]);
+			of_node_put(dev_np);
+			if (ret == -ENOENT) {
+				ret = 0;
+				continue;
+			}
+			if (ret) {
+				kvm_err("pkvm: failed to register %s: %d\n",
+					dev_name(&pdev->dev), ret);
+				of_node_put(np);
+				goto out_free;
+			}
+
+			pdev->pkvm_dev_idx = idx;
+			kvm_info("Registered %s (group %u, %d stream IDs, %d MSI-X, %d resources)",
+				 dev_name(&pdev->dev), dev_base[idx].group_id,
+				 dev_base[idx].nr_iommus,
+				 dev_base[idx].nr_msix_entries,
+				 dev_base[idx].nr_resources);
+			idx++;
+		}
+	}
+
+	*out_nr = idx;
+	*out_devs = dev_base;
+	return 0;
+
+out_free:
+	free_pages_exact(dev_base, dev_sz);
+	return ret;
+}
+
+static int pkvm_init_devices(unsigned long *out_nr, struct pkvm_device **out_devs)
+{
+	*out_nr = 0;
+	*out_devs = NULL;
+
+	if (pkvm_assign_permissive)
+		return pkvm_init_devices_permissive(out_nr, out_devs);
+
+	return pkvm_init_devices_strict(out_nr, out_devs);
+}
+
 static void __init _kvm_host_prot_finalize(void *arg)
 {
 	int *err = arg;
@@ -808,16 +1051,15 @@ static int __init finalize_pkvm(void)
 	if (ret)
 		pkvm_firmware_rmem_clear();
 
-	ret = pkvm_init_devices();
-	if (ret) {
-		pr_err("Failed to init kvm devices %d\n", ret);
-		pkvm_firmware_rmem_clear();
-	}
-
-	ret = kvm_call_hyp_nvhe(__pkvm_devices_init);
-	if (ret)
-		pr_warn("Assignable devices failed to initialize in the hypervisor %d\n", ret);
-
+	/*
+	 * Device registration is deferred to a post-finalize HVC. On platforms
+	 * like Tegra234, the PCIe RC probe is gated on async BPMP power-domain
+	 * callbacks and only completes well after device_initcall_sync, so
+	 * scanning for assignable devices here would always find zero.
+	 * pkvm_late_devices_init() (registered as late_initcall_sync below)
+	 * arms a PCI bus notifier and calls __pkvm_devices_register_late once
+	 * enumeration has settled.
+	 */
 	ret = pkvm_init_device_audit();
 	if (ret) {
 		pr_err("Failed to init pkvm audit system %d\n", ret);
@@ -848,6 +1090,112 @@ static int __init finalize_pkvm(void)
 	return 0;
 }
 device_initcall_sync(finalize_pkvm);
+
+/*
+ * Late, post-finalize device registration.
+ *
+ * On platforms where PCI enumeration only completes well after
+ * device_initcall_sync (e.g. Tegra234, where the PCIe RC waits on async
+ * BPMP power-domain callbacks and finishes around 13s into boot), the
+ * scan in finalize_pkvm() finds zero assignable devices. Instead, we arm
+ * a PCI bus notifier here and debounce: every BUS_NOTIFY_BOUND_DRIVER
+ * event pushes a delayed_work out by LATE_DEBOUNCE_MS, and once the bus
+ * goes quiet for that long we run the scan and issue a one-shot HVC.
+ *
+ * EL2 enforces the one-shot guarantee in pkvm_devices_register_late();
+ * the late_submitted flag here is just a host-side optimization so we
+ * don't keep rescheduling work after the table has been committed.
+ */
+#define PKVM_LATE_DEBOUNCE_MS	7000
+
+static DEFINE_MUTEX(pkvm_late_lock);
+static bool pkvm_late_submitted;
+static struct delayed_work pkvm_late_dw;
+static struct notifier_block pkvm_late_nb;
+
+static void pkvm_late_register_work(struct work_struct *w)
+{
+	unsigned long nr_devs = 0;
+	struct pkvm_device *devs = NULL;
+	size_t dev_sz;
+	int ret;
+
+	mutex_lock(&pkvm_late_lock);
+	if (pkvm_late_submitted)
+		goto out;
+
+	ret = pkvm_init_devices(&nr_devs, &devs);
+	if (ret) {
+		pr_err("pkvm: late device scan failed: %d\n", ret);
+		goto out;
+	}
+
+	if (!nr_devs) {
+		pr_warn("pkvm: late scan found 0 assignable devices, skipping HVC\n");
+		WRITE_ONCE(pkvm_late_submitted, true);
+		goto out;
+	}
+
+	/*
+	 * Pass the device array directly to EL2 via the HVC. We must NOT
+	 * write to kvm_nvhe_sym(registered_devices*) here — those live in
+	 * hyp BSS which is stage-2 protected after pkvm_drop_host_privileges().
+	 * EL2 will kern_hyp_va() and donate the pages itself.
+	 */
+	ret = kvm_call_hyp_nvhe(__pkvm_devices_register_late,
+				(unsigned long)nr_devs,
+				(unsigned long)devs);
+	if (ret) {
+		pr_err("pkvm: late device HVC failed: %d\n", ret);
+		dev_sz = PAGE_ALIGN(size_mul(sizeof(struct pkvm_device), nr_devs));
+		free_pages_exact(devs, dev_sz);
+		goto out;
+	}
+
+	pr_info("pkvm: registered %lu device(s) via late HVC\n", nr_devs);
+	WRITE_ONCE(pkvm_late_submitted, true);
+out:
+	mutex_unlock(&pkvm_late_lock);
+}
+
+static int pkvm_late_pci_notify(struct notifier_block *nb,
+				unsigned long action, void *data)
+{
+	if (action != BUS_NOTIFY_BOUND_DRIVER)
+		return NOTIFY_DONE;
+
+	/*
+	 * No locking here: notifier callbacks may run with driver-core locks
+	 * held, and pkvm_late_submitted is only an optimization. The
+	 * authoritative one-shot check is inside pkvm_late_register_work()
+	 * (and ultimately in EL2 via pkvm_devices_register_late()).
+	 */
+	if (READ_ONCE(pkvm_late_submitted))
+		return NOTIFY_DONE;
+
+	mod_delayed_work(system_wq, &pkvm_late_dw,
+			 msecs_to_jiffies(PKVM_LATE_DEBOUNCE_MS));
+	return NOTIFY_DONE;
+}
+
+static int __init pkvm_late_devices_init(void)
+{
+	if (!is_protected_kvm_enabled() || !is_kvm_arm_initialised())
+		return 0;
+
+	INIT_DELAYED_WORK(&pkvm_late_dw, pkvm_late_register_work);
+	pkvm_late_nb.notifier_call = pkvm_late_pci_notify;
+	bus_register_notifier(&pci_bus_type, &pkvm_late_nb);
+
+	/*
+	 * Schedule an initial fire so we still commit (with zero devices)
+	 * even on systems where no PCI device ever binds.
+	 */
+	mod_delayed_work(system_wq, &pkvm_late_dw,
+			 msecs_to_jiffies(PKVM_LATE_DEBOUNCE_MS));
+	return 0;
+}
+late_initcall_sync(pkvm_late_devices_init);
 
 int pkvm_enable_smc_forwarding(struct file *kvm_file)
 {
@@ -1969,13 +2317,18 @@ int __pkvm_topup_hyp_alloc_mgt_gfp(unsigned long id, unsigned long nr_pages,
 
 static int __pkvm_donate_resource(struct resource *r)
 {
-	if (!PAGE_ALIGNED(resource_size(r)) || !PAGE_ALIGNED(r->start))
+	int ret;
+
+	if (!PAGE_ALIGNED(resource_size(r)) || !PAGE_ALIGNED(r->start)) {
+		pr_warn("pkvm_donate: NOT page-aligned (start=0x%llx size=0x%llx) -> EINVAL\n",
+			(u64)r->start, (u64)resource_size(r));
 		return -EINVAL;
+	}
 
-	return kvm_call_hyp_nvhe(__pkvm_host_donate_hyp_mmio,
-				 __phys_to_pfn(r->start),
-				 resource_size(r) >> PAGE_SHIFT);
-
+	ret = kvm_call_hyp_nvhe(__pkvm_host_donate_hyp_mmio,
+				__phys_to_pfn(r->start),
+				resource_size(r) >> PAGE_SHIFT);
+	return ret;
 }
 
 static int __pkvm_reclaim_resource(struct resource *r)
@@ -1990,85 +2343,301 @@ static int __pkvm_reclaim_resource(struct resource *r)
 
 static int __pkvm_arch_assign_device(struct device *dev, void *data)
 {
-	struct platform_device *pdev;
-	struct resource *r;
-	int index = 0;
 	int ret = 0;
 
-	if (!dev_is_platform(dev))
-		return -EOPNOTSUPP;
+	/*
+	 * iommu_group_for_each_dev() visits every member of the IOMMU group,
+	 * including siblings that share the group purely due to hardware SID
+	 * constraints (e.g. Tegra234 PCIe host controller 14100000.pcie shares
+	 * group 5 with its downstream PCI endpoints). Those siblings were
+	 * never enrolled in EL2's registered_devices[], so the donate HVC
+	 * would fail with -ENODEV and abort the whole assign. Skip them
+	 * silently — their MMIO belongs to the host (this mirrors regular
+	 * KVM/VFIO, which never relocates MMIO of unclaimed group members).
+	 */
+	if (!dev->pkvm_registered)
+		return 0;
 
-	pdev = to_platform_device(dev);
+	if (dev_is_platform(dev)) {
+		struct platform_device *pdev = to_platform_device(dev);
+		struct resource *r;
+		int index = 0;
 
-	while ((r = platform_get_resource(pdev, IORESOURCE_MEM, index++))) {
-		ret = __pkvm_donate_resource(r);
-		if (ret)
-			break;
-	}
-
-	if (ret) {
-		while (index--) {
-			r = platform_get_resource(pdev, IORESOURCE_MEM, index);
-			__pkvm_reclaim_resource(r);
+		while ((r = platform_get_resource(pdev, IORESOURCE_MEM, index++))) {
+			ret = __pkvm_donate_resource(r);
+			if (ret) {
+				pr_warn("pkvm_assign_dev: %s platform res[%d] donate ret=%d -> abort\n",
+					dev_name(dev), index - 1, ret);
+				break;
+			}
 		}
+
+		if (ret) {
+			while (index--) {
+				r = platform_get_resource(pdev, IORESOURCE_MEM, index);
+				__pkvm_reclaim_resource(r);
+			}
+		}
+	} else if (dev_is_pci(dev)) {
+		struct pci_dev *pdev = to_pci_dev(dev);
+		int i;
+
+		for (i = 0; i < PCI_STD_NUM_BARS; i++) {
+			struct resource *r = &pdev->resource[i];
+
+			if (!resource_size(r))
+				continue;
+			if (!(r->flags & IORESOURCE_MEM))
+				continue;
+
+			ret = __pkvm_donate_resource(r);
+			if (ret) {
+				pr_warn("pkvm_assign_dev: %s BAR%d donate ret=%d -> abort\n",
+					dev_name(dev), i, ret);
+				break;
+			}
+		}
+
+		if (ret) {
+			while (i--) {
+				struct resource *r = &pdev->resource[i];
+
+				if (!resource_size(r))
+					continue;
+				if (!(r->flags & IORESOURCE_MEM))
+					continue;
+
+				__pkvm_reclaim_resource(r);
+			}
+		}
+	} else {
+		pr_warn("pkvm_assign_dev: %s unsupported bus type -> EOPNOTSUPP\n",
+			dev_name(dev));
+		return -EOPNOTSUPP;
 	}
+
 	return ret;
 }
 
 static int __pkvm_arch_reclaim_device(struct device *dev, void *data)
 {
-	struct platform_device *pdev;
-	struct resource *r;
-	int index = 0;
+	int err = 0, ret;
 
-	if (!dev)
-		return -EINVAL;
-	if (!dev_is_platform(dev))
-		return -EOPNOTSUPP;
-
-	pdev = to_platform_device(dev);
-
-	while ((r = platform_get_resource(pdev, IORESOURCE_MEM, index++)))
-		__pkvm_reclaim_resource(r);
-
-	return 0;
-}
-
-int kvm_arch_assign_device(struct device *dev)
-{
-	if (!is_protected_kvm_enabled())
+	/* Mirror the assign-side gate: only reclaim what we donated. */
+	if (!dev->pkvm_registered)
 		return 0;
 
-	return __pkvm_arch_assign_device(dev, NULL);
+	if (dev_is_platform(dev)) {
+		struct platform_device *pdev = to_platform_device(dev);
+		struct resource *r;
+		int index = 0;
+
+		while ((r = platform_get_resource(pdev, IORESOURCE_MEM, index++))) {
+			ret = __pkvm_reclaim_resource(r);
+			/*
+			 * -EBUSY = VM still owns the device; pkvm_devices_teardown()
+			 * will reclaim eagerly when the VM dies. Other return codes
+			 * are real failures worth surfacing.
+			 */
+			if (ret == -EBUSY)
+				continue;
+			if (ret) {
+				pr_warn("pkvm_reclaim: %s res%d reclaim failed ret=%d\n",
+					dev_name(dev), index - 1, ret);
+				err = err ?: ret;
+			}
+		}
+	} else if (dev_is_pci(dev)) {
+		struct pci_dev *pdev = to_pci_dev(dev);
+		int i;
+
+		for (i = 0; i < PCI_STD_NUM_BARS; i++) {
+			struct resource *r = &pdev->resource[i];
+
+			if (!resource_size(r))
+				continue;
+			if (!(r->flags & IORESOURCE_MEM))
+				continue;
+
+			ret = __pkvm_reclaim_resource(r);
+			if (ret == -EBUSY)
+				continue;
+			if (ret) {
+				pr_warn("pkvm_reclaim: %s BAR%d reclaim failed ret=%d\n",
+					dev_name(dev), i, ret);
+				err = err ?: ret;
+			}
+		}
+	}
+
+	return err;
 }
 
-int kvm_arch_assign_group(struct iommu_group *group)
+int kvm_arch_assign_device(struct device *dev, struct kvm *kvm)
 {
 	int ret;
 
 	if (!is_protected_kvm_enabled())
 		return 0;
 
+	if (!kvm_vm_is_protected(kvm))
+		return 0;
+
+	/*
+	 * The primary device must be enrolled in pKVM's registered_devices[].
+	 * Without this, EL2's pkvm_get_device lookup will fail at first BAR
+	 * access and the guest will crash with -ENODEV mid-boot. Refuse the
+	 * assign upfront so userspace gets a clear error from VFIO instead.
+	 *
+	 * Siblings sharing the IOMMU group are still allowed through the
+	 * group iterator (__pkvm_arch_assign_device returns 0 for them).
+	 */
+	if (!dev->pkvm_registered) {
+		pr_warn("pkvm_assign_dev: %s not registered with pKVM (no pkvm,device-assignment DT entry, and pkvm.assign_permissive=0)\n",
+			dev_name(dev));
+		return -ENODEV;
+	}
+
+	ret = __pkvm_arch_assign_device(dev, NULL);
+	if (!ret && dev_is_pci(dev)) {
+		struct pci_dev *pdev = to_pci_dev(dev);
+
+		if (pdev->msix_cap)
+			pdev->pkvm_msix_hyp = 1;
+	}
+	return ret;
+}
+
+static int __pkvm_arch_set_msix_hyp(struct device *dev, void *data)
+{
+	if (dev_is_pci(dev)) {
+		struct pci_dev *pdev = to_pci_dev(dev);
+
+		if (pdev->msix_cap)
+			pdev->pkvm_msix_hyp = 1;
+	}
+	return 0;
+}
+
+static int __pkvm_arch_clear_msix_hyp(struct device *dev, void *data)
+{
+	if (dev_is_pci(dev))
+		to_pci_dev(dev)->pkvm_msix_hyp = 0;
+	return 0;
+}
+
+static int __pkvm_count_registered(struct device *dev, void *data)
+{
+	unsigned int *count = data;
+
+	if (dev->pkvm_registered)
+		(*count)++;
+	return 0;
+}
+
+int kvm_arch_assign_group(struct iommu_group *group, struct kvm *kvm)
+{
+	unsigned int registered = 0;
+	int ret;
+
+	if (!is_protected_kvm_enabled())
+		return 0;
+
+	if (!kvm_vm_is_protected(kvm))
+		return 0;
+
+	/*
+	 * The group must contain at least one device enrolled in pKVM's
+	 * registered_devices[]. Otherwise EL2 has no record of any BAR for
+	 * this group and the guest will crash on first MMIO access.
+	 */
+	iommu_group_for_each_dev(group, &registered, __pkvm_count_registered);
+	if (!registered) {
+		pr_warn("pkvm_assign_group: group %d has no pKVM-registered devices (no pkvm,device-assignment DT entry, and pkvm.assign_permissive=0)\n",
+			iommu_group_id(group));
+		return -ENODEV;
+	}
+
 	ret = iommu_group_for_each_dev(group, NULL, __pkvm_arch_assign_device);
 
-	if (ret)
+	if (ret) {
 		iommu_group_for_each_dev(group, NULL, __pkvm_arch_reclaim_device);
+		return ret;
+	}
+
+	iommu_group_for_each_dev(group, NULL, __pkvm_arch_set_msix_hyp);
+
+	return 0;
+}
+
+void kvm_arch_reclaim_device(struct device *dev, struct kvm *kvm)
+{
+	if (!is_protected_kvm_enabled())
+		return;
+
+	if (!kvm_vm_is_protected(kvm))
+		return;
+
+	__pkvm_arch_reclaim_device(dev, NULL);
+
+	if (dev_is_pci(dev))
+		to_pci_dev(dev)->pkvm_msix_hyp = 0;
+}
+
+void kvm_arch_reclaim_group(struct iommu_group *group, struct kvm *kvm)
+{
+	if (!is_protected_kvm_enabled())
+		return;
+
+	if (!kvm_vm_is_protected(kvm))
+		return;
+
+	iommu_group_for_each_dev(group, NULL, __pkvm_arch_clear_msix_hyp);
+	iommu_group_for_each_dev(group, NULL, __pkvm_arch_reclaim_device);
+}
+
+/*
+ * Hyp-mediated MSI-X access wrappers.
+ * These HVCs allow the host to read/write MSI-X table entries on devices
+ * whose BARs have been donated to EL2 (protected VM passthrough).
+ * EL2 validates all accesses against boot-time registration data.
+ */
+int pkvm_msix_hyp_read_entry(u32 dev_idx, u32 entry_idx,
+			     u32 *addr_lo, u32 *addr_hi,
+			     u32 *data, u32 *ctrl)
+{
+	struct arm_smccc_res res;
+
+	res = kvm_call_hyp_nvhe_smccc(__pkvm_msix_read_entry,
+				      dev_idx, entry_idx, 0, 0);
+	if (res.a1)
+		return res.a1;
+
+	*addr_lo = (u32)res.a2;
+	*addr_hi = (u32)(res.a2 >> 32);
+	*data    = (u32)res.a3;
+	*ctrl    = (u32)(res.a3 >> 32);
+
+	return 0;
+}
+
+int pkvm_msix_hyp_write_entry(u32 dev_idx, u32 entry_idx,
+			      u32 addr_lo, u32 addr_hi,
+			      u32 data, u32 ctrl, u32 field_mask)
+{
+	u64 packed_addr = ((u64)addr_hi << 32) | addr_lo;
+	u64 packed_data_ctrl = ((u64)ctrl << 32) | data;
+	int ret;
+
+	ret = kvm_call_hyp_nvhe(__pkvm_msix_write_entry,
+				 dev_idx, entry_idx,
+				 packed_addr, packed_data_ctrl,
+				 field_mask, 0);
 
 	return ret;
 }
 
-void kvm_arch_reclaim_device(struct device *dev)
+int pkvm_msix_hyp_mask_all(u32 dev_idx)
 {
-	if (!is_protected_kvm_enabled())
-		return;
-
-	__pkvm_arch_reclaim_device(dev, NULL);
-}
-
-void kvm_arch_reclaim_group(struct iommu_group *group)
-{
-	if (!is_protected_kvm_enabled())
-		return;
-
-	iommu_group_for_each_dev(group, NULL, __pkvm_arch_reclaim_device);
+	return kvm_call_hyp_nvhe(__pkvm_msix_mask_all, dev_idx, 0);
 }

@@ -1714,16 +1714,34 @@ static void handle___pkvm_serial_register_ops(struct kvm_cpu_context *host_ctxt)
 
 static void handle___pkvm_devices_init(struct kvm_cpu_context *host_ctxt)
 {
+	DECLARE_REG(unsigned long, nr_devs, host_ctxt, 1);
+	DECLARE_REG(unsigned long, dev_ptr, host_ctxt, 2);
+
 	/*
 	 * Devices must be initialised after the IOMMUs driver is initialised.
 	 * We do this in a separate HVC to avoid complexity.
 	 */
-	cpu_reg(host_ctxt, 1) = pkvm_init_devices();
+	cpu_reg(host_ctxt, 1) = pkvm_init_devices(nr_devs,
+						  (struct pkvm_device *)dev_ptr);
 }
 
 static void handle___pkvm_device_audit_init(struct kvm_cpu_context *host_ctxt)
 {
 	cpu_reg(host_ctxt, 1) = pkvm_audit_init();
+}
+
+static void handle___pkvm_devices_register_late(struct kvm_cpu_context *host_ctxt)
+{
+	DECLARE_REG(unsigned long, nr_devs, host_ctxt, 1);
+	DECLARE_REG(unsigned long, dev_ptr, host_ctxt, 2);
+
+	/*
+	 * Post-finalize one-shot device registration. Used on platforms (e.g.
+	 * Tegra234) where PCI enumeration finishes after stage-2 lockdown.
+	 * EL2 enforces the one-shot guarantee internally.
+	 */
+	cpu_reg(host_ctxt, 1) = pkvm_devices_register_late(nr_devs,
+						(struct pkvm_device *)dev_ptr);
 }
 
 static void handle___pkvm_host_iommu_alloc_domain(struct kvm_cpu_context *host_ctxt)
@@ -1883,17 +1901,23 @@ static void handle___pkvm_host_map_guest_mmio(struct kvm_cpu_context *host_ctxt)
 	DECLARE_REG(u64, pfn, host_ctxt, 1);
 	DECLARE_REG(u64, gfn, host_ctxt, 2);
 	struct pkvm_hyp_vcpu *hyp_vcpu;
-	int ret = -EINVAL;
+	int ret;
 
-	if (!is_protected_kvm_enabled())
+	if (!is_protected_kvm_enabled()) {
+		ret = -EPERM;
 		goto out;
+	}
 
 	hyp_vcpu = pkvm_get_loaded_hyp_vcpu();
-	if (!hyp_vcpu)
+	if (!hyp_vcpu) {
+		ret = -EINVAL;
 		goto out;
+	}
 
-	if (!pkvm_hyp_vcpu_is_protected(hyp_vcpu))
+	if (!pkvm_hyp_vcpu_is_protected(hyp_vcpu)) {
+		ret = -EPERM;
 		goto out;
+	}
 
 	/* Top-up our per-vcpu memcache from the host's */
 	ret = pkvm_refill_memcache(hyp_vcpu);
@@ -1954,6 +1978,59 @@ static void handle___pkvm_host_iommu_debug(struct kvm_cpu_context *host_ctxt)
 	hyp_reqs_smccc_encode(ret, host_ctxt, this_cpu_ptr(&host_hyp_reqs));
 }
 #endif
+
+static void handle___pkvm_msix_read_entry(struct kvm_cpu_context *host_ctxt)
+{
+	DECLARE_REG(u32, device_idx, host_ctxt, 1);
+	DECLARE_REG(u32, entry_idx, host_ctxt, 2);
+	DECLARE_REG(u64, rsvd1, host_ctxt, 3);
+	DECLARE_REG(u64, rsvd2, host_ctxt, 4);
+	u64 packed_addr, packed_data_ctrl;
+
+	if (!is_protected_kvm_enabled() || rsvd1 || rsvd2) {
+		cpu_reg(host_ctxt, 1) = -EINVAL;
+		return;
+	}
+
+	cpu_reg(host_ctxt, 1) = pkvm_msix_read_entry(device_idx, entry_idx,
+						      &packed_addr,
+						      &packed_data_ctrl);
+	cpu_reg(host_ctxt, 2) = packed_addr;
+	cpu_reg(host_ctxt, 3) = packed_data_ctrl;
+}
+
+static void handle___pkvm_msix_write_entry(struct kvm_cpu_context *host_ctxt)
+{
+	DECLARE_REG(u32, device_idx, host_ctxt, 1);
+	DECLARE_REG(u32, entry_idx, host_ctxt, 2);
+	DECLARE_REG(u64, packed_addr, host_ctxt, 3);
+	DECLARE_REG(u64, packed_data_ctrl, host_ctxt, 4);
+	DECLARE_REG(u32, field_mask, host_ctxt, 5);
+	DECLARE_REG(u64, rsvd, host_ctxt, 6);
+
+	if (!is_protected_kvm_enabled() || rsvd) {
+		cpu_reg(host_ctxt, 1) = -EINVAL;
+		return;
+	}
+
+	cpu_reg(host_ctxt, 1) = pkvm_msix_write_entry(device_idx, entry_idx,
+						       packed_addr,
+						       packed_data_ctrl,
+						       field_mask);
+}
+
+static void handle___pkvm_msix_mask_all(struct kvm_cpu_context *host_ctxt)
+{
+	DECLARE_REG(u32, device_idx, host_ctxt, 1);
+	DECLARE_REG(u64, rsvd, host_ctxt, 2);
+
+	if (!is_protected_kvm_enabled() || rsvd) {
+		cpu_reg(host_ctxt, 1) = -EINVAL;
+		return;
+	}
+
+	cpu_reg(host_ctxt, 1) = pkvm_msix_mask_all(device_idx);
+}
 
 typedef void (*hcall_t)(struct kvm_cpu_context *);
 
@@ -2042,10 +2119,14 @@ static const hcall_t host_hcall[] = {
 	HANDLE_FUNC(__pkvm_host_reclaim_hyp_mmio),
 	HANDLE_FUNC(__pkvm_host_map_guest_mmio),
 	HANDLE_FUNC(__pkvm_pviommu_attach),
+	HANDLE_FUNC(__pkvm_msix_read_entry),
+	HANDLE_FUNC(__pkvm_msix_write_entry),
+	HANDLE_FUNC(__pkvm_msix_mask_all),
 	HANDLE_FUNC(__pkvm_pviommu_add_vsid),
 #ifdef CONFIG_ARM_SMMU_V2_PKVM
 	HANDLE_FUNC(__pkvm_mc_register_sid),
 #endif
+	HANDLE_FUNC(__pkvm_devices_register_late),
 #ifdef CONFIG_ARM_SMMU_V2_PKVM_DEBUGFS
 	HANDLE_FUNC(__pkvm_host_iommu_debug),
 #endif
@@ -2142,7 +2223,19 @@ void handle_trap(struct kvm_cpu_context *host_ctxt)
 		handle_host_mem_abort(host_ctxt);
 		break;
 	default:
-		BUG_ON(!READ_ONCE(default_trap_handler) || !default_trap_handler(&host_ctxt->regs));
+		if (!READ_ONCE(default_trap_handler) ||
+		    !default_trap_handler(&host_ctxt->regs)) {
+			if (IS_ENABLED(CONFIG_PKVM_DEBUG)) {
+				u64 elr = read_sysreg_el2(SYS_ELR);
+
+				hyp_err("unhandled EL2 trap: EC=0x%llx ESR=0x%llx ELR=0x%llx FAR=0x%llx",
+					(unsigned long long)ESR_ELx_EC(esr),
+					(unsigned long long)esr,
+					(unsigned long long)elr,
+					(unsigned long long)read_sysreg_el2(SYS_FAR));
+			}
+			BUG();
+		}
 	}
 
 	__hyp_exit();

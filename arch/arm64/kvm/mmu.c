@@ -1940,6 +1940,7 @@ static int __pkvm_host_donate_guest_sglist(struct kvm_vcpu *vcpu, struct list_he
 		}
 
 		ret = kvm_call_hyp_nvhe(__pkvm_host_donate_guest_sglist);
+
 		/* See __pkvm_host_donate_guest() -EPERM comment */
 		if (ret == -EPERM) {
 			ret = 0;
@@ -2023,11 +2024,12 @@ static int pkvm_mem_abort_device(struct kvm_vcpu *vcpu, struct kvm_memory_slot *
 
 		device = !pfn_is_map_memory(pfn);
 		if (device) {
-			int ret = kvm_call_hyp_nvhe(__pkvm_host_map_guest_mmio, pfn, gfn);
+			int ret;
+
+			ret = kvm_call_hyp_nvhe(__pkvm_host_map_guest_mmio, pfn, gfn);
 			/* Ignore EEXIST as we might have raced with another vCPU. */
-			if (ret && (ret != -EEXIST)) {
+			if (ret && (ret != -EEXIST))
 				return ret;
-			}
 		} else {
 			/* Release pin from __kvm_faultin_pfn(). */
 			kvm_release_faultin_page(vcpu->kvm, tmp, true, writable);
@@ -2068,7 +2070,8 @@ static int pkvm_mem_abort(struct kvm_vcpu *vcpu, phys_addr_t fault_ipa, size_t s
 		 * case, that is possible because the VMA for the device mapping is VM_IO,
 		 * which fails in check_vma_flags() with -EFAULT
 		 */
-		return pkvm_mem_abort_device(vcpu, memslot, gfn, nr_pages);
+		ret = pkvm_mem_abort_device(vcpu, memslot, gfn, nr_pages);
+		return ret;
 	} else if (ret) {
 		return ret;
 	}

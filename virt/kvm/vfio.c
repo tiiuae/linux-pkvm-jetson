@@ -164,34 +164,39 @@ static void kvm_vfio_update_coherency(struct kvm_device *dev)
 	}
 }
 
-static int kvm_vfio_assign_file(struct file *file)
+static int kvm_vfio_assign_file(struct file *file, struct kvm *kvm)
 {
 	struct device *dev;
 	struct iommu_group *group;
+	int ret;
 
 	dev = kvm_vfio_file_get_device(file);
-	if (dev)
-		return kvm_arch_assign_device(dev);
+	if (dev) {
+		ret = kvm_arch_assign_device(dev, kvm);
+		return ret;
+	}
 	group = kvm_vfio_file_iommu_group(file);
-	if (group)
-		return kvm_arch_assign_group(group);
+	if (group) {
+		ret = kvm_arch_assign_group(group, kvm);
+		return ret;
+	}
 
 	return -ENODEV;
 }
 
-static void kvm_vfio_reclaim_file(struct file *file)
+static void kvm_vfio_reclaim_file(struct file *file, struct kvm *kvm)
 {
 	struct device *dev;
 	struct iommu_group *group;
 
 	dev = kvm_vfio_file_get_device(file);
 	if (dev) {
-		kvm_arch_reclaim_device(dev);
+		kvm_arch_reclaim_device(dev, kvm);
 		return;
 	}
 	group = kvm_vfio_file_iommu_group(file);
 	if (group)
-		kvm_arch_reclaim_group(group);
+		kvm_arch_reclaim_group(group, kvm);
 }
 
 static int kvm_vfio_file_add(struct kvm_device *dev, unsigned int fd)
@@ -226,7 +231,7 @@ static int kvm_vfio_file_add(struct kvm_device *dev, unsigned int fd)
 		goto out_unlock;
 	}
 
-	ret = kvm_vfio_assign_file(filp);
+	ret = kvm_vfio_assign_file(filp, dev->kvm);
 	if (ret)
 		goto out_unlock;
 
@@ -261,7 +266,7 @@ static int kvm_vfio_file_del(struct kvm_device *dev, unsigned int fd)
 		if (kvf->file != fd_file(f))
 			continue;
 
-		kvm_vfio_reclaim_file(kvf->file);
+		kvm_vfio_reclaim_file(kvf->file, dev->kvm);
 		list_del(&kvf->node);
 #ifdef CONFIG_SPAPR_TCE_IOMMU
 		kvm_spapr_tce_release_vfio_group(dev->kvm, kvf);
@@ -568,7 +573,7 @@ static void kvm_vfio_release(struct kvm_device *dev)
 #ifdef CONFIG_SPAPR_TCE_IOMMU
 		kvm_spapr_tce_release_vfio_group(dev->kvm, kvf);
 #endif
-		kvm_vfio_reclaim_file(kvf->file);
+		kvm_vfio_reclaim_file(kvf->file, dev->kvm);
 		kvm_vfio_file_set_kvm(kvf->file, NULL);
 		fput(kvf->file);
 		list_del(&kvf->node);
