@@ -2,13 +2,28 @@
 /*
  * To probe this driver, add a matching node to your platform device tree.
  *
-	bpmp_host_proxy: bpmp_host_proxy {
-		compatible = "nvidia,bpmp-host-proxy";
-		nvidia,bpmp = <&bpmp>;
-		allowed-clocks = <TEGRA234_CLK_UARTA>;
-		allowed-resets = <TEGRA234_RESET_UARTA>;
-		status = "okay";
-	};
+ *	bpmp_host_proxy: bpmp_host_proxy {
+ *		compatible = "nvidia,bpmp-host-proxy";
+ *		nvidia,bpmp = <&bpmp>;
+ *		allowed-clocks = <TEGRA234_CLK_UARTA>;
+ *		allowed-resets = <TEGRA234_RESET_UARTA>;
+ *		allowed-power-domains = <TEGRA234_POWER_DOMAIN_DISP>;
+ *		status = "okay";
+ *	};
+ *
+ * As an alternative to listing the resource ids one by one (clocks, resets & power domains),
+ * especially for devices that need access to many clocks, the `allowed-devices` property can
+ * be used with a list of phandles.
+ *
+ *	bpmp_host_proxy: bpmp_host_proxy {
+ *		compatible = "nvidia,bpmp-host-proxy";
+ *		nvidia,bpmp = <&bpmp>;
+ *		allowed-devices = <&ga10b &host1x_pt &vic_b &nvdec_b &nvjpg_b &nvdisplay>;
+ *		status = "okay";
+ *	};
+ *
+ * If both allowed-devices and allowed-{clocks,resets,power-domains} are specified, the resulting
+ * allow list is the union of the two arrays.
  */
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
@@ -25,8 +40,9 @@
 
 #include "bpmp-private.h"
 
-#define BPMP_HOST_MAX_CLOCKS_SIZE 256
-#define BPMP_HOST_MAX_RESETS_SIZE 256
+#define BPMP_HOST_MAX_CLOCKS_SIZE 128
+#define BPMP_HOST_MAX_RESETS_SIZE 64
+#define BPMP_HOST_MAX_PGS_SIZE 64
 
 struct bpmp_allowed_res {
 	int clocks_size;
@@ -36,6 +52,8 @@ struct bpmp_allowed_res {
 	uint32_t *clock_parents;
 	int resets_size;
 	uint32_t reset[BPMP_HOST_MAX_RESETS_SIZE];
+	int pgs_size;
+	uint32_t pgs[BPMP_HOST_MAX_PGS_SIZE];
 };
 
 #define DEVICE_NAME "bpmp_host"
@@ -109,6 +127,7 @@ static bool check_if_allowed(struct tegra_bpmp_message *msg)
 	case MRQ_THREADED_PING:
 	case MRQ_QUERY_ABI:
 	case MRQ_QUERY_FW_TAG:
+	case MRQ_STRAP:
 		return true;
 
 	case MRQ_PG:
@@ -122,6 +141,15 @@ static bool check_if_allowed(struct tegra_bpmp_message *msg)
 		    pg_req->cmd == CMD_PG_GET_NAME ||
 		    pg_req->cmd == CMD_PG_GET_MAX_ID)
 			return true;
+
+		/* allow SET_STATE for specific ids */
+		for (i = 0; i < bpmp_ares.pgs_size; i++) {
+			if (bpmp_ares.pgs[i] == pg_req->id) {
+				return true;
+			}
+		}
+		pr_warn("powergate not allowed for %d, with command %d\n",
+			pg_req->id, pg_req->cmd);
 		break;
 
 	case MRQ_RESET:
@@ -132,7 +160,11 @@ static bool check_if_allowed(struct tegra_bpmp_message *msg)
 				return true;
 			}
 		}
-		pr_warn("Error, reset not allowed for: %d", reset_req->reset_id);
+
+		if (reset_req->cmd == CMD_RESET_GET_MAX_ID)
+			return true;
+
+		pr_warn("reset not allowed for: %d\n", reset_req->reset_id);
 		break;
 
 	case MRQ_CLK:
@@ -140,7 +172,7 @@ static bool check_if_allowed(struct tegra_bpmp_message *msg)
 		clk_id = clock_req->cmd_and_id & 0x0FFF;
 		clk_cmd = (clock_req->cmd_and_id >> 24) & 0x000F;
 
-		pr_debug("Got command: %d for clock %d", clk_cmd, clk_id);
+		pr_debug("Got command: %d for clock %d\n", clk_cmd, clk_id);
 
 		for (i = 0; i < bpmp_ares.clocks_size; i++) {
 			if (bpmp_ares.clock[i] == clk_id)
@@ -156,16 +188,17 @@ static bool check_if_allowed(struct tegra_bpmp_message *msg)
 
 		if (clk_cmd == CMD_CLK_GET_MAX_CLK_ID ||
 		    clk_cmd == CMD_CLK_GET_ALL_INFO ||
-		    clk_cmd == CMD_CLK_GET_PARENT) {
+		    clk_cmd == CMD_CLK_GET_PARENT ||
+		    clk_cmd == CMD_CLK_GET_RATE) {
 			return true;
 		}
 
-		pr_warn("Error, clock not allowed for: %d, with command: %d",
-		       clk_id, clk_cmd);
+		pr_warn("clock not allowed for: %d, with command: %d\n", clk_id,
+			clk_cmd);
 		break;
 
 	default:
-		pr_warn("Error, msg->mrq %d not allowed", msg->mrq);
+		pr_warn("msg->mrq %d not allowed\n", msg->mrq);
 		break;
 	}
 
@@ -194,12 +227,12 @@ static ssize_t write(struct file *filep, const char *buffer, size_t len,
 	bpmp_transaction_free_msg_buffers(ctx);
 
 	if (!bpmp) {
-		pr_err("host device not initialised, can't do transfer!");
+		pr_err("host device not initialised, can't do transfer!\n");
 		ret = -ENODEV;
 		goto unlock;
 	}
 	if (len != sizeof(req)) {
-		pr_err("expected packed message of size %lu, got %zu",
+		pr_err("expected packed message of size %lu, got %zu\n",
 		       sizeof(req), len);
 		ret = -EINVAL;
 		goto unlock;
@@ -254,11 +287,11 @@ static ssize_t read(struct file *filep, char *buffer, size_t len,
 
 	switch (ctx->transfer_status) {
 	case TRANSFER_NONE:
-		pr_err("tried to read before sending a command\n");
+		pr_err_once("error: tried to read before sending a command\n");
 		ctx->msg.rx.ret = -BPMP_TRANSPORT_ENODATA;
 		break;
 	case TRANSFER_PREPARE:
-		pr_err("write op returned an error: %d\n", ctx->write_status);
+		pr_devel("write op returned an error: %d\n", ctx->write_status);
 		ctx->msg.rx.ret =
 			ctx->write_status - BPMP_TRANSPORT_ERRCODE_OFFSET;
 		break;
@@ -308,7 +341,7 @@ static int open(struct inode *inodep, struct file *filep)
 	struct bpmp_transaction_ctx *ctx;
 
 	if (!bpmp) {
-		pr_err("host device not initialised, can't do transfer!");
+		pr_err("host device not initialised, can't do transfer!\n");
 		return -EFAULT;
 	}
 	ctx = kzalloc(sizeof(struct bpmp_transaction_ctx), GFP_KERNEL);
@@ -319,7 +352,7 @@ static int open(struct inode *inodep, struct file *filep)
 	ctx->transfer_status = TRANSFER_NONE;
 
 	filep->private_data = ctx;
-	pr_debug("device opened.\n");
+	pr_debug("device opened\n");
 	return 0;
 }
 
@@ -336,7 +369,7 @@ static int release(struct inode *inodep, struct file *filep)
 		mutex_destroy(&ctx->lock);
 		kfree(ctx);
 	}
-	pr_debug("device closed.\n");
+	pr_debug("device closed\n");
 	return 0;
 }
 
@@ -348,35 +381,170 @@ static struct file_operations fops = {
 	.write = write,
 };
 
+static ssize_t allowed_clocks_show(struct device *dev,
+				   struct device_attribute *attr, char *buf)
+{
+	ssize_t len = 0;
+	int i;
+
+	for (i = 0; i < bpmp_ares.clocks_size; i++)
+		len += sysfs_emit_at(buf, len, "%u\n", bpmp_ares.clock[i]);
+	return len;
+}
+static DEVICE_ATTR_RO(allowed_clocks);
+
+static ssize_t allowed_resets_show(struct device *dev,
+				   struct device_attribute *attr, char *buf)
+{
+	ssize_t len = 0;
+	int i;
+
+	for (i = 0; i < bpmp_ares.resets_size; i++)
+		len += sysfs_emit_at(buf, len, "%u\n", bpmp_ares.reset[i]);
+	return len;
+}
+static DEVICE_ATTR_RO(allowed_resets);
+
+static ssize_t allowed_power_domains_show(struct device *dev,
+					  struct device_attribute *attr,
+					  char *buf)
+{
+	ssize_t len = 0;
+	int i;
+
+	for (i = 0; i < bpmp_ares.pgs_size; i++)
+		len += sysfs_emit_at(buf, len, "%u\n", bpmp_ares.pgs[i]);
+	return len;
+}
+static DEVICE_ATTR_RO(allowed_power_domains);
+
+static struct attribute *bpmp_host_proxy_attrs[] = {
+	&dev_attr_allowed_clocks.attr,
+	&dev_attr_allowed_resets.attr,
+	&dev_attr_allowed_power_domains.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(bpmp_host_proxy);
+
+static int bpmp_host_parse_prop_spec(const struct device_node *np,
+				     const char *list_name,
+				     const char *cells_name,
+				     uint32_t *out_values, int *out_size,
+				     int max_size)
+{
+	struct of_phandle_args pargs;
+	int idx = 0;
+
+	while (!of_parse_phandle_with_args(np, list_name, cells_name, idx,
+					   &pargs)) {
+		uint32_t bpmp_res_id = pargs.args[0];
+		of_node_put(pargs.np);
+		idx++;
+
+		if (*out_size >= max_size) {
+			pr_err("allow list has reached max capacity: %d\n",
+			       max_size);
+			return -ENOMEM;
+		}
+
+		pr_devel("device %s allowed clock: %u\n", np->name,
+			 bpmp_res_id);
+		out_values[*out_size] = bpmp_res_id;
+		(*out_size)++;
+	}
+
+	return 0;
+}
+
+static int bpmp_host_parse_allowed_devices(struct platform_device *pdev)
+{
+	struct of_phandle_args args;
+	int idx = 0;
+	int ret;
+
+	while (!of_parse_phandle_with_fixed_args(
+		pdev->dev.of_node, "allowed-devices", 0, idx, &args)) {
+		struct device_node *client_dev = args.np;
+		idx++;
+
+		ret = bpmp_host_parse_prop_spec(client_dev, "clocks",
+						"#clock-cells", bpmp_ares.clock,
+						&bpmp_ares.clocks_size,
+						BPMP_HOST_MAX_CLOCKS_SIZE);
+		if (ret) {
+			of_node_put(args.np);
+			return ret;
+		}
+
+		ret = bpmp_host_parse_prop_spec(client_dev, "resets",
+						"#reset-cells", bpmp_ares.reset,
+						&bpmp_ares.resets_size,
+						BPMP_HOST_MAX_RESETS_SIZE);
+		if (ret) {
+			of_node_put(args.np);
+			return ret;
+		}
+
+		ret = bpmp_host_parse_prop_spec(client_dev, "power-domains",
+						"#power-domain-cells",
+						bpmp_ares.pgs,
+						&bpmp_ares.pgs_size,
+						BPMP_HOST_MAX_PGS_SIZE);
+
+		of_node_put(args.np);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
+static void init_array_from_property(struct device *dev, const char *propname,
+				     u32 *out_values, int *out_size,
+				     int max_size)
+{
+	*out_size = of_property_read_variable_u32_array(
+		dev->of_node, propname, out_values, 0, max_size);
+	if (*out_size < 0) {
+		dev_err_probe(dev, *out_size, "failed to parse property %s\n",
+			      propname);
+		*out_size = 0;
+	}
+}
 
 static int bpmp_host_proxy_probe(struct platform_device *pdev)
 {
 	int err, i, j;
 
-	dev_info(&pdev->dev, "%s, installing module.", __func__);
+	dev_info(&pdev->dev, "%s, installing module.\n", __func__);
 
 	/* Get a reference to the bpmp device via the device tree
 		nvidia,bpmp = <&bpmp>; */
 	bpmp = tegra_bpmp_get(&pdev->dev);
 	err = PTR_ERR_OR_ZERO(bpmp);
 	if (err) {
-		pr_err("tegra_bpmp_get returned error: %d\n", err);
-		return err;
+		return dev_err_probe(&pdev->dev, err,
+				     "tegra_bpmp_get returned error\n");
 	}
 
-	bpmp_ares.clocks_size = of_property_read_variable_u32_array(
-		pdev->dev.of_node, "allowed-clocks", bpmp_ares.clock, 0,
-		BPMP_HOST_MAX_CLOCKS_SIZE);
+	init_array_from_property(&pdev->dev, "allowed-clocks", bpmp_ares.clock,
+				 &bpmp_ares.clocks_size,
+				 BPMP_HOST_MAX_CLOCKS_SIZE);
+	init_array_from_property(&pdev->dev, "allowed-resets", bpmp_ares.reset,
+				 &bpmp_ares.resets_size,
+				 BPMP_HOST_MAX_RESETS_SIZE);
+	init_array_from_property(&pdev->dev, "allowed-power-domains",
+				 bpmp_ares.pgs, &bpmp_ares.pgs_size,
+				 BPMP_HOST_MAX_PGS_SIZE);
 
-	if (bpmp_ares.clocks_size <= 0) {
-		dev_err(&pdev->dev, "No allowed clocks defined");
-		err = -EINVAL;
+	err = bpmp_host_parse_allowed_devices(pdev);
+	if (err) {
+		dev_err(&pdev->dev,
+			"Error while parsing allowed-devices property\n");
 		goto bpmp_put;
 	}
 
-	dev_dbg(&pdev->dev, "bpmp_ares.clocks_size: %d",
-		 bpmp_ares.clocks_size);
-
+	/* Dynamically register clock parents */
 	bpmp_ares.clock_parents_size = 0;
 
 	unsigned int max_parents = bpmp_ares.clocks_size * MRQ_CLK_MAX_PARENTS;
@@ -387,7 +555,7 @@ static int bpmp_host_proxy_probe(struct platform_device *pdev)
 		struct cmd_clk_get_all_info_response info;
 		uint32_t clk_id = bpmp_ares.clock[i];
 
-		dev_dbg(&pdev->dev, "bpmp_ares.clock %d", clk_id);
+		dev_dbg(&pdev->dev, "bpmp_ares.clock %d\n", clk_id);
 
 		err = tegra_bpmp_clk_get_info(bpmp, clk_id, &info);
 		if (err)
@@ -400,29 +568,15 @@ static int bpmp_host_proxy_probe(struct platform_device *pdev)
 		}
 
 		for (j = 0; j < info.num_parents; j++) {
-			dev_dbg(&pdev->dev, "clock %u parent: %u", clk_id,
-				 info.parents[j]);
+			dev_dbg(&pdev->dev, "clock %u parent: %u\n", clk_id,
+				info.parents[j]);
 			bpmp_ares.clock_parents[bpmp_ares.clock_parents_size +
 						j] = info.parents[j];
 		}
 		bpmp_ares.clock_parents_size += info.num_parents;
 	}
 
-	bpmp_ares.resets_size = of_property_read_variable_u32_array(
-		pdev->dev.of_node, "allowed-resets", bpmp_ares.reset, 0,
-		BPMP_HOST_MAX_RESETS_SIZE);
-
-	if (bpmp_ares.resets_size <= 0) {
-		dev_err(&pdev->dev, "No allowed resets defined");
-		err = -EINVAL;
-		goto bpmp_put;
-	}
-
-	dev_dbg(&pdev->dev, "bpmp_ares.resets_size: %d",
-		 bpmp_ares.resets_size);
-	for (i = 0; i < bpmp_ares.resets_size; i++) {
-		dev_dbg(&pdev->dev, "bpmp_ares.reset %d", bpmp_ares.reset[i]);
-	}
+	/* TODO deduplicate parent clocks */
 
 	major_number = register_chrdev(0, DEVICE_NAME, &fops);
 	if (major_number < 0) {
@@ -464,7 +618,7 @@ bpmp_put:
 
 static void bpmp_host_proxy_remove(struct platform_device *pdev)
 {
-	dev_info(&pdev->dev, "driver unloaded.");
+	dev_info(&pdev->dev, "driver unloaded\n");
 	device_destroy(bpmp_host_proxy_class, MKDEV(major_number, 0));
 	class_unregister(bpmp_host_proxy_class);
 	class_destroy(bpmp_host_proxy_class);
@@ -481,6 +635,7 @@ static struct platform_driver bpmp_host_proxy_driver = {
 	.driver = {
 		.name = "bpmp_host_proxy",
 		.of_match_table = bpmp_host_proxy_ids,
+		.dev_groups = bpmp_host_proxy_groups,
 	},
 	.probe = bpmp_host_proxy_probe,
 	.remove = bpmp_host_proxy_remove,
