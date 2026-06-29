@@ -382,6 +382,51 @@ static struct file_operations fops = {
 	.write = write,
 };
 
+static ssize_t allowed_clocks_show(struct device *dev,
+				   struct device_attribute *attr, char *buf)
+{
+	ssize_t len = 0;
+	int i;
+
+	for (i = 0; i < bpmp_ares.clocks_size; i++)
+		len += sysfs_emit_at(buf, len, "%u\n", bpmp_ares.clock[i]);
+	return len;
+}
+static DEVICE_ATTR_RO(allowed_clocks);
+
+static ssize_t allowed_resets_show(struct device *dev,
+				   struct device_attribute *attr, char *buf)
+{
+	ssize_t len = 0;
+	int i;
+
+	for (i = 0; i < bpmp_ares.resets_size; i++)
+		len += sysfs_emit_at(buf, len, "%u\n", bpmp_ares.reset[i]);
+	return len;
+}
+static DEVICE_ATTR_RO(allowed_resets);
+
+static ssize_t allowed_power_domains_show(struct device *dev,
+					  struct device_attribute *attr,
+					  char *buf)
+{
+	ssize_t len = 0;
+	int i;
+
+	for (i = 0; i < bpmp_ares.pgs_size; i++)
+		len += sysfs_emit_at(buf, len, "%u\n", bpmp_ares.pgs[i]);
+	return len;
+}
+static DEVICE_ATTR_RO(allowed_power_domains);
+
+static struct attribute *bpmp_host_proxy_attrs[] = {
+	&dev_attr_allowed_clocks.attr,
+	&dev_attr_allowed_resets.attr,
+	&dev_attr_allowed_power_domains.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(bpmp_host_proxy);
+
 static int bpmp_host_parse_prop_spec(const struct device_node *np,
 				     const char *list_name,
 				     const char *cells_name,
@@ -591,6 +636,7 @@ static struct platform_driver bpmp_host_proxy_driver = {
 	.driver = {
 		.name = "bpmp_host_proxy",
 		.of_match_table = bpmp_host_proxy_ids,
+		.dev_groups = bpmp_host_proxy_groups,
 	},
 	.probe = bpmp_host_proxy_probe,
 	.remove = bpmp_host_proxy_remove,
