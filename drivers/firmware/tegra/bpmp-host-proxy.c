@@ -110,6 +110,7 @@ static bool check_if_allowed(struct tegra_bpmp_message *msg)
 	case MRQ_THREADED_PING:
 	case MRQ_QUERY_ABI:
 	case MRQ_QUERY_FW_TAG:
+	case MRQ_STRAP:
 		return true;
 
 	case MRQ_PG:
@@ -133,6 +134,10 @@ static bool check_if_allowed(struct tegra_bpmp_message *msg)
 				return true;
 			}
 		}
+
+		if (reset_req->cmd == CMD_RESET_GET_MAX_ID)
+			return true;
+
 		pr_warn("reset not allowed for: %d\n", reset_req->reset_id);
 		break;
 
@@ -157,7 +162,8 @@ static bool check_if_allowed(struct tegra_bpmp_message *msg)
 
 		if (clk_cmd == CMD_CLK_GET_MAX_CLK_ID ||
 		    clk_cmd == CMD_CLK_GET_ALL_INFO ||
-		    clk_cmd == CMD_CLK_GET_PARENT) {
+		    clk_cmd == CMD_CLK_GET_PARENT ||
+		    clk_cmd == CMD_CLK_GET_RATE) {
 			return true;
 		}
 
