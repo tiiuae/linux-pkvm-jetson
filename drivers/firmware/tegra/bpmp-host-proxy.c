@@ -2,13 +2,28 @@
 /*
  * To probe this driver, add a matching node to your platform device tree.
  *
-	bpmp_host_proxy: bpmp_host_proxy {
-		compatible = "nvidia,bpmp-host-proxy";
-		nvidia,bpmp = <&bpmp>;
-		allowed-clocks = <TEGRA234_CLK_UARTA>;
-		allowed-resets = <TEGRA234_RESET_UARTA>;
-		status = "okay";
-	};
+ *	bpmp_host_proxy: bpmp_host_proxy {
+ *		compatible = "nvidia,bpmp-host-proxy";
+ *		nvidia,bpmp = <&bpmp>;
+ *		allowed-clocks = <TEGRA234_CLK_UARTA>;
+ *		allowed-resets = <TEGRA234_RESET_UARTA>;
+ *		allowed-power-domains = <TEGRA234_POWER_DOMAIN_DISP>;
+ *		status = "okay";
+ *	};
+ *
+ * As an alternative to listing the resource ids one by one (clocks, resets & power domains),
+ * especially for devices that need access to many clocks, the `allowed-devices` property can
+ * be used with a list of phandles.
+ *
+ *	bpmp_host_proxy: bpmp_host_proxy {
+ *		compatible = "nvidia,bpmp-host-proxy";
+ *		nvidia,bpmp = <&bpmp>;
+ *		allowed-devices = <&ga10b &host1x_pt &vic_b &nvdec_b &nvjpg_b &nvdisplay>;
+ *		status = "okay";
+ *	};
+ *
+ * If both allowed-devices and allowed-{clocks,resets,power-domains} are specified, the resulting
+ * allow list is the union of the two arrays.
  */
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
@@ -25,8 +40,9 @@
 
 #include "bpmp-private.h"
 
-#define BPMP_HOST_MAX_CLOCKS_SIZE 256
-#define BPMP_HOST_MAX_RESETS_SIZE 256
+#define BPMP_HOST_MAX_CLOCKS_SIZE 128
+#define BPMP_HOST_MAX_RESETS_SIZE 64
+#define BPMP_HOST_MAX_PGS_SIZE 64
 
 struct bpmp_allowed_res {
 	int clocks_size;
@@ -36,6 +52,8 @@ struct bpmp_allowed_res {
 	uint32_t *clock_parents;
 	int resets_size;
 	uint32_t reset[BPMP_HOST_MAX_RESETS_SIZE];
+	int pgs_size;
+	uint32_t pgs[BPMP_HOST_MAX_PGS_SIZE];
 };
 
 #define DEVICE_NAME "bpmp_host"
@@ -124,6 +142,15 @@ static bool check_if_allowed(struct tegra_bpmp_message *msg)
 		    pg_req->cmd == CMD_PG_GET_NAME ||
 		    pg_req->cmd == CMD_PG_GET_MAX_ID)
 			return true;
+
+		/* allow SET_STATE for specific ids */
+		for (i = 0; i < bpmp_ares.pgs_size; i++) {
+			if (bpmp_ares.pgs[i] == pg_req->id) {
+				return true;
+			}
+		}
+		pr_warn("powergate not allowed for %d, with command %d\n",
+			pg_req->id, pg_req->cmd);
 		break;
 
 	case MRQ_RESET:
@@ -355,6 +382,91 @@ static struct file_operations fops = {
 	.write = write,
 };
 
+static int bpmp_host_parse_prop_spec(const struct device_node *np,
+				     const char *list_name,
+				     const char *cells_name,
+				     uint32_t *out_values, int *out_size,
+				     int max_size)
+{
+	struct of_phandle_args pargs;
+	int idx = 0;
+
+	while (!of_parse_phandle_with_args(np, list_name, cells_name, idx,
+					   &pargs)) {
+		uint32_t bpmp_res_id = pargs.args[0];
+		of_node_put(pargs.np);
+		idx++;
+
+		if (*out_size >= max_size) {
+			pr_err("allow list has reached max capacity: %d\n",
+			       max_size);
+			return -ENOMEM;
+		}
+
+		pr_devel("device %s allowed clock: %u\n", np->name,
+			 bpmp_res_id);
+		out_values[*out_size] = bpmp_res_id;
+		(*out_size)++;
+	}
+
+	return 0;
+}
+
+static int bpmp_host_parse_allowed_devices(struct platform_device *pdev)
+{
+	struct of_phandle_args args;
+	int idx = 0;
+	int ret;
+
+	while (!of_parse_phandle_with_fixed_args(
+		pdev->dev.of_node, "allowed-devices", 0, idx, &args)) {
+		struct device_node *client_dev = args.np;
+		idx++;
+
+		ret = bpmp_host_parse_prop_spec(client_dev, "clocks",
+						"#clock-cells", bpmp_ares.clock,
+						&bpmp_ares.clocks_size,
+						BPMP_HOST_MAX_CLOCKS_SIZE);
+		if (ret) {
+			of_node_put(args.np);
+			return ret;
+		}
+
+		ret = bpmp_host_parse_prop_spec(client_dev, "resets",
+						"#reset-cells", bpmp_ares.reset,
+						&bpmp_ares.resets_size,
+						BPMP_HOST_MAX_RESETS_SIZE);
+		if (ret) {
+			of_node_put(args.np);
+			return ret;
+		}
+
+		ret = bpmp_host_parse_prop_spec(client_dev, "power-domains",
+						"#power-domain-cells",
+						bpmp_ares.pgs,
+						&bpmp_ares.pgs_size,
+						BPMP_HOST_MAX_PGS_SIZE);
+
+		of_node_put(args.np);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
+static void init_array_from_property(struct device *dev, const char *propname,
+				     u32 *out_values, int *out_size,
+				     int max_size)
+{
+	*out_size = of_property_read_variable_u32_array(
+		dev->of_node, propname, out_values, 0, max_size);
+	if (*out_size < 0) {
+		dev_err_probe(dev, *out_size, "failed to parse property %s\n",
+			      propname);
+		*out_size = 0;
+	}
+}
 
 static int bpmp_host_proxy_probe(struct platform_device *pdev)
 {
@@ -371,18 +483,24 @@ static int bpmp_host_proxy_probe(struct platform_device *pdev)
 				     "tegra_bpmp_get returned error\n");
 	}
 
-	bpmp_ares.clocks_size = of_property_read_variable_u32_array(
-		pdev->dev.of_node, "allowed-clocks", bpmp_ares.clock, 0,
-		BPMP_HOST_MAX_CLOCKS_SIZE);
+	init_array_from_property(&pdev->dev, "allowed-clocks", bpmp_ares.clock,
+				 &bpmp_ares.clocks_size,
+				 BPMP_HOST_MAX_CLOCKS_SIZE);
+	init_array_from_property(&pdev->dev, "allowed-resets", bpmp_ares.reset,
+				 &bpmp_ares.resets_size,
+				 BPMP_HOST_MAX_RESETS_SIZE);
+	init_array_from_property(&pdev->dev, "allowed-power-domains",
+				 bpmp_ares.pgs, &bpmp_ares.pgs_size,
+				 BPMP_HOST_MAX_PGS_SIZE);
 
-	if (bpmp_ares.clocks_size <= 0) {
-		dev_err(&pdev->dev, "No allowed clocks defined\n");
-		err = -EINVAL;
+	err = bpmp_host_parse_allowed_devices(pdev);
+	if (err) {
+		dev_err(&pdev->dev,
+			"Error while parsing allowed-devices property\n");
 		goto bpmp_put;
 	}
 
-	dev_dbg(&pdev->dev, "bpmp_ares.clocks_size: %d\n", bpmp_ares.clocks_size);
-
+	/* Dynamically register clock parents */
 	bpmp_ares.clock_parents_size = 0;
 
 	unsigned int max_parents = bpmp_ares.clocks_size * MRQ_CLK_MAX_PARENTS;
@@ -414,20 +532,7 @@ static int bpmp_host_proxy_probe(struct platform_device *pdev)
 		bpmp_ares.clock_parents_size += info.num_parents;
 	}
 
-	bpmp_ares.resets_size = of_property_read_variable_u32_array(
-		pdev->dev.of_node, "allowed-resets", bpmp_ares.reset, 0,
-		BPMP_HOST_MAX_RESETS_SIZE);
-
-	if (bpmp_ares.resets_size <= 0) {
-		dev_err(&pdev->dev, "No allowed resets defined\n");
-		err = -EINVAL;
-		goto bpmp_put;
-	}
-
-	dev_dbg(&pdev->dev, "bpmp_ares.resets_size: %d\n", bpmp_ares.resets_size);
-	for (i = 0; i < bpmp_ares.resets_size; i++) {
-		dev_dbg(&pdev->dev, "bpmp_ares.reset %d\n", bpmp_ares.reset[i]);
-	}
+	/* TODO deduplicate parent clocks */
 
 	major_number = register_chrdev(0, DEVICE_NAME, &fops);
 	if (major_number < 0) {
