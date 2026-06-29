@@ -133,7 +133,7 @@ static bool check_if_allowed(struct tegra_bpmp_message *msg)
 				return true;
 			}
 		}
-		pr_warn("Error, reset not allowed for: %d", reset_req->reset_id);
+		pr_warn("reset not allowed for: %d\n", reset_req->reset_id);
 		break;
 
 	case MRQ_CLK:
@@ -141,7 +141,7 @@ static bool check_if_allowed(struct tegra_bpmp_message *msg)
 		clk_id = clock_req->cmd_and_id & 0x0FFF;
 		clk_cmd = (clock_req->cmd_and_id >> 24) & 0x000F;
 
-		pr_debug("Got command: %d for clock %d", clk_cmd, clk_id);
+		pr_debug("Got command: %d for clock %d\n", clk_cmd, clk_id);
 
 		for (i = 0; i < bpmp_ares.clocks_size; i++) {
 			if (bpmp_ares.clock[i] == clk_id)
@@ -161,12 +161,12 @@ static bool check_if_allowed(struct tegra_bpmp_message *msg)
 			return true;
 		}
 
-		pr_warn("Error, clock not allowed for: %d, with command: %d",
-		       clk_id, clk_cmd);
+		pr_warn("clock not allowed for: %d, with command: %d\n", clk_id,
+			clk_cmd);
 		break;
 
 	default:
-		pr_warn("Error, msg->mrq %d not allowed", msg->mrq);
+		pr_warn("msg->mrq %d not allowed\n", msg->mrq);
 		break;
 	}
 
@@ -195,12 +195,12 @@ static ssize_t write(struct file *filep, const char *buffer, size_t len,
 	bpmp_transaction_free_msg_buffers(ctx);
 
 	if (!bpmp) {
-		pr_err("host device not initialised, can't do transfer!");
+		pr_err("host device not initialised, can't do transfer!\n");
 		ret = -ENODEV;
 		goto unlock;
 	}
 	if (len != sizeof(req)) {
-		pr_err("expected packed message of size %lu, got %zu",
+		pr_err("expected packed message of size %lu, got %zu\n",
 		       sizeof(req), len);
 		ret = -EINVAL;
 		goto unlock;
@@ -255,11 +255,11 @@ static ssize_t read(struct file *filep, char *buffer, size_t len,
 
 	switch (ctx->transfer_status) {
 	case TRANSFER_NONE:
-		pr_err("tried to read before sending a command\n");
+		pr_err_once("error: tried to read before sending a command\n");
 		ctx->msg.rx.ret = -BPMP_TRANSPORT_ENODATA;
 		break;
 	case TRANSFER_PREPARE:
-		pr_err("write op returned an error: %d\n", ctx->write_status);
+		pr_devel("write op returned an error: %d\n", ctx->write_status);
 		ctx->msg.rx.ret =
 			ctx->write_status - BPMP_TRANSPORT_ERRCODE_OFFSET;
 		break;
@@ -309,7 +309,7 @@ static int open(struct inode *inodep, struct file *filep)
 	struct bpmp_transaction_ctx *ctx;
 
 	if (!bpmp) {
-		pr_err("host device not initialised, can't do transfer!");
+		pr_err("host device not initialised, can't do transfer!\n");
 		return -EFAULT;
 	}
 	ctx = kzalloc(sizeof(struct bpmp_transaction_ctx), GFP_KERNEL);
@@ -320,7 +320,7 @@ static int open(struct inode *inodep, struct file *filep)
 	ctx->transfer_status = TRANSFER_NONE;
 
 	filep->private_data = ctx;
-	pr_debug("device opened.\n");
+	pr_debug("device opened\n");
 	return 0;
 }
 
@@ -337,7 +337,7 @@ static int release(struct inode *inodep, struct file *filep)
 		mutex_destroy(&ctx->lock);
 		kfree(ctx);
 	}
-	pr_debug("device closed.\n");
+	pr_debug("device closed\n");
 	return 0;
 }
 
@@ -354,15 +354,15 @@ static int bpmp_host_proxy_probe(struct platform_device *pdev)
 {
 	int err, i, j;
 
-	dev_info(&pdev->dev, "%s, installing module.", __func__);
+	dev_info(&pdev->dev, "%s, installing module.\n", __func__);
 
 	/* Get a reference to the bpmp device via the device tree
 		nvidia,bpmp = <&bpmp>; */
 	bpmp = tegra_bpmp_get(&pdev->dev);
 	err = PTR_ERR_OR_ZERO(bpmp);
 	if (err) {
-		pr_err("tegra_bpmp_get returned error: %d\n", err);
-		return err;
+		return dev_err_probe(&pdev->dev, err,
+				     "tegra_bpmp_get returned error\n");
 	}
 
 	bpmp_ares.clocks_size = of_property_read_variable_u32_array(
@@ -370,13 +370,12 @@ static int bpmp_host_proxy_probe(struct platform_device *pdev)
 		BPMP_HOST_MAX_CLOCKS_SIZE);
 
 	if (bpmp_ares.clocks_size <= 0) {
-		dev_err(&pdev->dev, "No allowed clocks defined");
+		dev_err(&pdev->dev, "No allowed clocks defined\n");
 		err = -EINVAL;
 		goto bpmp_put;
 	}
 
-	dev_dbg(&pdev->dev, "bpmp_ares.clocks_size: %d",
-		 bpmp_ares.clocks_size);
+	dev_dbg(&pdev->dev, "bpmp_ares.clocks_size: %d\n", bpmp_ares.clocks_size);
 
 	bpmp_ares.clock_parents_size = 0;
 
@@ -388,7 +387,7 @@ static int bpmp_host_proxy_probe(struct platform_device *pdev)
 		struct cmd_clk_get_all_info_response info;
 		uint32_t clk_id = bpmp_ares.clock[i];
 
-		dev_dbg(&pdev->dev, "bpmp_ares.clock %d", clk_id);
+		dev_dbg(&pdev->dev, "bpmp_ares.clock %d\n", clk_id);
 
 		err = tegra_bpmp_clk_get_info(bpmp, clk_id, &info);
 		if (err)
@@ -401,8 +400,8 @@ static int bpmp_host_proxy_probe(struct platform_device *pdev)
 		}
 
 		for (j = 0; j < info.num_parents; j++) {
-			dev_dbg(&pdev->dev, "clock %u parent: %u", clk_id,
-				 info.parents[j]);
+			dev_dbg(&pdev->dev, "clock %u parent: %u\n", clk_id,
+				info.parents[j]);
 			bpmp_ares.clock_parents[bpmp_ares.clock_parents_size +
 						j] = info.parents[j];
 		}
@@ -414,15 +413,14 @@ static int bpmp_host_proxy_probe(struct platform_device *pdev)
 		BPMP_HOST_MAX_RESETS_SIZE);
 
 	if (bpmp_ares.resets_size <= 0) {
-		dev_err(&pdev->dev, "No allowed resets defined");
+		dev_err(&pdev->dev, "No allowed resets defined\n");
 		err = -EINVAL;
 		goto bpmp_put;
 	}
 
-	dev_dbg(&pdev->dev, "bpmp_ares.resets_size: %d",
-		 bpmp_ares.resets_size);
+	dev_dbg(&pdev->dev, "bpmp_ares.resets_size: %d\n", bpmp_ares.resets_size);
 	for (i = 0; i < bpmp_ares.resets_size; i++) {
-		dev_dbg(&pdev->dev, "bpmp_ares.reset %d", bpmp_ares.reset[i]);
+		dev_dbg(&pdev->dev, "bpmp_ares.reset %d\n", bpmp_ares.reset[i]);
 	}
 
 	major_number = register_chrdev(0, DEVICE_NAME, &fops);
@@ -465,7 +463,7 @@ bpmp_put:
 
 static void bpmp_host_proxy_remove(struct platform_device *pdev)
 {
-	dev_info(&pdev->dev, "driver unloaded.");
+	dev_info(&pdev->dev, "driver unloaded\n");
 	device_destroy(bpmp_host_proxy_class, MKDEV(major_number, 0));
 	class_unregister(bpmp_host_proxy_class);
 	class_destroy(bpmp_host_proxy_class);
