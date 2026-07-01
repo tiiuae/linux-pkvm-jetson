@@ -21,6 +21,7 @@
 #include <linux/of_address.h>
 #include <linux/of_fdt.h>
 #include <linux/of_reserved_mem.h>
+#include <linux/of_platform.h>
 #include <linux/pci.h>
 #include <linux/platform_device.h>
 #include <linux/list_sort.h>
@@ -618,6 +619,20 @@ static int pkvm_register_device_from_dev(struct device *dev, u32 group_id,
 				j++;
 			}
 		}
+	} else if (dev_is_platform(dev)) {
+		struct platform_device *ppdev = to_platform_device(dev);
+		int ri = 0;
+
+		while (j < PKVM_DEVICE_MAX_RESOURCE &&
+		       (res = platform_get_resource(ppdev, IORESOURCE_MEM, ri++))) {
+			if (!resource_size(res))
+				continue;
+			if (PAGE_ALIGNED(res->start) && PAGE_ALIGNED(resource_size(res))) {
+				pkvm_dev->resources[j].base = res->start;
+				pkvm_dev->resources[j].size = resource_size(res);
+				j++;
+			}
+		}
 	}
 	pkvm_dev->nr_resources = j;
 
@@ -997,15 +1012,162 @@ out_free:
 	return ret;
 }
 
+static int pkvm_init_devices_platform(unsigned long *out_nr,
+				      struct pkvm_device **out_devs)
+{
+	struct device_node *np;
+	struct of_phandle_args args;
+	struct pkvm_device *dev_base;
+	int idx = 0, dev_cnt = 0, ret = 0, i;
+	size_t dev_sz;
+
+	*out_nr = 0;
+	*out_devs = NULL;
+
+	/* Pass 1: count declared platform devices */
+	for_each_compatible_node(np, NULL, PKVM_DEVICE_ASSIGN_COMPAT) {
+		i = 0;
+		while (!of_parse_phandle_with_fixed_args(np, "devices", 1, i,
+							 &args)) {
+			struct platform_device *pdev =
+				of_find_device_by_node(args.np);
+
+			i++;
+			if (pdev) {
+				dev_cnt++;
+				put_device(&pdev->dev);
+			}
+			of_node_put(args.np);
+		}
+	}
+
+	if (!dev_cnt)
+		return 0;
+
+	kvm_info("Found %d DT-declared assignable platform devices", dev_cnt);
+
+	dev_sz = PAGE_ALIGN(size_mul(sizeof(struct pkvm_device), dev_cnt));
+	dev_base = alloc_pages_exact(dev_sz, GFP_KERNEL_ACCOUNT | __GFP_ZERO);
+	if (!dev_base)
+		return -ENOMEM;
+
+	/* Pass 2: resolve each phandle and register */
+	for_each_compatible_node(np, NULL, PKVM_DEVICE_ASSIGN_COMPAT) {
+		i = 0;
+		while (!of_parse_phandle_with_fixed_args(np, "devices", 1, i,
+							 &args)) {
+			struct platform_device *pdev =
+				of_find_device_by_node(args.np);
+			struct iommu_group *grp;
+			u32 grp_id;
+
+			i++;
+			of_node_put(args.np);
+			if (!pdev)
+				continue;
+
+			grp = iommu_group_get(&pdev->dev);
+			grp_id = grp ? iommu_group_id(grp) : (u32)idx;
+			if (grp)
+				iommu_group_put(grp);
+
+			ret = pkvm_register_device_from_dev(&pdev->dev, grp_id,
+							    &dev_base[idx]);
+			if (ret == -ENOENT) {
+				kvm_info("pkvm: platform %s has no stream IDs at scan time; skipping\n",
+					 dev_name(&pdev->dev));
+				put_device(&pdev->dev);
+				ret = 0;
+				continue;
+			}
+			if (ret) {
+				kvm_err("pkvm: failed to register platform %s: %d\n",
+					dev_name(&pdev->dev), ret);
+				put_device(&pdev->dev);
+				of_node_put(np);
+				goto out_free;
+			}
+
+			kvm_info("Registered platform %s (group %u, %d stream IDs, %d resources)",
+				 dev_name(&pdev->dev), dev_base[idx].group_id,
+				 dev_base[idx].nr_iommus,
+				 dev_base[idx].nr_resources);
+			put_device(&pdev->dev);
+			idx++;
+		}
+	}
+
+	*out_nr = idx;
+	*out_devs = dev_base;
+	return 0;
+
+out_free:
+	free_pages_exact(dev_base, dev_sz);
+	return ret;
+}
+
 static int pkvm_init_devices(unsigned long *out_nr, struct pkvm_device **out_devs)
 {
+	unsigned long pci_nr = 0, plat_nr = 0;
+	struct pkvm_device *pci_devs = NULL, *plat_devs = NULL;
+	struct pkvm_device *merged;
+	size_t merged_sz;
+	int ret;
+
 	*out_nr = 0;
 	*out_devs = NULL;
 
 	if (pkvm_assign_permissive)
-		return pkvm_init_devices_permissive(out_nr, out_devs);
+		ret = pkvm_init_devices_permissive(&pci_nr, &pci_devs);
+	else
+		ret = pkvm_init_devices_strict(&pci_nr, &pci_devs);
+	if (ret)
+		return ret;
 
-	return pkvm_init_devices_strict(out_nr, out_devs);
+	ret = pkvm_init_devices_platform(&plat_nr, &plat_devs);
+	if (ret)
+		goto free_pci;
+
+	if (!plat_nr) {
+		*out_nr = pci_nr;
+		*out_devs = pci_devs;
+		return 0;
+	}
+	if (!pci_nr) {
+		*out_nr = plat_nr;
+		*out_devs = plat_devs;
+		return 0;
+	}
+
+	merged_sz = PAGE_ALIGN(size_mul(sizeof(struct pkvm_device),
+					pci_nr + plat_nr));
+	merged = alloc_pages_exact(merged_sz, GFP_KERNEL_ACCOUNT | __GFP_ZERO);
+	if (!merged) {
+		ret = -ENOMEM;
+		goto free_plat;
+	}
+
+	memcpy(merged, pci_devs,
+	       size_mul(sizeof(struct pkvm_device), pci_nr));
+	memcpy(merged + pci_nr, plat_devs,
+	       size_mul(sizeof(struct pkvm_device), plat_nr));
+
+	free_pages_exact(pci_devs,
+			 PAGE_ALIGN(size_mul(sizeof(struct pkvm_device), pci_nr)));
+	free_pages_exact(plat_devs,
+			 PAGE_ALIGN(size_mul(sizeof(struct pkvm_device), plat_nr)));
+
+	*out_nr = pci_nr + plat_nr;
+	*out_devs = merged;
+	return 0;
+
+free_plat:
+	free_pages_exact(plat_devs,
+			 PAGE_ALIGN(size_mul(sizeof(struct pkvm_device), plat_nr)));
+free_pci:
+	free_pages_exact(pci_devs,
+			 PAGE_ALIGN(size_mul(sizeof(struct pkvm_device), pci_nr)));
+	return ret;
 }
 
 static void __init _kvm_host_prot_finalize(void *arg)
