@@ -1087,21 +1087,22 @@ static int stage2_map_walk_leaf(const struct kvm_pgtable_visit_ctx *ctx,
 	return 0;
 }
 
-static void debug_check_table_before_coalescing(
+static bool table_can_be_coalesced(
 	const struct kvm_pgtable_visit_ctx *ctx,
 	struct stage2_map_data *data,
 	kvm_pte_t *ptep, u64 pa)
 {
-#ifdef CONFIG_PKVM_STRICT_CHECKS
 	u64 granule = kvm_granule_size(ctx->level + 1);
 	int i;
 
 	for (i = 0; i < PTRS_PER_PTE; i++, ptep++, pa += granule) {
 		kvm_pte_t pte = kvm_init_valid_leaf_pte(
 			pa, data->attr, ctx->level + 1);
-		WARN_ON(pte != *ptep);
+		if (pte != *ptep)
+			return false;
 	}
-#endif
+
+	return true;
 }
 
 static int stage2_coalesce_walk_table_post(const struct kvm_pgtable_visit_ctx *ctx,
@@ -1137,7 +1138,8 @@ static int stage2_coalesce_walk_table_post(const struct kvm_pgtable_visit_ctx *c
 	size = kvm_granule_size(ctx->level);
 	addr = ALIGN_DOWN(ctx->addr, size);
 
-	debug_check_table_before_coalescing(ctx, data, childp, addr);
+	if (!table_can_be_coalesced(ctx, data, childp, addr))
+		return 0;
 
 	new = kvm_init_valid_leaf_pte(addr, data->attr, ctx->level);
 
