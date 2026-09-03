@@ -96,9 +96,10 @@ static int virtio_bpmp_send(struct tegra_bpmp *bpmp,
 	unsigned long flags;
 	int rc;
 
+	/* TODO handle disabled/missing audit driver */
 	arm_smccc_1_1_invoke(ARM_SMCCC_VENDOR_HYP_KVM_AUDIT_OP_FUNC_ID,
 			     KVM_AUDIT_OP_TARGET_BPMP, msg->mrq, 1, 1, &smcc_res);
-	if (smcc_res.a0 != SMCCC_RET_SUCCESS) {
+	if (smcc_res.a0 != SMCCC_RET_SUCCESS && smcc_res.a0 != SMCCC_RET_NOT_SUPPORTED) {
 		dev_warn(bpmp->dev, "hypervisor replied with error %ld\n",
 			 smcc_res.a0);
 	}
