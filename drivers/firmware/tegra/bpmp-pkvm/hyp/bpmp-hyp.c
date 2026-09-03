@@ -39,7 +39,7 @@ static const unsigned int bpmp_frame_size = ALIGN(MSG_MIN_SZ, TEGRA_IVC_ALIGN);
  * compute the channel size at compile-time.
  *
  * In the general case the channel size is defined as
- * tegra_ivc_total_queue_size(num_frames * frame_size)
+ * sizeof(struct tegra_ivc_header) + num_frames * frame_size
  */
 static const unsigned int bpmp_channel_size =
 	sizeof(struct tegra_ivc_header) + bpmp_frame_size;
