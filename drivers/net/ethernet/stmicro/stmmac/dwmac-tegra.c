@@ -300,6 +300,7 @@ static int tegra_mgbe_probe(struct platform_device *pdev)
 		goto disable_clks;
 	}
 
+	plat->host_dma_width = 32;
 	plat->has_xgmac = 1;
 	plat->flags |= STMMAC_FLAG_TSO_EN;
 	plat->pmt = 1;
