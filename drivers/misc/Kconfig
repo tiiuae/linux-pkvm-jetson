@@ -679,4 +679,18 @@ source "drivers/misc/mchp_pci1xxxx/Kconfig"
 source "drivers/misc/keba/Kconfig"
 source "drivers/misc/amd-sbi/Kconfig"
 source "drivers/misc/rp1/Kconfig"
+config PKVM_GUEST_RAM
+	bool "pKVM identity-mapped guest RAM device"
+	depends on KVM && ARM64 && OF
+	help
+	  Expose the boot-time DRAM reservation that backs a pKVM protected
+	  guest's 1:1 (guest IPA == host PA) RAM, so the VMM can load the guest
+	  kernel, FDT and initrd into it before the guest starts.
+
+	  The reservation is described by a "pkvm,identity-guest-ram" node. Say
+	  Y if this host runs a protected guest with identity-mapped RAM, such
+	  as one doing iGPU passthrough.
+
+	  If unsure, say N.
+
 endmenu
