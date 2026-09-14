@@ -155,6 +155,22 @@ static void prepare_host_vtcr(void)
 					      id_aa64mmfr1_el1_sys_val, phys_shift);
 }
 
+/* Enrolled for assignment: donated via the device path, not host RAM. */
+static bool addr_in_assign_region(phys_addr_t addr)
+{
+	unsigned int i;
+
+	for (i = 0; i < pkvm_moveable_regs_nr; i++) {
+		struct pkvm_moveable_reg *r = &pkvm_moveable_regs[i];
+
+		if (r->type != PKVM_MREG_ASSIGN_MMIO)
+			continue;
+		if (addr >= r->start && addr < r->start + r->size)
+			return true;
+	}
+	return false;
+}
+
 static int prepopulate_host_stage2(void)
 {
 	struct memblock_region *reg;
@@ -2822,6 +2838,8 @@ int __pkvm_install_guest_mmio(struct pkvm_hyp_vcpu *hyp_vcpu, u64 pfn, u64 gfn)
 	 */
 	if (test_bit(KVM_ARCH_FLAG_MMIO_GUARD, &vm->kvm.arch.flags)) {
 		ret = __pkvm_remove_ioguard_page(vm, ipa);
+		if (ret == -EINVAL && addr_in_assign_region(hyp_pfn_to_phys(pfn)))
+			ret = 0;
 		if (ret)
 			goto out_unlock;
 	}

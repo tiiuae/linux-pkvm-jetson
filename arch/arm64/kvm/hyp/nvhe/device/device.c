@@ -68,7 +68,7 @@ int pkvm_init_devices(unsigned long nr_devs, struct pkvm_device *devs)
 			if (pkvm_mmio_in_assign_region(res->base, res->size))
 				continue;
 
-			hyp_err("pkvm_init_devices: dev[%d] BAR[%d] base=0x%llx size=0x%llx not in any PKVM_MREG_ASSIGN_MMIO region",
+			hyp_err("pkvm_init_devices: dev[%d] BAR[%d] base=0x%llx size=0x%llx not in any assignable region",
 				i, j, res->base, res->size);
 			__pkvm_hyp_donate_host(pfn, dev_sz >> PAGE_SHIFT);
 			return -EPERM;

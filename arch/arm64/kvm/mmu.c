@@ -2011,6 +2011,22 @@ unlock:
 static int pkvm_mem_abort_device(struct kvm_vcpu *vcpu, struct kvm_memory_slot *memslot,
 				 u64 gfn, u64 nr_pages)
 {
+	struct kvm_s2_mmu *mmu = &vcpu->kvm->arch.mmu;
+	u64 start = ALIGN_DOWN(gfn << PAGE_SHIFT, PMD_SIZE);
+	u64 end = ALIGN((gfn + nr_pages) << PAGE_SHIFT, PMD_SIZE);
+	unsigned long nr_stage2_pages, nr_donated;
+	int ret;
+
+	nr_stage2_pages = ((end - start) >> PAGE_SHIFT) / PTRS_PER_PTE;
+	nr_stage2_pages *= kvm_mmu_cache_min_pages(mmu);
+	nr_donated = vcpu->arch.stage2_mc.nr_pages;
+	ret = topup_hyp_memcache(&vcpu->arch.stage2_mc, nr_stage2_pages, 0);
+	if (ret)
+		return ret;
+
+	nr_donated = vcpu->arch.stage2_mc.nr_pages - nr_donated;
+	atomic64_add(nr_donated << PAGE_SHIFT, &vcpu->kvm->stat.protected_hyp_mem);
+
 	while (nr_pages--) {
 		bool device, writable;
 		kvm_pfn_t pfn;
