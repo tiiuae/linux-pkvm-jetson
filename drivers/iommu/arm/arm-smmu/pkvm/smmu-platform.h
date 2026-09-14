@@ -32,10 +32,15 @@ struct sid_assignment;
  *                @addr: Physical address of the MMIO access
  *                @is_write: True for write, false for read
  *                @val: Pointer to value (read: output, write: input)
+ *
+ * @sid_is_untranslatable: Return true if @sid names a stream the SoC never
+ *                translates. Such a SID gets no stream matching entry, so
+ *                any number of devices may declare it. Optional.
  */
 struct smmu_platform_hooks {
 	int (*init)(void);
 	bool (*mmio_handler)(u64 addr, bool is_write, u64 *val);
+	bool (*sid_is_untranslatable)(u32 sid);
 };
 
 /**
