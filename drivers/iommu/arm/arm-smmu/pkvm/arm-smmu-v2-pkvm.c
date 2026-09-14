@@ -112,6 +112,12 @@ void smmu_register_platform_hooks(const struct smmu_platform_hooks *hooks)
 	platform_hooks = hooks;
 }
 
+static bool smmu_sid_untranslatable(u32 sid)
+{
+	return platform_hooks && platform_hooks->sid_is_untranslatable &&
+	       platform_hooks->sid_is_untranslatable(sid);
+}
+
 /*
  * Memory Donation Helpers
  */
@@ -2638,6 +2644,11 @@ static void smmu_domain_free(struct kvm_hyp_iommu_domain *domain)
 	hyp_free(smmu_domain);
 }
 
+static bool smmu_dev_sid_untranslatable(pkvm_handle_t iommu, u32 smr)
+{
+	return smmu_sid_untranslatable(FIELD_GET(ARM_SMMU_SMR_ID, smr));
+}
+
 static int smmu_dev_attach(pkvm_handle_t iommu, struct kvm_hyp_iommu_domain *domain,
 			   u32 smr, u32 pasid, u32 pasid_bits, unsigned long flags)
 {
@@ -2652,6 +2663,14 @@ static int smmu_dev_attach(pkvm_handle_t iommu, struct kvm_hyp_iommu_domain *dom
 		return -ENODEV;
 	if (smmu_domain->smmu != smmu)
 		return -EBUSY;
+
+	/*
+	 * No stream matching entry to install, so nothing can collide with a
+	 * sibling that declares the same SID. sCR0.USFCFG=1 keeps an unmatched
+	 * stream faulting.
+	 */
+	if (smmu_sid_untranslatable(sid))
+		return 0;
 
 	hyp_spin_lock(&smmu->lock);
 
@@ -2672,6 +2691,9 @@ static int smmu_dev_attach(pkvm_handle_t iommu, struct kvm_hyp_iommu_domain *dom
 			 * enable it based on the hyp_disabled flag.
 			 */
 			smmu_sme_hyp_disable(smmu, sme_idx);
+		} else if (smmu->s2crs[sme_idx].cbndx == smmu_domain->cbndx) {
+			/* Already attached to this domain, ret stays 0. */
+			goto exit_with_lock;
 		} else {
 			/*
 			 * SID exists, is valid and is not set to fault. Adding
@@ -2712,6 +2734,9 @@ static int smmu_dev_detach(pkvm_handle_t iommu, struct kvm_hyp_iommu_domain *dom
 		return -ENODEV;
 	if (smmu_domain->smmu != smmu)
 		return -EBUSY;
+
+	if (smmu_sid_untranslatable(sid))
+		return 0;
 
 	hyp_spin_lock(&smmu->lock);
 
@@ -2986,6 +3011,7 @@ struct kvm_iommu_ops hyp_arm_smmu_v2_ops = {
 	.host_stage2_idmap	= smmu_host_stage2_idmap,
 	.set_identity		= NULL,
 	.dev_block_dma		= smmu_dev_block_dma,
+	.sid_untranslatable	= smmu_dev_sid_untranslatable,
 	.get_iommu_token_by_id	= smmu_id_to_token,
 #ifdef CONFIG_ARM_SMMU_V2_PKVM_DEBUGFS
 	.debug			= smmu_debug,
