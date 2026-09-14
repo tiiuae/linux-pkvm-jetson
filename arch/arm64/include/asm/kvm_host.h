@@ -282,6 +282,8 @@ struct kvm_pinned_page {
 	u64			ipa;
 	u64			__subtree_last;
 	u8			order;
+	/* False for 1:1 identity RAM, which is reserved, not GUP-pinned. */
+	bool			pinned;
 };
 
 void kvm_pinned_pages_insert(struct kvm_pinned_page *ppage, struct rb_root_cached *root);

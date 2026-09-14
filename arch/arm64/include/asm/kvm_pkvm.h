@@ -371,4 +371,6 @@ int pkvm_msix_hyp_write_entry(u32 dev_idx, u32 entry_idx,
 			      u32 data, u32 ctrl, u32 field_mask);
 int pkvm_msix_hyp_mask_all(u32 dev_idx);
 
+bool pkvm_ipa_is_identity(phys_addr_t ipa);
+
 #endif	/* __ARM64_KVM_PKVM_H__ */

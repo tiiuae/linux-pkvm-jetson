@@ -1839,6 +1839,7 @@ __pkvm_pages_to_ppages(struct kvm *kvm, struct kvm_memory_slot *memslot, gfn_t g
 		ppage->page = pfn_to_page(pfn);
 		ppage->ipa = ipa;
 		ppage->order = get_order(page_size);
+		ppage->pinned = true;
 		list_add_tail(&ppage->list_node, ppages);
 		nr_ppages += 1 << ppage->order;
 
@@ -2056,6 +2057,88 @@ static int pkvm_mem_abort_device(struct kvm_vcpu *vcpu, struct kvm_memory_slot *
 	return 0;
 }
 
+/*
+ * Guest RAM backed by the boot-time 1:1 reservation. The pages sit at a fixed
+ * physical range that equals the guest's IPA range, so the pfn is simply the
+ * gfn and there is nothing to pin: they are reserved at boot and never belong
+ * to the page allocator or to any userspace mapping.
+ *
+ * __pkvm_pin_user_pages() cannot be used for these. FOLL_LONGTERM migrates
+ * pages off a fixed physical range (which would destroy the identity mapping),
+ * and its folio_test_swapbacked() check rejects anything that is not anonymous
+ * or shmem, neither of which a fixed reservation can be.
+ *
+ * Reached only when pinning has already failed on a VM_IO/VM_PFNMAP mapping AND
+ * the IPA lies in the reserved identity range, so a guest backed by ordinary
+ * memory can never land here however its IPAs happen to be laid out.
+ */
+static int pkvm_mem_abort_identity(struct kvm_vcpu *vcpu, gfn_t gfn, long nr_pages)
+{
+	struct list_head ppage_prealloc = LIST_HEAD_INIT(ppage_prealloc);
+	struct kvm_pinned_page *ppage, *tmp;
+	struct kvm *kvm = vcpu->kvm;
+	LIST_HEAD(ppages);
+	int ret = 0;
+	long p;
+
+	for (p = 0; p < nr_pages; p++) {
+		ppage = kmalloc(sizeof(*ppage), GFP_KERNEL_ACCOUNT);
+		if (!ppage) {
+			ret = -ENOMEM;
+			goto free_prealloc;
+		}
+		list_add(&ppage->list_node, &ppage_prealloc);
+	}
+
+	read_lock(&kvm->mmu_lock);
+	for (p = 0; p < nr_pages; p++) {
+		phys_addr_t ipa = (gfn + p) << PAGE_SHIFT;
+		u64 pfn = gfn + p;
+
+		if (!pfn_valid(pfn))
+			continue;
+
+		/* Already mapped: another vCPU won the race for this page. */
+		if (kvm_pinned_pages_iter_first(&kvm->arch.pkvm.pinned_pages,
+						ipa, ipa + PAGE_SIZE - 1))
+			continue;
+
+		ppage = list_first_entry(&ppage_prealloc, struct kvm_pinned_page,
+					 list_node);
+		list_del_init(&ppage->list_node);
+
+		ppage->page = pfn_to_page(pfn);
+		ppage->ipa = ipa;
+		ppage->order = 0;
+		ppage->pinned = false;
+		list_add_tail(&ppage->list_node, &ppages);
+	}
+	read_unlock(&kvm->mmu_lock);
+
+	if (list_empty(&ppages))
+		goto free_prealloc;
+
+	ret = __pkvm_topup_stage2_memcache(vcpu, &ppages);
+	if (ret)
+		goto free_ppages;
+
+	ret = __pkvm_host_donate_guest(vcpu, &ppages);
+
+free_ppages:
+	/* Whatever is left here was not mapped; nothing to unpin or unaccount. */
+	list_for_each_entry_safe(ppage, tmp, &ppages, list_node) {
+		list_del(&ppage->list_node);
+		kfree(ppage);
+	}
+free_prealloc:
+	list_for_each_entry_safe(ppage, tmp, &ppage_prealloc, list_node) {
+		list_del(&ppage->list_node);
+		kfree(ppage);
+	}
+
+	return ret;
+}
+
 static int pkvm_mem_abort(struct kvm_vcpu *vcpu, phys_addr_t fault_ipa, size_t size,
 			  struct kvm_memory_slot *memslot)
 {
@@ -2085,7 +2168,15 @@ static int pkvm_mem_abort(struct kvm_vcpu *vcpu, phys_addr_t fault_ipa, size_t s
 		 * device check is done on the fail path for pin_user_pages, inside -EREMOTEIO
 		 * case, that is possible because the VMA for the device mapping is VM_IO,
 		 * which fails in check_vma_flags() with -EFAULT
+		 *
+		 * The same is true of the 1:1 identity RAM device, so the identity
+		 * range is checked here too rather than on the hot path: a guest
+		 * whose RAM is ordinary anonymous or memfd memory pins fine and
+		 * never gets here.
 		 */
+		if (pkvm_ipa_is_identity(fault_ipa))
+			return pkvm_mem_abort_identity(vcpu, gfn, nr_pages);
+
 		ret = pkvm_mem_abort_device(vcpu, memslot, gfn, nr_pages);
 		return ret;
 	} else if (ret) {
@@ -2170,6 +2261,10 @@ int __pkvm_pgtable_stage2_split(struct kvm_vcpu *vcpu, phys_addr_t ipa, size_t s
 	if (!IS_ALIGNED(ipa, PMD_SIZE) || size != PMD_SIZE)
 		return -EINVAL;
 
+	/* Identity RAM is only ever mapped at 4K, so there is no block to split. */
+	if (pkvm_ipa_is_identity(ipa))
+		return -EINVAL;
+
 	nr_pages = hyp_memcache->nr_pages;
 	ret = topup_hyp_memcache(hyp_memcache, 1, 0);
 	if (ret)
@@ -2227,6 +2322,8 @@ int __pkvm_pgtable_stage2_split(struct kvm_vcpu *vcpu, phys_addr_t ipa, size_t s
 		ppage->page = pfn_to_page(pfn);
 		ppage->ipa = ipa;
 		ppage->order = 0;
+		/* Sub-pages are covered by the huge page's GUP pin. */
+		ppage->pinned = true;
 		ppage->node.rb_right = ppage->node.rb_left = NULL;
 		WARN_ON(insert_ppage(kvm, ppage));
 
@@ -2968,6 +3065,15 @@ void kvm_arch_commit_memory_region(struct kvm *kvm,
 	}
 }
 
+/* Identity RAM is mapped by the donation path, never from this VMA. */
+static bool kvm_slot_is_identity_ram(const struct kvm_memory_slot *slot)
+{
+	u64 start = slot->base_gfn << PAGE_SHIFT;
+	u64 end = start + (slot->npages << PAGE_SHIFT) - 1;
+
+	return pkvm_ipa_is_identity(start) && pkvm_ipa_is_identity(end);
+}
+
 int kvm_arch_prepare_memory_region(struct kvm *kvm,
 				   const struct kvm_memory_slot *old,
 				   struct kvm_memory_slot *new,
@@ -3045,7 +3151,10 @@ int kvm_arch_prepare_memory_region(struct kvm *kvm,
 			 * Cacheable PFNMAP is allowed only if the hardware
 			 * supports it.
 			 */
-			if (kvm_vma_is_cacheable(vma) && !kvm_supports_cacheable_pfnmap()) {
+			if (kvm_vma_is_cacheable(vma) &&
+			    !kvm_supports_cacheable_pfnmap() &&
+			    !(kvm_vm_is_protected(kvm) &&
+			      kvm_slot_is_identity_ram(new))) {
 				ret = -EINVAL;
 				break;
 			}

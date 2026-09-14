@@ -1569,6 +1569,65 @@ int pkvm_pgtable_stage2_init(struct kvm_pgtable *pgt, struct kvm_s2_mmu *mmu,
 	return 0;
 }
 
+/*
+ * A boot-time reserved-but-mapped DRAM range that a protected guest maps 1:1
+ * (guest IPA == host PA). The SMMU-bypassed iGPU consumes raw physical
+ * addresses out of its GMMU, so every page of guest RAM the GPU can touch has
+ * to be identity mapped; doing it for all of guest RAM removes the need to
+ * confine GPU allocations to a dedicated carveout.
+ *
+ * The range must NOT be no-map: EL2's donation gate (HOST_CHECK_IS_MEMORY)
+ * requires System RAM, and the host needs a mapping of it to load the guest
+ * payload before the guest faults it in.
+ */
+static phys_addr_t pkvm_identity_ram_base;
+static u64 pkvm_identity_ram_size;
+
+bool pkvm_ipa_is_identity(phys_addr_t ipa)
+{
+	if (!pkvm_identity_ram_size)
+		return false;
+
+	return ipa >= pkvm_identity_ram_base &&
+	       ipa - pkvm_identity_ram_base < pkvm_identity_ram_size;
+}
+
+static int __init pkvm_init_identity_ram(void)
+{
+	struct device_node *np;
+	struct resource res;
+
+	np = of_find_compatible_node(NULL, NULL, "pkvm,identity-guest-ram");
+	if (!np)
+		return 0;
+
+	if (of_address_to_resource(np, 0, &res)) {
+		kvm_err("pkvm: identity guest RAM node has no usable reg\n");
+		goto out;
+	}
+
+	/*
+	 * no-map would drop the range out of System RAM: the donation would then
+	 * fail HOST_CHECK_IS_MEMORY and there would be no struct page for it.
+	 */
+	if (of_property_read_bool(np, "no-map") ||
+	    !memblock_is_map_memory(res.start)) {
+		kvm_err("pkvm: identity guest RAM 0x%llx is not mapped System RAM\n",
+			(u64)res.start);
+		goto out;
+	}
+
+	pkvm_identity_ram_base = res.start;
+	pkvm_identity_ram_size = resource_size(&res);
+	kvm_info("pkvm: identity guest RAM 0x%llx-0x%llx mapped 1:1 (IPA==PA)\n",
+		 (u64)pkvm_identity_ram_base,
+		 (u64)(pkvm_identity_ram_base + pkvm_identity_ram_size - 1));
+out:
+	of_node_put(np);
+	return 0;
+}
+core_initcall(pkvm_init_identity_ram);
+
 void pkvm_host_reclaim_page(struct kvm *kvm, phys_addr_t ipa)
 {
 	struct mm_struct *mm = current->mm;
@@ -1587,8 +1646,10 @@ void pkvm_host_reclaim_page(struct kvm *kvm, phys_addr_t ipa)
 	if (!ppage)
 		return;
 
-	account_locked_vm(mm, 1, false);
-	unpin_user_pages_dirty_lock(&ppage->page, 1, true);
+	if (ppage->pinned) {
+		account_locked_vm(mm, 1, false);
+		unpin_user_pages_dirty_lock(&ppage->page, 1, true);
+	}
 	kfree(ppage);
 }
 
@@ -1637,8 +1698,10 @@ retry:
 			continue;
 		}
 		WARN_ON(ret);
-		unpin_user_pages_dirty_lock(&ppage->page, 1, true);
-		account_locked_vm(mm, 1 << ppage->order, false);
+		if (ppage->pinned) {
+			unpin_user_pages_dirty_lock(&ppage->page, 1, true);
+			account_locked_vm(mm, 1 << ppage->order, false);
+		}
 		kvm_pinned_pages_remove(ppage, &kvm->arch.pkvm.pinned_pages);
 		kfree(ppage);
 		ppage = next;
