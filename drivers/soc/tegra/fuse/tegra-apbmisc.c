@@ -30,7 +30,13 @@
 static void __iomem *apbmisc_base;
 static bool long_ram_code;
 static u32 strapping;
-static u32 chipid;
+/*
+ * Default to the Tegra234 chip id so a VM guest with no APBMISC MMIO can still
+ * identify the SoC (userspace libnvrm reads soc0/soc_id). On real hardware
+ * tegra_init_apbmisc() overwrites this from the register, so the host is
+ * unaffected. 0x00012347: bits[15:8]=0x23 (Tegra234).
+ */
+static u32 chipid = 0x00012347;
 
 u32 tegra_read_chipid(void)
 {
