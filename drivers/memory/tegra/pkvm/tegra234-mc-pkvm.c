@@ -401,12 +401,18 @@ err_reclaim:
 	return ret;
 }
 
+static bool tegra234_mc_sid_is_untranslatable(u32 sid)
+{
+	return sid == TEGRA234_SID_PASSTHROUGH;
+}
+
 /*
  * Platform hooks for SMMU integration
  */
 static const struct smmu_platform_hooks tegra234_mc_hooks = {
 	.init = tegra234_mc_init,
 	.mmio_handler = tegra234_mc_mmio_handler,
+	.sid_is_untranslatable = tegra234_mc_sid_is_untranslatable,
 };
 
 /*

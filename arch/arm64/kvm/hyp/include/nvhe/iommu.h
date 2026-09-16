@@ -55,6 +55,7 @@ struct kvm_iommu_ops {
 	int (*dev_block_dma)(pkvm_handle_t iommu, u32 endpoint_id,
 			     bool is_host_to_guest);
 	int (*get_iommu_token_by_id)(pkvm_handle_t smmu_id, u64 *out_token);
+	bool (*sid_untranslatable)(pkvm_handle_t iommu, u32 sid);
 #ifdef CONFIG_ARM_SMMU_V2_PKVM_DEBUGFS
 	int (*debug)(pkvm_handle_t smmu_id, enum kvm_iommu_debug_ops op, void *out, size_t out_sz);
 #endif
@@ -74,6 +75,7 @@ void kvm_iommu_host_stage2_idmap_complete(bool map);
 int kvm_iommu_alloc_domain(pkvm_handle_t drv_id, pkvm_handle_t iommu_id,
 			   pkvm_handle_t domain_id, int type);
 int kvm_iommu_free_domain(pkvm_handle_t domain_id);
+bool kvm_iommu_sid_untranslatable(pkvm_handle_t iommu, u32 sid);
 int kvm_iommu_attach_dev(pkvm_handle_t iommu_id, pkvm_handle_t domain_id,
 			 u32 endpoint_id, u32 pasid, u32 pasid_bits,
 			 unsigned long flags);

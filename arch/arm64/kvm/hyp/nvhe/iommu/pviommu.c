@@ -447,6 +447,29 @@ void kvm_iommu_teardown_guest_domains(struct pkvm_hyp_vm *hyp_vm)
 	hyp_spin_unlock(&pviommu_guest_domain_lock);
 }
 
+static bool pkvm_guest_iommu_sid_info(struct pkvm_hyp_vcpu *hyp_vcpu)
+{
+	struct kvm_vcpu *vcpu = &hyp_vcpu->vcpu;
+	u64 iommu_id = smccc_get_arg2(vcpu);
+	u64 sid = smccc_get_arg3(vcpu);
+	struct pkvm_hyp_vm *vm = pkvm_hyp_vcpu_to_hyp_vm(hyp_vcpu);
+	struct pviommu_route route;
+	u64 flags = 0;
+	int ret;
+
+	ret = pkvm_pviommu_get_route(vm, iommu_id, sid, &route);
+	if (ret) {
+		smccc_set_retval(vcpu, SMCCC_RET_INVALID_PARAMETER, 0, 0, 0);
+		return true;
+	}
+
+	if (kvm_iommu_sid_untranslatable(route.iommu, route.sid))
+		flags |= KVM_PVIOMMU_SID_UNTRANSLATED;
+
+	smccc_set_retval(vcpu, SMCCC_RET_SUCCESS, flags, 0, 0);
+	return true;
+}
+
 bool kvm_handle_pviommu_hvc(struct kvm_vcpu *vcpu, u64 *exit_code)
 {
 	u64 iommu_op = smccc_get_arg1(vcpu);
@@ -471,6 +494,8 @@ bool kvm_handle_pviommu_hvc(struct kvm_vcpu *vcpu, u64 *exit_code)
 		return pkvm_guest_iommu_map(hyp_vcpu, exit_code);
 	case KVM_PVIOMMU_OP_UNMAP_PAGES:
 		return pkvm_guest_iommu_unmap(hyp_vcpu, exit_code);
+	case KVM_PVIOMMU_OP_SID_INFO:
+		return pkvm_guest_iommu_sid_info(hyp_vcpu);
 	}
 
 	smccc_set_retval(vcpu, SMCCC_RET_NOT_SUPPORTED, 0, 0, 0);
