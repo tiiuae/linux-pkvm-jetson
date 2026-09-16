@@ -487,6 +487,19 @@ out_unlock:
 	return ret;
 }
 
+bool kvm_iommu_sid_untranslatable(pkvm_handle_t iommu, u32 sid)
+{
+	struct kvm_iommu_ops *ops;
+
+	for_each_drv(ops) {
+		if (ops->sid_untranslatable &&
+		    ops->sid_untranslatable(iommu, sid))
+			return true;
+	}
+
+	return false;
+}
+
 int kvm_iommu_attach_dev(pkvm_handle_t iommu_id, pkvm_handle_t domain_id,
 			 u32 endpoint_id, u32 pasid, u32 pasid_bits, unsigned long flags)
 {
