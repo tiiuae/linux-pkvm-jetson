@@ -306,6 +306,8 @@ struct kvm_protected_vm {
 	bool is_created;
 	bool smc_forwarded;
 	u32 ffa_support;
+	u64 identity_ram_base;
+	u64 identity_ram_size;
 	u64 its_doorbell_guest_ipa;  /* Page-aligned guest IPA of ITS doorbell page */
 	u64 its_doorbell_phys_addr;  /* Page-aligned physical ITS doorbell page addr */
 };
