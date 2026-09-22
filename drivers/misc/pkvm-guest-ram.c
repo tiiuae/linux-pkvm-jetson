@@ -11,6 +11,7 @@
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
+#include <linux/pkvm-guest-ram.h>
 
 static phys_addr_t pkvm_guest_ram_base;
 static u64 pkvm_guest_ram_size;
@@ -36,6 +37,11 @@ static const struct file_operations pkvm_guest_ram_fops = {
 	.mmap	= pkvm_guest_ram_mmap,
 	.llseek	= noop_llseek,
 };
+
+bool pkvm_guest_ram_is_vma(struct vm_area_struct *vma)
+{
+	return vma->vm_file && vma->vm_file->f_op == &pkvm_guest_ram_fops;
+}
 
 static struct miscdevice pkvm_guest_ram_dev = {
 	.minor	= MISC_DYNAMIC_MINOR,
