@@ -613,11 +613,16 @@ static int pkvm_register_device_from_dev(struct device *dev, u32 group_id,
 				continue;
 			if (!(res->flags & (IORESOURCE_MEM | IORESOURCE_IO)))
 				continue;
-			if (PAGE_ALIGNED(res->start) && PAGE_ALIGNED(resource_size(res))) {
-				pkvm_dev->resources[j].base = res->start;
-				pkvm_dev->resources[j].size = resource_size(res);
-				j++;
+			if (!PAGE_ALIGNED(res->start) ||
+			    !PAGE_ALIGNED(resource_size(res))) {
+				kvm_err("pkvm: %s BAR%d [%pa+0x%llx] not page-aligned; not donated\n",
+					dev_name(dev), i, &res->start,
+					(u64)resource_size(res));
+				continue;
 			}
+			pkvm_dev->resources[j].base = res->start;
+			pkvm_dev->resources[j].size = resource_size(res);
+			j++;
 		}
 	} else if (dev_is_platform(dev)) {
 		struct platform_device *ppdev = to_platform_device(dev);
@@ -627,11 +632,16 @@ static int pkvm_register_device_from_dev(struct device *dev, u32 group_id,
 		       (res = platform_get_resource(ppdev, IORESOURCE_MEM, ri++))) {
 			if (!resource_size(res))
 				continue;
-			if (PAGE_ALIGNED(res->start) && PAGE_ALIGNED(resource_size(res))) {
-				pkvm_dev->resources[j].base = res->start;
-				pkvm_dev->resources[j].size = resource_size(res);
-				j++;
+			if (!PAGE_ALIGNED(res->start) ||
+			    !PAGE_ALIGNED(resource_size(res))) {
+				kvm_err("pkvm: %s res%d [%pa+0x%llx] not page-aligned; not donated\n",
+					dev_name(dev), ri - 1, &res->start,
+					(u64)resource_size(res));
+				continue;
 			}
+			pkvm_dev->resources[j].base = res->start;
+			pkvm_dev->resources[j].size = resource_size(res);
+			j++;
 		}
 	}
 	pkvm_dev->nr_resources = j;
@@ -983,6 +993,8 @@ static int pkvm_init_devices_strict(unsigned long *out_nr,
 							    &dev_base[idx]);
 			of_node_put(dev_np);
 			if (ret == -ENOENT) {
+				kvm_err("pkvm: declared device %s has no IOMMU stream IDs; NOT assignable\n",
+					dev_name(&pdev->dev));
 				ret = 0;
 				continue;
 			}
