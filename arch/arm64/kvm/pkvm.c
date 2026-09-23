@@ -1325,6 +1325,7 @@ device_initcall_sync(finalize_pkvm);
 
 static DEFINE_MUTEX(pkvm_late_lock);
 static bool pkvm_late_submitted;
+static long pkvm_late_registered_nr = -1;
 static struct delayed_work pkvm_late_dw;
 static struct notifier_block pkvm_late_nb;
 
@@ -1347,6 +1348,7 @@ static void pkvm_late_register(void)
 
 	if (!nr_devs) {
 		pr_warn("pkvm: late scan found 0 assignable devices, skipping HVC\n");
+		WRITE_ONCE(pkvm_late_registered_nr, 0);
 		WRITE_ONCE(pkvm_late_submitted, true);
 		goto out;
 	}
@@ -1368,6 +1370,7 @@ static void pkvm_late_register(void)
 	}
 
 	pr_info("pkvm: registered %lu device(s) via late HVC\n", nr_devs);
+	WRITE_ONCE(pkvm_late_registered_nr, nr_devs);
 	WRITE_ONCE(pkvm_late_submitted, true);
 out:
 	mutex_unlock(&pkvm_late_lock);
@@ -1493,6 +1496,7 @@ static int __init pkvm_late_devices_init(void)
 	if (!pkvm_assign_permissive) {
 		pkvm_wait_for_declared_devices();
 		pkvm_late_register();
+		kvm_info("strict device registration complete.\n");
 		return 0;
 	}
 
@@ -2881,7 +2885,7 @@ int kvm_arch_assign_device(struct device *dev, struct kvm *kvm)
 	 * group iterator (__pkvm_arch_assign_device returns 0 for them).
 	 */
 	if (!dev->pkvm_registered) {
-		pr_warn("pkvm_assign_dev: %s not registered with pKVM (no pkvm,device-assignment DT entry, and pkvm.assign_permissive=0)\n",
+		pr_warn("pkvm_assign_dev: %s not registered with pKVM. Check for errors in early KVM device registration.\n",
 			dev_name(dev));
 		return -ENODEV;
 	}
@@ -2941,8 +2945,19 @@ int kvm_arch_assign_group(struct iommu_group *group, struct kvm *kvm)
 	 */
 	iommu_group_for_each_dev(group, &registered, __pkvm_count_registered);
 	if (!registered) {
-		pr_warn("pkvm_assign_group: group %d has no pKVM-registered devices (no pkvm,device-assignment DT entry, and pkvm.assign_permissive=0)\n",
-			iommu_group_id(group));
+		long nr = READ_ONCE(pkvm_late_registered_nr);
+
+		if (nr < 0) {
+			pr_warn("pkvm_assign_group: group %d not assignable: error in early KVM device registration\n",
+				iommu_group_id(group));
+		} else if (nr == 0) {
+			pr_warn("pkvm_assign_group: group %d not assignable: no devices registered in pKVM\n",
+				iommu_group_id(group));
+		} else {
+			pr_warn("pkvm_assign_group: group %d not assignable: %ld device(s) registered but none of them in this group\n",
+				iommu_group_id(group), nr);
+			pr_warn("Hint: edit the 'pkvm,device-assignment' DT node (or set pkvm.assign_permissive for PCI devices)\n");
+		}
 		return -ENODEV;
 	}
 
