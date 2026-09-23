@@ -1736,13 +1736,25 @@ int pkvm_pgtable_stage2_init(struct kvm_pgtable *pgt, struct kvm_s2_mmu *mmu,
 static phys_addr_t pkvm_identity_ram_base;
 static u64 pkvm_identity_ram_size;
 
-bool pkvm_ipa_is_identity(phys_addr_t ipa)
+bool pkvm_identity_ram_reservation(phys_addr_t *base, u64 *size)
 {
 	if (!pkvm_identity_ram_size)
 		return false;
 
-	return ipa >= pkvm_identity_ram_base &&
-	       ipa - pkvm_identity_ram_base < pkvm_identity_ram_size;
+	*base = pkvm_identity_ram_base;
+	*size = pkvm_identity_ram_size;
+	return true;
+}
+
+bool pkvm_ipa_is_identity(struct kvm *kvm, phys_addr_t ipa)
+{
+	u64 base = kvm->arch.pkvm.identity_ram_base;
+	u64 size = kvm->arch.pkvm.identity_ram_size;
+
+	if (!size)
+		return false;
+
+	return ipa >= base && ipa - base < size;
 }
 
 static int __init pkvm_init_identity_ram(void)
