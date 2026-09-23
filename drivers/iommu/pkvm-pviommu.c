@@ -5,10 +5,12 @@
  */
 #include <linux/of_platform.h>
 #include <linux/arm-smccc.h>
+#include <linux/interval_tree.h>
 #include <linux/iommu.h>
-#include <linux/maple_tree.h>
 #include <linux/pci.h>
 #include <linux/platform_device.h>
+#include <linux/slab.h>
+#include <linux/spinlock.h>
 #include <linux/xarray.h>
 
 #define ASSERT(cond)							\
@@ -27,8 +29,31 @@ static unsigned long pgsize_bitmap;
 struct pviommu_domain {
 	struct iommu_domain		domain;
 	unsigned long			id; /* pKVM domain ID. */
-	struct maple_tree		mappings; /* IOVA -> IPA */
+	/*
+	 * IOVA -> IPA shadow of the hypervisor's tables, needed because the
+	 * hypervisor offers no way to query a translation back.
+	 *
+	 * The IOMMU core serialises neither ->map_pages against ->unmap_pages
+	 * nor either of them against ->iova_to_phys, and the DMA API allows
+	 * dma_unmap_*() and dma_sync_*() from interrupt context, so every
+	 * access is taken under @lock with interrupts disabled.
+	 *
+	 * This deliberately is not a maple tree. Its node allocator reaches
+	 * kmem_cache_prefill_sheaf() for anything but a single node, which
+	 * takes the SLUB percpu sheaves local_lock unconditionally, and that
+	 * lock is only preempt-disable on !PREEMPT_RT. A tree write from a
+	 * NAPI poll would then corrupt the sheaves of a task it interrupted.
+	 * kmalloc(GFP_ATOMIC) has no such problem: its sheaf fast paths use
+	 * local_trylock() and fall back on failure.
+	 */
+	struct rb_root_cached		mappings;
 	spinlock_t			lock;
+};
+
+/* A contiguous IOVA range backed by a contiguous IPA range. */
+struct pviommu_mapping {
+	struct interval_tree_node	node;	/* IOVA range, inclusive. */
+	phys_addr_t			paddr;	/* IPA of node.start. */
 };
 
 struct pviommu {
@@ -79,49 +104,118 @@ static u64 __linux_prot_smccc(int iommu_prot)
 	return prot;
 }
 
+static struct pviommu_mapping *to_pviommu_mapping(struct interval_tree_node *node)
+{
+	return container_of(node, struct pviommu_mapping, node);
+}
+
 static void pviommu_domain_mappings_init(struct pviommu_domain *pv_domain)
 {
 	spin_lock_init(&pv_domain->lock);
-	mt_init_flags(&pv_domain->mappings, MT_FLAGS_LOCK_EXTERN);
-	mt_set_external_lock(&pv_domain->mappings, &pv_domain->lock);
+	pv_domain->mappings = RB_ROOT_CACHED;
 }
 
 static void pviommu_domain_mappings_destroy(struct pviommu_domain *pv_domain)
 {
-	unsigned long flags;
+	struct pviommu_mapping *map, *tmp;
 
-	spin_lock_irqsave(&pv_domain->lock, flags);
-	__mt_destroy(&pv_domain->mappings);
-	spin_unlock_irqrestore(&pv_domain->lock, flags);
+	rbtree_postorder_for_each_entry_safe(map, tmp,
+					     &pv_domain->mappings.rb_root,
+					     node.rb)
+		kfree(map);
+
+	pv_domain->mappings = RB_ROOT_CACHED;
 }
 
 /*
- * Store @entry over the inclusive range [@start, @end], or erase it when @entry
- * is NULL. Caller must hold pv_domain->lock.
+ * Record @map over the inclusive range [@start, @end], which must not overlap
+ * an existing mapping. Caller must hold pv_domain->lock.
  */
-static void __pviommu_domain_store(struct pviommu_domain *pv_domain,
-				   u64 start, u64 end, void *entry)
+static void __pviommu_domain_insert(struct pviommu_domain *pv_domain,
+				    struct pviommu_mapping *map,
+				    u64 start, u64 end, phys_addr_t paddr)
 {
-	MA_STATE(mas, &pv_domain->mappings, start, end);
-	int ret;
+	map->node.start = start;
+	map->node.last = end;
+	map->paddr = paddr;
+	interval_tree_insert(&map->node, &pv_domain->mappings);
+}
 
-	ret = mas_store_gfp(&mas, entry, GFP_ATOMIC);
-	if (ret)
-		pr_err_ratelimited("pviommu: failed to record %s of [%llx, %llx]: %d\n",
-				   entry ? "map" : "unmap", start, end, ret);
+/*
+ * Drop the inclusive range [@start, @end] from the shadow, trimming or
+ * splitting the mappings it overlaps. Caller must hold pv_domain->lock.
+ */
+static void __pviommu_domain_punch(struct pviommu_domain *pv_domain,
+				   u64 start, u64 end)
+{
+	struct interval_tree_node *node;
+
+	/* The range can cover any number of mappings. */
+	while ((node = interval_tree_iter_first(&pv_domain->mappings,
+						start, end))) {
+		struct pviommu_mapping *map = to_pviommu_mapping(node);
+		struct pviommu_mapping *head = NULL, *tail = NULL;
+		u64 old_start = node->start, old_end = node->last;
+		phys_addr_t old_paddr = map->paddr;
+
+		interval_tree_remove(node, &pv_domain->mappings);
+
+		/*
+		 * Reuse the node just removed for whichever part survives, so
+		 * that the common case of an exact match allocates nothing and
+		 * only a mapping punched in the middle needs a second node.
+		 */
+		if (old_start < start) {
+			head = map;
+			if (old_end > end)
+				tail = kzalloc(sizeof(*tail), GFP_ATOMIC);
+		} else if (old_end > end) {
+			tail = map;
+		}
+
+		if (head)
+			__pviommu_domain_insert(pv_domain, head, old_start,
+						start - 1, old_paddr);
+
+		/*
+		 * A mapping records the IPA of its first byte, so a surviving
+		 * tail has to be rebased rather than merely trimmed.
+		 */
+		if (tail)
+			__pviommu_domain_insert(pv_domain, tail, end + 1, old_end,
+						old_paddr + (end + 1 - old_start));
+		else if (old_end > end)
+			pr_err_ratelimited("pviommu: dropping shadow of [%llx, %llx]\n",
+					   end + 1, old_end);
+
+		if (!head && !tail)
+			kfree(map);
+	}
 }
 
 /* Ranges are inclusive for all functions. */
 static void pviommu_domain_insert_map(struct pviommu_domain *pv_domain,
-				      u64 start, u64 end, u64 val)
+				      u64 start, u64 end, phys_addr_t paddr,
+				      gfp_t gfp)
 {
+	struct pviommu_mapping *map;
 	unsigned long flags;
 
 	if (end < start)
 		return;
 
+	/* Allocated up front, as the tree is walked with interrupts disabled. */
+	map = kzalloc(sizeof(*map), gfp);
+	if (!map) {
+		pr_err_ratelimited("pviommu: failed to record map of [%llx, %llx]\n",
+				   start, end);
+		return;
+	}
+
 	spin_lock_irqsave(&pv_domain->lock, flags);
-	__pviommu_domain_store(pv_domain, start, end, xa_mk_value(val));
+	/* A new mapping replaces whatever was recorded for the range. */
+	__pviommu_domain_punch(pv_domain, start, end);
+	__pviommu_domain_insert(pv_domain, map, start, end, paddr);
 	spin_unlock_irqrestore(&pv_domain->lock, flags);
 }
 
@@ -134,60 +228,21 @@ static void pviommu_domain_remove_map(struct pviommu_domain *pv_domain,
 		return;
 
 	spin_lock_irqsave(&pv_domain->lock, flags);
-	/* Range can cover multiple entries. */
-	while (start <= end) {
-		MA_STATE(mas, &pv_domain->mappings, start, end);
-		u64 old_start, old_end, entry;
-		void *old;
-
-		/*
-		 * Search up to @end so that holes are skipped rather than
-		 * mistaken for an entry starting at @start.
-		 */
-		old = mas_find(&mas, end);
-		if (!xa_is_value(old))
-			break;
-
-		entry = xa_to_value(old);
-		old_start = mas.index;
-		old_end = mas.last;
-
-		/*
-		 * Erase the whole entry and put back the parts that survive.
-		 * They cannot simply be split off, as the value of an entry is
-		 * the IPA of its first byte and so differs for each part.
-		 */
-		__pviommu_domain_store(pv_domain, old_start, old_end, NULL);
-
-		if (start > old_start)
-			__pviommu_domain_store(pv_domain, old_start, start - 1,
-					       xa_mk_value(entry));
-
-		if (old_end > end)
-			__pviommu_domain_store(pv_domain, end + 1, old_end,
-					       xa_mk_value(entry + end - old_start + 1));
-
-		/* Also guards against old_end + 1 wrapping to 0. */
-		if (old_end >= end)
-			break;
-
-		start = old_end + 1;
-	}
+	__pviommu_domain_punch(pv_domain, start, end);
 	spin_unlock_irqrestore(&pv_domain->lock, flags);
 }
 
-static u64 pviommu_domain_find(struct pviommu_domain *pv_domain, u64 key)
+static phys_addr_t pviommu_domain_find(struct pviommu_domain *pv_domain, u64 key)
 {
-	MA_STATE(mas, &pv_domain->mappings, key, key);
+	struct interval_tree_node *node;
 	unsigned long flags;
-	u64 phys = 0;
-	void *entry;
+	phys_addr_t phys = 0;
 
 	spin_lock_irqsave(&pv_domain->lock, flags);
-	entry = mas_find(&mas, key);
-	/* No entry. */
-	if (xa_is_value(entry))
-		phys = (key - mas.index) + (u64)xa_to_value(entry);
+	node = interval_tree_iter_first(&pv_domain->mappings, key, key);
+	/* No node means the IOVA is not mapped. */
+	if (node)
+		phys = to_pviommu_mapping(node)->paddr + (key - node->start);
 	spin_unlock_irqrestore(&pv_domain->lock, flags);
 
 	return phys;
@@ -221,14 +276,9 @@ static int pviommu_map_pages(struct iommu_domain *domain, unsigned long iova,
 			break;
 	}
 
-	/*
-	 * @gfp is deliberately ignored: the mappings tree is updated under a
-	 * spinlock that ->unmap_pages may take from interrupt context, so it
-	 * always allocates as GFP_ATOMIC.
-	 */
 	if (*mapped)
 		pviommu_domain_insert_map(pv_domain, iova - *mapped, iova - 1,
-					  paddr - *mapped);
+					  paddr - *mapped, gfp);
 
 	return smccc_to_linux_ret(res.a0);
 }
@@ -571,8 +621,9 @@ static int __init __pviommu_selftest(void)
 
 	pviommu_domain_mappings_init(&domain);
 
-	pviommu_domain_insert_map(&domain, 0x10000, 0xFEFFF, 0xE0000);
-	pviommu_domain_insert_map(&domain, 0xFFF0000, 0x1EDBFFFF, 0xDEAD0000);
+	pviommu_domain_insert_map(&domain, 0x10000, 0xFEFFF, 0xE0000, GFP_KERNEL);
+	pviommu_domain_insert_map(&domain, 0xFFF0000, 0x1EDBFFFF, 0xDEAD0000,
+				  GFP_KERNEL);
 	ASSERT(pviommu_domain_find(&domain, 0x10000) == 0xE0000);
 	ASSERT(pviommu_domain_find(&domain, 0x10F00) == 0xE0F00);
 	ASSERT(pviommu_domain_find(&domain, 0x1EDBFFFF) == 0xED89FFFF);
@@ -583,9 +634,10 @@ static int __init __pviommu_selftest(void)
 	ASSERT(pviommu_domain_find(&domain, 0x1B000) == 0xEB000);
 	ASSERT(pviommu_domain_find(&domain, 0x14000) == 0);
 
-	pviommu_domain_insert_map(&domain, 0xC00000, 0xCFFFFF, 0xABCD000);
-	pviommu_domain_insert_map(&domain, 0xD00000, 0xDFFFFF, 0x1000);
-	pviommu_domain_insert_map(&domain, 0xE00000, 0xEFFFFF, 0xC0FE00000);
+	pviommu_domain_insert_map(&domain, 0xC00000, 0xCFFFFF, 0xABCD000, GFP_KERNEL);
+	pviommu_domain_insert_map(&domain, 0xD00000, 0xDFFFFF, 0x1000, GFP_KERNEL);
+	pviommu_domain_insert_map(&domain, 0xE00000, 0xEFFFFF, 0xC0FE00000,
+				  GFP_KERNEL);
 	ASSERT(pviommu_domain_find(&domain, 0xD00000) == 0x1000);
 	pviommu_domain_remove_map(&domain, 0xC50000, 0xE5FFFF);
 	ASSERT(pviommu_domain_find(&domain, 0xC50000) == 0);
