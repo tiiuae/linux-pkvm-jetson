@@ -13,13 +13,13 @@
 #include <linux/spinlock.h>
 #include <linux/xarray.h>
 
-#define ASSERT(cond)							\
-	do {								\
-		if (!(cond)) {						\
-			pr_err("line %d: assertion failed: %s\n",	\
-			       __LINE__, #cond);			\
-			return -1;					\
-		}							\
+#define ASSERT(cond)                                                        \
+	do {                                                                \
+		if (!(cond)) {                                              \
+			pr_err("line %d: assertion failed: %s\n", __LINE__, \
+			       #cond);                                      \
+			return -1;                                          \
+		}                                                           \
 	} while (0)
 
 static DEFINE_XARRAY(pviommu_groups);
@@ -27,45 +27,35 @@ static DEFINE_XARRAY(pviommu_groups);
 static unsigned long pgsize_bitmap;
 
 struct pviommu_domain {
-	struct iommu_domain		domain;
-	unsigned long			id; /* pKVM domain ID. */
+	struct iommu_domain domain;
+	unsigned long id; /* pKVM domain ID. */
 	/*
-	 * IOVA -> IPA shadow of the hypervisor's tables, needed because the
-	 * hypervisor offers no way to query a translation back.
+	 * IOVA -> IPA shadow of the hypervisor tables, because the hypervisor
+	 * offers no way to query a translation back.
 	 *
-	 * The IOMMU core serialises neither ->map_pages against ->unmap_pages
-	 * nor either of them against ->iova_to_phys, and the DMA API allows
-	 * dma_unmap_*() and dma_sync_*() from interrupt context, so every
-	 * access is taken under @lock with interrupts disabled.
-	 *
-	 * This deliberately is not a maple tree. Its node allocator reaches
-	 * kmem_cache_prefill_sheaf() for anything but a single node, which
-	 * takes the SLUB percpu sheaves local_lock unconditionally, and that
-	 * lock is only preempt-disable on !PREEMPT_RT. A tree write from a
-	 * NAPI poll would then corrupt the sheaves of a task it interrupted.
-	 * kmalloc(GFP_ATOMIC) has no such problem: its sheaf fast paths use
-	 * local_trylock() and fall back on failure.
+	 * The DMA API allows dma_unmap_*() and dma_sync_*() from interrupt
+	 * context, so every access is taken under lock with interrupts disabled.
 	 */
-	struct rb_root_cached		mappings;
-	spinlock_t			lock;
+	struct rb_root_cached mappings;
+	spinlock_t lock;
 };
 
 /* A contiguous IOVA range backed by a contiguous IPA range. */
 struct pviommu_mapping {
-	struct interval_tree_node	node;	/* IOVA range, inclusive. */
-	phys_addr_t			paddr;	/* IPA of node.start. */
+	struct interval_tree_node node; /* IOVA range, inclusive. */
+	phys_addr_t paddr; /* IPA of node.start. */
 };
 
 struct pviommu {
-	struct iommu_device		iommu;
-	u32				id;
+	struct iommu_device iommu;
+	u32 id;
 };
 
 struct pviommu_master {
-	struct device			*dev;
-	struct pviommu			*iommu;
-	u32				ssid_bits;
-	struct pviommu_domain		*domain;
+	struct device *dev;
+	struct pviommu *iommu;
+	u32 ssid_bits;
+	struct pviommu_domain *domain;
 };
 
 static int smccc_to_linux_ret(u64 smccc_ret)
@@ -104,7 +94,8 @@ static u64 __linux_prot_smccc(int iommu_prot)
 	return prot;
 }
 
-static struct pviommu_mapping *to_pviommu_mapping(struct interval_tree_node *node)
+static struct pviommu_mapping *
+to_pviommu_mapping(struct interval_tree_node *node)
 {
 	return container_of(node, struct pviommu_mapping, node);
 }
@@ -119,10 +110,10 @@ static void pviommu_domain_mappings_destroy(struct pviommu_domain *pv_domain)
 {
 	struct pviommu_mapping *map, *tmp;
 
-	rbtree_postorder_for_each_entry_safe(map, tmp,
-					     &pv_domain->mappings.rb_root,
-					     node.rb)
+	rbtree_postorder_for_each_entry_safe(
+		map, tmp, &pv_domain->mappings.rb_root, node.rb) {
 		kfree(map);
+	}
 
 	pv_domain->mappings = RB_ROOT_CACHED;
 }
@@ -132,8 +123,8 @@ static void pviommu_domain_mappings_destroy(struct pviommu_domain *pv_domain)
  * an existing mapping. Caller must hold pv_domain->lock.
  */
 static void __pviommu_domain_insert(struct pviommu_domain *pv_domain,
-				    struct pviommu_mapping *map,
-				    u64 start, u64 end, phys_addr_t paddr)
+				    struct pviommu_mapping *map, u64 start,
+				    u64 end, phys_addr_t paddr)
 {
 	map->node.start = start;
 	map->node.last = end;
@@ -145,14 +136,14 @@ static void __pviommu_domain_insert(struct pviommu_domain *pv_domain,
  * Drop the inclusive range [@start, @end] from the shadow, trimming or
  * splitting the mappings it overlaps. Caller must hold pv_domain->lock.
  */
-static void __pviommu_domain_punch(struct pviommu_domain *pv_domain,
-				   u64 start, u64 end)
+static void __pviommu_domain_punch(struct pviommu_domain *pv_domain, u64 start,
+				   u64 end)
 {
 	struct interval_tree_node *node;
 
 	/* The range can cover any number of mappings. */
-	while ((node = interval_tree_iter_first(&pv_domain->mappings,
-						start, end))) {
+	while ((node = interval_tree_iter_first(&pv_domain->mappings, start,
+						end))) {
 		struct pviommu_mapping *map = to_pviommu_mapping(node);
 		struct pviommu_mapping *head = NULL, *tail = NULL;
 		u64 old_start = node->start, old_end = node->last;
@@ -182,11 +173,13 @@ static void __pviommu_domain_punch(struct pviommu_domain *pv_domain,
 		 * tail has to be rebased rather than merely trimmed.
 		 */
 		if (tail)
-			__pviommu_domain_insert(pv_domain, tail, end + 1, old_end,
-						old_paddr + (end + 1 - old_start));
+			__pviommu_domain_insert(
+				pv_domain, tail, end + 1, old_end,
+				old_paddr + (end + 1 - old_start));
 		else if (old_end > end)
-			pr_err_ratelimited("pviommu: dropping shadow of [%llx, %llx]\n",
-					   end + 1, old_end);
+			pr_err_ratelimited(
+				"pviommu: dropping shadow of [%llx, %llx]\n",
+				end + 1, old_end);
 
 		if (!head && !tail)
 			kfree(map);
@@ -207,8 +200,9 @@ static void pviommu_domain_insert_map(struct pviommu_domain *pv_domain,
 	/* Allocated up front, as the tree is walked with interrupts disabled. */
 	map = kzalloc(sizeof(*map), gfp);
 	if (!map) {
-		pr_err_ratelimited("pviommu: failed to record map of [%llx, %llx]\n",
-				   start, end);
+		pr_err_ratelimited(
+			"pviommu: failed to record map of [%llx, %llx]\n",
+			start, end);
 		return;
 	}
 
@@ -232,7 +226,8 @@ static void pviommu_domain_remove_map(struct pviommu_domain *pv_domain,
 	spin_unlock_irqrestore(&pv_domain->lock, flags);
 }
 
-static phys_addr_t pviommu_domain_find(struct pviommu_domain *pv_domain, u64 key)
+static phys_addr_t pviommu_domain_find(struct pviommu_domain *pv_domain,
+				       u64 key)
 {
 	struct interval_tree_node *node;
 	unsigned long flags;
@@ -252,7 +247,8 @@ static int pviommu_map_pages(struct iommu_domain *domain, unsigned long iova,
 			     phys_addr_t paddr, size_t pgsize, size_t pgcount,
 			     int prot, gfp_t gfp, size_t *mapped)
 {
-	struct pviommu_domain *pv_domain = container_of(domain, struct pviommu_domain, domain);
+	struct pviommu_domain *pv_domain =
+		container_of(domain, struct pviommu_domain, domain);
 	struct arm_smccc_res res = { .a0 = SMCCC_RET_SUCCESS };
 	size_t requested_size = pgsize * pgcount, cur_mapped;
 
@@ -267,7 +263,8 @@ static int pviommu_map_pages(struct iommu_domain *domain, unsigned long iova,
 	while (*mapped < requested_size) {
 		arm_smccc_1_1_hvc(ARM_SMCCC_VENDOR_HYP_KVM_PVIOMMU_OP_FUNC_ID,
 				  KVM_PVIOMMU_OP_MAP_PAGES, pv_domain->id, iova,
-				  paddr, requested_size - *mapped, __linux_prot_smccc(prot), &res);
+				  paddr, requested_size - *mapped,
+				  __linux_prot_smccc(prot), &res);
 		cur_mapped = res.a1;
 		*mapped += cur_mapped;
 		iova += cur_mapped;
@@ -283,19 +280,22 @@ static int pviommu_map_pages(struct iommu_domain *domain, unsigned long iova,
 	return smccc_to_linux_ret(res.a0);
 }
 
-static size_t pviommu_unmap_pages(struct iommu_domain *domain, unsigned long iova,
-				  size_t pgsize, size_t pgcount,
+static size_t pviommu_unmap_pages(struct iommu_domain *domain,
+				  unsigned long iova, size_t pgsize,
+				  size_t pgcount,
 				  struct iommu_iotlb_gather *gather)
 {
-	struct pviommu_domain *pv_domain = container_of(domain, struct pviommu_domain, domain);
+	struct pviommu_domain *pv_domain =
+		container_of(domain, struct pviommu_domain, domain);
 	struct arm_smccc_res res = { .a0 = SMCCC_RET_SUCCESS };
 	size_t total_unmapped = 0, unmapped, requested_size = pgsize * pgcount;
 
 	/* @iova is advanced before the error is acted on, as in map_pages(). */
 	while (total_unmapped < requested_size) {
 		arm_smccc_1_1_hvc(ARM_SMCCC_VENDOR_HYP_KVM_PVIOMMU_OP_FUNC_ID,
-				  KVM_PVIOMMU_OP_UNMAP_PAGES, pv_domain->id, iova,
-				  requested_size - total_unmapped, 0, 0, &res);
+				  KVM_PVIOMMU_OP_UNMAP_PAGES, pv_domain->id,
+				  iova, requested_size - total_unmapped, 0, 0,
+				  &res);
 		unmapped = res.a1;
 		total_unmapped += unmapped;
 		iova += unmapped;
@@ -304,25 +304,30 @@ static size_t pviommu_unmap_pages(struct iommu_domain *domain, unsigned long iov
 	}
 
 	if (total_unmapped)
-		pviommu_domain_remove_map(pv_domain, iova - total_unmapped, iova - 1);
+		pviommu_domain_remove_map(pv_domain, iova - total_unmapped,
+					  iova - 1);
 
 	return total_unmapped;
 }
 
-static phys_addr_t pviommu_iova_to_phys(struct iommu_domain *domain, dma_addr_t iova)
+static phys_addr_t pviommu_iova_to_phys(struct iommu_domain *domain,
+					dma_addr_t iova)
 {
-	struct pviommu_domain *pv_domain = container_of(domain, struct pviommu_domain, domain);
+	struct pviommu_domain *pv_domain =
+		container_of(domain, struct pviommu_domain, domain);
 
 	return pviommu_domain_find(pv_domain, iova);
 }
 
 static void pviommu_domain_free(struct iommu_domain *domain)
 {
-	struct pviommu_domain *pv_domain = container_of(domain, struct pviommu_domain, domain);
+	struct pviommu_domain *pv_domain =
+		container_of(domain, struct pviommu_domain, domain);
 	struct arm_smccc_res res;
 
 	arm_smccc_1_1_hvc(ARM_SMCCC_VENDOR_HYP_KVM_PVIOMMU_OP_FUNC_ID,
-			  KVM_PVIOMMU_OP_FREE_DOMAIN, pv_domain->id, 0, 0, 0, 0, &res);
+			  KVM_PVIOMMU_OP_FREE_DOMAIN, pv_domain->id, 0, 0, 0, 0,
+			  &res);
 	if (res.a0 != SMCCC_RET_SUCCESS)
 		pr_err("Failed to free domain %ld\n", res.a0);
 
@@ -336,7 +341,8 @@ static void pviommu_remove_dev_pasid(struct device *dev, ioasid_t pasid,
 	struct pviommu_master *master = dev_iommu_priv_get(dev);
 	struct iommu_fwspec *fwspec = dev_iommu_fwspec_get(dev);
 	struct pviommu *pv = master->iommu;
-	struct pviommu_domain *pv_domain = container_of(domain, struct pviommu_domain, domain);
+	struct pviommu_domain *pv_domain =
+		container_of(domain, struct pviommu_domain, domain);
 	struct arm_smccc_res res;
 	u32 sid;
 	int i;
@@ -347,27 +353,31 @@ static void pviommu_remove_dev_pasid(struct device *dev, ioasid_t pasid,
 	for (i = 0; i < fwspec->num_ids; i++) {
 		sid = fwspec->ids[i];
 		arm_smccc_1_1_hvc(ARM_SMCCC_VENDOR_HYP_KVM_PVIOMMU_OP_FUNC_ID,
-				  KVM_PVIOMMU_OP_DETACH_DEV,
-				  pv->id, sid, pasid, pv_domain->id, 0, &res);
+				  KVM_PVIOMMU_OP_DETACH_DEV, pv->id, sid, pasid,
+				  pv_domain->id, 0, &res);
 		if (res.a0 != SMCCC_RET_SUCCESS)
-			dev_err(dev, "Failed to detach_dev sid %d, err %ld\n", sid, res.a0);
+			dev_err(dev, "Failed to detach_dev sid %d, err %ld\n",
+				sid, res.a0);
 	}
 }
 
-static void pviommu_detach_dev(struct pviommu_master *master, struct iommu_domain *domain)
+static void pviommu_detach_dev(struct pviommu_master *master,
+			       struct iommu_domain *domain)
 {
 	pviommu_remove_dev_pasid(master->dev, 0, domain);
 }
 
 static int pviommu_set_dev_pasid(struct iommu_domain *domain,
-				 struct device *dev, ioasid_t pasid, struct iommu_domain *old)
+				 struct device *dev, ioasid_t pasid,
+				 struct iommu_domain *old)
 {
 	int ret = 0, i;
 	struct arm_smccc_res res;
 	u32 sid;
 	struct pviommu_master *master = dev_iommu_priv_get(dev);
 	struct iommu_fwspec *fwspec = dev_iommu_fwspec_get(dev);
-	struct pviommu_domain *pv_domain = container_of(domain, struct pviommu_domain, domain);
+	struct pviommu_domain *pv_domain =
+		container_of(domain, struct pviommu_domain, domain);
 	struct pviommu *pv = master->iommu;
 
 	if (!fwspec)
@@ -379,8 +389,7 @@ static int pviommu_set_dev_pasid(struct iommu_domain *domain,
 	for (i = 0; i < fwspec->num_ids; i++) {
 		sid = fwspec->ids[i];
 		arm_smccc_1_1_hvc(ARM_SMCCC_VENDOR_HYP_KVM_PVIOMMU_OP_FUNC_ID,
-				  KVM_PVIOMMU_OP_ATTACH_DEV,
-				  pv->id, sid, pasid,
+				  KVM_PVIOMMU_OP_ATTACH_DEV, pv->id, sid, pasid,
 				  pv_domain->id, master->ssid_bits, &res);
 		if (res.a0) {
 			ret = smccc_to_linux_ret(res.a0);
@@ -390,10 +399,10 @@ static int pviommu_set_dev_pasid(struct iommu_domain *domain,
 
 	if (ret) {
 		while (i--) {
-			arm_smccc_1_1_hvc(ARM_SMCCC_VENDOR_HYP_KVM_PVIOMMU_OP_FUNC_ID,
-					  KVM_PVIOMMU_OP_DETACH_DEV,
-					  pv->id, sid, pasid,
-					  pv_domain->id, 0, &res);
+			arm_smccc_1_1_hvc(
+				ARM_SMCCC_VENDOR_HYP_KVM_PVIOMMU_OP_FUNC_ID,
+				KVM_PVIOMMU_OP_DETACH_DEV, pv->id, sid, pasid,
+				pv_domain->id, 0, &res);
 		}
 	}
 
@@ -434,7 +443,8 @@ static struct platform_driver pkvm_pviommu_driver;
 
 static struct pviommu *pviommu_get_by_fwnode(struct fwnode_handle *fwnode)
 {
-	struct device *dev = bus_find_device_by_fwnode(&platform_bus_type, fwnode);
+	struct device *dev =
+		bus_find_device_by_fwnode(&platform_bus_type, fwnode);
 
 	put_device(dev);
 	return dev ? dev_get_drvdata(dev) : NULL;
@@ -453,8 +463,8 @@ static bool pviommu_sids_untranslated(struct pviommu *pv,
 
 	for (i = 0; i < fwspec->num_ids; i++) {
 		arm_smccc_1_1_hvc(ARM_SMCCC_VENDOR_HYP_KVM_PVIOMMU_OP_FUNC_ID,
-				  KVM_PVIOMMU_OP_SID_INFO,
-				  pv->id, fwspec->ids[i], 0, 0, 0, &res);
+				  KVM_PVIOMMU_OP_SID_INFO, pv->id,
+				  fwspec->ids[i], 0, 0, 0, &res);
 		if (res.a0 != SMCCC_RET_SUCCESS ||
 		    !(res.a1 & KVM_PVIOMMU_SID_UNTRANSLATED))
 			return false;
@@ -504,12 +514,14 @@ static void pviommu_release_device(struct device *dev)
 	pviommu_detach_dev(master, domain);
 }
 
-static int pviommu_of_xlate(struct device *dev, const struct of_phandle_args *args)
+static int pviommu_of_xlate(struct device *dev,
+			    const struct of_phandle_args *args)
 {
 	return iommu_fwspec_add_ids(dev, args->args, args->args_count);
 }
 
-static struct iommu_group *pviommu_group_alloc_get(struct device *dev, int group_id)
+static struct iommu_group *pviommu_group_alloc_get(struct device *dev,
+						   int group_id)
 {
 	struct iommu_group *group;
 
@@ -521,7 +533,8 @@ static struct iommu_group *pviommu_group_alloc_get(struct device *dev, int group
 	if (!IS_ERR(group))
 		return group;
 
-	if (WARN_ON(xa_insert(&pviommu_groups, (unsigned long)group_id, group, GFP_KERNEL)))
+	if (WARN_ON(xa_insert(&pviommu_groups, (unsigned long)group_id, group,
+			      GFP_KERNEL)))
 		dev_err(dev,
 			"Failed to track group %d this will lead to multiple groups instead of one\n",
 			group_id);
@@ -547,21 +560,22 @@ static struct iommu_group *pviommu_device_group(struct device *dev)
 }
 
 static struct iommu_ops pviommu_ops = {
-	.device_group		= pviommu_device_group,
-	.of_xlate		= pviommu_of_xlate,
-	.probe_device		= pviommu_probe_device,
-	.release_device		= pviommu_release_device,
-	.domain_alloc_paging		= pviommu_domain_alloc_paging,
-	.owner			= THIS_MODULE,
-	.msi_iova_bypass	= true,
-	.default_domain_ops = &(const struct iommu_domain_ops) {
-		.attach_dev	= pviommu_attach_dev,
-		.map_pages	= pviommu_map_pages,
-		.unmap_pages	= pviommu_unmap_pages,
-		.iova_to_phys	= pviommu_iova_to_phys,
-		.set_dev_pasid	= pviommu_set_dev_pasid,
-		.free		= pviommu_domain_free,
-	}
+	.device_group = pviommu_device_group,
+	.of_xlate = pviommu_of_xlate,
+	.probe_device = pviommu_probe_device,
+	.release_device = pviommu_release_device,
+	.domain_alloc_paging = pviommu_domain_alloc_paging,
+	.owner = THIS_MODULE,
+	.msi_iova_bypass = true,
+	.default_domain_ops =
+		&(const struct iommu_domain_ops){
+			.attach_dev = pviommu_attach_dev,
+			.map_pages = pviommu_map_pages,
+			.unmap_pages = pviommu_unmap_pages,
+			.iova_to_phys = pviommu_iova_to_phys,
+			.set_dev_pasid = pviommu_set_dev_pasid,
+			.free = pviommu_domain_free,
+		}
 };
 
 static int pviommu_probe(struct platform_device *pdev)
@@ -574,11 +588,13 @@ static int pviommu_probe(struct platform_device *pdev)
 
 	ret = of_property_read_u32_index(np, "id", 0, &pv->id);
 	if (ret) {
-		dev_err(dev, "Failed to read id from device tree node %d\n", ret);
+		dev_err(dev, "Failed to read id from device tree node %d\n",
+			ret);
 		return ret;
 	}
 
-	arm_smccc_1_1_hvc(ARM_SMCCC_VENDOR_HYP_KVM_HYP_MEMINFO_FUNC_ID, 0, 0, 0, &res);
+	arm_smccc_1_1_hvc(ARM_SMCCC_VENDOR_HYP_KVM_HYP_MEMINFO_FUNC_ID, 0, 0, 0,
+			  &res);
 	if (res.a0 < 0)
 		return -ENODEV;
 
@@ -586,8 +602,8 @@ static int pviommu_probe(struct platform_device *pdev)
 
 	platform_set_drvdata(pdev, pv);
 
-	ret = iommu_device_sysfs_add(&pv->iommu, dev, NULL,
-				     "pviommu.%pa", &pv->id);
+	ret = iommu_device_sysfs_add(&pv->iommu, dev, NULL, "pviommu.%pa",
+				     &pv->id);
 
 	ret = iommu_device_register(&pv->iommu, &pviommu_ops, dev);
 	if (ret) {
@@ -599,8 +615,10 @@ static int pviommu_probe(struct platform_device *pdev)
 }
 
 static const struct of_device_id pviommu_of_match[] = {
-	{ .compatible = "pkvm,pviommu", },
-	{ },
+	{
+		.compatible = "pkvm,pviommu",
+	},
+	{},
 };
 
 static struct platform_driver pkvm_pviommu_driver = {
@@ -621,7 +639,8 @@ static int __init __pviommu_selftest(void)
 
 	pviommu_domain_mappings_init(&domain);
 
-	pviommu_domain_insert_map(&domain, 0x10000, 0xFEFFF, 0xE0000, GFP_KERNEL);
+	pviommu_domain_insert_map(&domain, 0x10000, 0xFEFFF, 0xE0000,
+				  GFP_KERNEL);
 	pviommu_domain_insert_map(&domain, 0xFFF0000, 0x1EDBFFFF, 0xDEAD0000,
 				  GFP_KERNEL);
 	ASSERT(pviommu_domain_find(&domain, 0x10000) == 0xE0000);
@@ -634,8 +653,10 @@ static int __init __pviommu_selftest(void)
 	ASSERT(pviommu_domain_find(&domain, 0x1B000) == 0xEB000);
 	ASSERT(pviommu_domain_find(&domain, 0x14000) == 0);
 
-	pviommu_domain_insert_map(&domain, 0xC00000, 0xCFFFFF, 0xABCD000, GFP_KERNEL);
-	pviommu_domain_insert_map(&domain, 0xD00000, 0xDFFFFF, 0x1000, GFP_KERNEL);
+	pviommu_domain_insert_map(&domain, 0xC00000, 0xCFFFFF, 0xABCD000,
+				  GFP_KERNEL);
+	pviommu_domain_insert_map(&domain, 0xD00000, 0xDFFFFF, 0x1000,
+				  GFP_KERNEL);
 	pviommu_domain_insert_map(&domain, 0xE00000, 0xEFFFFF, 0xC0FE00000,
 				  GFP_KERNEL);
 	ASSERT(pviommu_domain_find(&domain, 0xD00000) == 0x1000);
