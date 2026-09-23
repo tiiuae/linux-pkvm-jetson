@@ -11,7 +11,9 @@
 #include <linux/io.h>
 #include <linux/interval_tree_generic.h>
 #include <linux/iommu.h>
+#include <linux/jiffies.h>
 #include <linux/kmemleak.h>
+#include <linux/ktime.h>
 #include <linux/kvm_host.h>
 #include <linux/irqchip/arm-gic-v3.h>
 #include <asm/kvm_mmu.h>
@@ -613,11 +615,16 @@ static int pkvm_register_device_from_dev(struct device *dev, u32 group_id,
 				continue;
 			if (!(res->flags & (IORESOURCE_MEM | IORESOURCE_IO)))
 				continue;
-			if (PAGE_ALIGNED(res->start) && PAGE_ALIGNED(resource_size(res))) {
-				pkvm_dev->resources[j].base = res->start;
-				pkvm_dev->resources[j].size = resource_size(res);
-				j++;
+			if (!PAGE_ALIGNED(res->start) ||
+			    !PAGE_ALIGNED(resource_size(res))) {
+				kvm_err("pkvm: %s BAR%d [%pa+0x%llx] not page-aligned; not donated\n",
+					dev_name(dev), i, &res->start,
+					(u64)resource_size(res));
+				continue;
 			}
+			pkvm_dev->resources[j].base = res->start;
+			pkvm_dev->resources[j].size = resource_size(res);
+			j++;
 		}
 	} else if (dev_is_platform(dev)) {
 		struct platform_device *ppdev = to_platform_device(dev);
@@ -627,11 +634,16 @@ static int pkvm_register_device_from_dev(struct device *dev, u32 group_id,
 		       (res = platform_get_resource(ppdev, IORESOURCE_MEM, ri++))) {
 			if (!resource_size(res))
 				continue;
-			if (PAGE_ALIGNED(res->start) && PAGE_ALIGNED(resource_size(res))) {
-				pkvm_dev->resources[j].base = res->start;
-				pkvm_dev->resources[j].size = resource_size(res);
-				j++;
+			if (!PAGE_ALIGNED(res->start) ||
+			    !PAGE_ALIGNED(resource_size(res))) {
+				kvm_err("pkvm: %s res%d [%pa+0x%llx] not page-aligned; not donated\n",
+					dev_name(dev), ri - 1, &res->start,
+					(u64)resource_size(res));
+				continue;
 			}
+			pkvm_dev->resources[j].base = res->start;
+			pkvm_dev->resources[j].size = resource_size(res);
+			j++;
 		}
 	}
 	pkvm_dev->nr_resources = j;
@@ -911,15 +923,45 @@ out_free:
 	return ret;
 }
 
-static struct pci_dev *pkvm_find_pci_dev_by_of_node(struct device_node *np)
+static int pkvm_pci_parse_bdf(struct device_node *np, u32 *domain, u32 *bus,
+			      u32 *devfn)
 {
-	struct pci_dev *pdev = NULL;
+	if (of_property_read_u32(np, "pci-domain", domain) ||
+	    of_property_read_u32(np, "pci-bus", bus) ||
+	    of_property_read_u32(np, "pci-devfn", devfn))
+		return -EINVAL;
 
-	for_each_pci_dev(pdev) {
-		if (pdev->dev.of_node == np)
-			return pdev;
+	if (*domain > INT_MAX || *bus > U8_MAX || *devfn > U8_MAX)
+		return -ERANGE;
+
+	return 0;
+}
+
+static struct pci_dev *pkvm_find_declared_pci_dev(struct device_node *np)
+{
+	u32 domain, bus, devfn;
+
+	if (pkvm_pci_parse_bdf(np, &domain, &bus, &devfn))
+		return NULL;
+
+	return pci_get_domain_bus_and_slot(domain, bus, devfn);
+}
+
+static bool pkvm_pci_dev_ids_match(struct device_node *np, struct pci_dev *pdev)
+{
+	u32 id;
+
+	if (!of_property_read_u32(np, "vendor-id", &id) && id != pdev->vendor) {
+		kvm_err("pkvm: %pOF is %04x:%04x, DT declares vendor %04x\n",
+			np, pdev->vendor, pdev->device, id);
+		return false;
 	}
-	return NULL;
+	if (!of_property_read_u32(np, "device-id", &id) && id != pdev->device) {
+		kvm_err("pkvm: %pOF is %04x:%04x, DT declares device %04x\n",
+			np, pdev->vendor, pdev->device, id);
+		return false;
+	}
+	return true;
 }
 
 static int pkvm_init_devices_strict(unsigned long *out_nr,
@@ -966,10 +1008,16 @@ static int pkvm_init_devices_strict(unsigned long *out_nr,
 
 			i++;
 
-			pdev = pkvm_find_pci_dev_by_of_node(dev_np);
+			pdev = pkvm_find_declared_pci_dev(dev_np);
 			if (!pdev) {
 				kvm_err("pkvm: declared device %pOF not bound; skipping\n",
 					dev_np);
+				of_node_put(dev_np);
+				continue;
+			}
+
+			if (!pkvm_pci_dev_ids_match(dev_np, pdev)) {
+				pci_dev_put(pdev);
 				of_node_put(dev_np);
 				continue;
 			}
@@ -983,6 +1031,8 @@ static int pkvm_init_devices_strict(unsigned long *out_nr,
 							    &dev_base[idx]);
 			of_node_put(dev_np);
 			if (ret == -ENOENT) {
+				kvm_err("pkvm: declared device %s has no IOMMU stream IDs; NOT assignable\n",
+					dev_name(&pdev->dev));
 				ret = 0;
 				continue;
 			}
@@ -1254,26 +1304,30 @@ device_initcall_sync(finalize_pkvm);
 /*
  * Late, post-finalize device registration.
  *
- * On platforms where PCI enumeration only completes well after
- * device_initcall_sync (e.g. Tegra234, where the PCIe RC waits on async
- * BPMP power-domain callbacks and finishes around 13s into boot), the
- * scan in finalize_pkvm() finds zero assignable devices. Instead, we arm
- * a PCI bus notifier here and debounce: every BUS_NOTIFY_BOUND_DRIVER
- * event pushes a delayed_work out by LATE_DEBOUNCE_MS, and once the bus
- * goes quiet for that long we run the scan and issue a one-shot HVC.
+ * PCI enumeration completes after device_initcall_sync, so the scan in
+ * finalize_pkvm() finds zero assignable devices and registration is deferred
+ * to a one-shot HVC issued from here.
+ *
+ * In strict mode the DT names every assignable device, so we wait for exactly
+ * those to be enumerated and then commit. In permissive mode there is no list
+ * to check off, so we keep the PCI bus notifier and debounce. Every
+ * BUS_NOTIFY_BOUND_DRIVER event pushes a delayed_work out by
+ * PKVM_LATE_DEBOUNCE_MS and the scan runs once the bus goes quiet.
  *
  * EL2 enforces the one-shot guarantee in pkvm_devices_register_late();
  * the late_submitted flag here is just a host-side optimization so we
  * don't keep rescheduling work after the table has been committed.
  */
-#define PKVM_LATE_DEBOUNCE_MS	7000
+#define PKVM_LATE_DEBOUNCE_MS		7000
+#define PKVM_PCI_PROBE_TIMEOUT_MS	1000
+#define PKVM_PCI_PROBE_INTERVAL_MS	10
 
 static DEFINE_MUTEX(pkvm_late_lock);
 static bool pkvm_late_submitted;
 static struct delayed_work pkvm_late_dw;
 static struct notifier_block pkvm_late_nb;
 
-static void pkvm_late_register_work(struct work_struct *w)
+static void pkvm_late_register(void)
 {
 	unsigned long nr_devs = 0;
 	struct pkvm_device *devs = NULL;
@@ -1318,6 +1372,11 @@ out:
 	mutex_unlock(&pkvm_late_lock);
 }
 
+static void pkvm_late_register_work(struct work_struct *w)
+{
+	pkvm_late_register();
+}
+
 static int pkvm_late_pci_notify(struct notifier_block *nb,
 				unsigned long action, void *data)
 {
@@ -1327,7 +1386,7 @@ static int pkvm_late_pci_notify(struct notifier_block *nb,
 	/*
 	 * No locking here: notifier callbacks may run with driver-core locks
 	 * held, and pkvm_late_submitted is only an optimization. The
-	 * authoritative one-shot check is inside pkvm_late_register_work()
+	 * authoritative one-shot check is inside pkvm_late_register()
 	 * (and ultimately in EL2 via pkvm_devices_register_late()).
 	 */
 	if (READ_ONCE(pkvm_late_submitted))
@@ -1338,10 +1397,103 @@ static int pkvm_late_pci_notify(struct notifier_block *nb,
 	return NOTIFY_DONE;
 }
 
+static bool __init pkvm_of_node_is_pci_endpoint(struct device_node *np)
+{
+	return of_property_present(np, "pci-domain");
+}
+
+static struct device_node * __init pkvm_pci_host_of_node(struct device_node *np)
+{
+	struct device_node *host;
+	u32 domain, bus, devfn, candidate;
+
+	if (pkvm_pci_parse_bdf(np, &domain, &bus, &devfn))
+		return NULL;
+
+	for_each_node_with_property(host, "linux,pci-domain") {
+		if (!of_property_read_u32(host, "linux,pci-domain", &candidate) &&
+		    candidate == domain)
+			return host;
+	}
+	return NULL;
+}
+
+static void __init pkvm_attach_pci_host(struct device_node *np)
+{
+	struct device_node *host_np;
+	struct platform_device *host;
+	int ret;
+
+	host_np = pkvm_pci_host_of_node(np);
+	if (!host_np)
+		return;
+
+	host = of_find_device_by_node(host_np);
+	of_node_put(host_np);
+	if (!host)
+		return;
+
+	ret = device_attach(&host->dev);
+	if (ret < 0 && ret != -EPROBE_DEFER)
+		pr_warn("pkvm: host bridge attach for %pOF failed: %d\n", np, ret);
+	put_device(&host->dev);
+}
+
+static void __init pkvm_wait_for_pci_device(struct device_node *np)
+{
+	unsigned long deadline;
+	ktime_t start;
+
+	if (!pkvm_of_node_is_pci_endpoint(np))
+		return;
+
+	pkvm_attach_pci_host(np);
+
+	start = ktime_get();
+	deadline = jiffies + msecs_to_jiffies(PKVM_PCI_PROBE_TIMEOUT_MS);
+	do {
+		struct pci_dev *pdev = pkvm_find_declared_pci_dev(np);
+
+		if (pdev) {
+			pci_dev_put(pdev);
+			pr_info("pkvm: %pOF enumerated after %lld us\n", np,
+				ktime_us_delta(ktime_get(), start));
+			return;
+		}
+		msleep(PKVM_PCI_PROBE_INTERVAL_MS);
+	} while (time_before(jiffies, deadline));
+
+	pr_err("pkvm: %pOF not enumerated after %d ms; it will NOT be assignable\n",
+	       np, PKVM_PCI_PROBE_TIMEOUT_MS);
+}
+
+static void __init pkvm_wait_for_declared_devices(void)
+{
+	struct of_phandle_args args;
+	struct device_node *np;
+	int i;
+
+	for_each_compatible_node(np, NULL, PKVM_DEVICE_ASSIGN_COMPAT) {
+		i = 0;
+		while (!of_parse_phandle_with_fixed_args(np, "devices", 1, i,
+							 &args)) {
+			i++;
+			pkvm_wait_for_pci_device(args.np);
+			of_node_put(args.np);
+		}
+	}
+}
+
 static int __init pkvm_late_devices_init(void)
 {
 	if (!is_protected_kvm_enabled() || !is_kvm_arm_initialised())
 		return 0;
+
+	if (!pkvm_assign_permissive) {
+		pkvm_wait_for_declared_devices();
+		pkvm_late_register();
+		return 0;
+	}
 
 	INIT_DELAYED_WORK(&pkvm_late_dw, pkvm_late_register_work);
 	pkvm_late_nb.notifier_call = pkvm_late_pci_notify;
