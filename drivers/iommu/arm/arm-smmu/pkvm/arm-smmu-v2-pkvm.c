@@ -1124,7 +1124,7 @@ static void smmu_cb_write(struct hyp_arm_smmu_v2_device *smmu, int cb_idx)
 	}
 
 	/* SCTLR */
-	reg = ARM_SMMU_SCTLR_CFIE | ARM_SMMU_SCTLR_CFRE | ARM_SMMU_SCTLR_AFE |
+	reg = ARM_SMMU_SCTLR_CFRE | ARM_SMMU_SCTLR_AFE |
 	      ARM_SMMU_SCTLR_TRE | ARM_SMMU_SCTLR_M;
 	if (stage1)
 		reg |= ARM_SMMU_SCTLR_S1_ASIDPNE;
@@ -1137,11 +1137,13 @@ static void smmu_cb_write(struct hyp_arm_smmu_v2_device *smmu, int cb_idx)
  * smmu_host_cb_map() - Get or allocate a new context bank for the host
  * @smmu: SMMU device
  * @cb_idx_host: The index that the host thinks this context bank will be in.
+ * @alloc: Allocate a context bank if @cb_idx_host has none yet.
  *
- * Return: Actual hardware context bank index, -EINVAL on invalid argument, or
- *         -ENOSPC if none available.
+ * Return: Actual hardware context bank index, -EINVAL on invalid argument,
+ *         -ENOSPC if none available, or -ENOENT if unmapped and !@alloc.
  */
-static int smmu_host_cb_map(struct hyp_arm_smmu_v2_device *smmu, int cb_idx_host)
+static int smmu_host_cb_map(struct hyp_arm_smmu_v2_device *smmu, int cb_idx_host,
+			    bool alloc)
 {
 	int cb_idx;
 
@@ -1150,6 +1152,8 @@ static int smmu_host_cb_map(struct hyp_arm_smmu_v2_device *smmu, int cb_idx_host
 
 	cb_idx = smmu->host_cb_map[cb_idx_host];
 	if (cb_idx == HYP_SMMUV2_INVALID_CB) {
+		if (!alloc)
+			return -ENOENT;
 		cb_idx = smmu_cb_alloc(smmu);
 		if (cb_idx >= 0)
 			smmu->host_cb_map[cb_idx_host] = cb_idx;
@@ -1781,7 +1785,7 @@ static int smmu_handle_gr0(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 
 			/* Map the context bank index to actual hardware CB */
 			cb_idx_host = FIELD_GET(ARM_SMMU_S2CR_CBNDX, val32);
-			cb_idx = smmu_host_cb_map(smmu, cb_idx_host);
+			cb_idx = smmu_host_cb_map(smmu, cb_idx_host, true);
 			if (cb_idx < 0) {
 				/* We ran out of CBs or a CBNDX too large */
 				return -EINVAL;
@@ -1881,9 +1885,9 @@ static int smmu_handle_gr1(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 			continue;
 
 		cb_idx_host = (offset - cbreg_base[cbreg_idx]) >> 2;
-		cb_idx = smmu_host_cb_map(smmu, cb_idx_host);
+		cb_idx = smmu_host_cb_map(smmu, cb_idx_host, is_write);
 		if (cb_idx < 0) {
-			/* Ran out of CBs; not sure what's best here, -EINVAL or 0 */
+			/* Out of CBs, or a read of a CB the host never set up */
 			*val = 0;
 			return 0;
 		}
@@ -2004,9 +2008,9 @@ static int smmu_handle_cb(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 	if (cb_idx_host >= smmu_num_host_cbs(smmu))
 		return -EINVAL;
 
-	cb_idx = smmu_host_cb_map(smmu, cb_idx_host);
+	cb_idx = smmu_host_cb_map(smmu, cb_idx_host, is_write);
 	if (cb_idx < 0) {
-		/* Ran out of CBs; not sure what's best here, -EINVAL or 0 */
+		/* Out of CBs, or a read of a CB the host never set up */
 		*val = 0;
 		return 0;
 	}
