@@ -387,6 +387,7 @@ config SPRD_IOMMU
 config PKVM_PVIOMMU
 	tristate "pKVM pvIOMMU driver"
 	depends on ARM64
+	select INTERVAL_TREE
 	select IOMMU_API
 	help
 	  Para-virtualised IOMMU driver with pKVM.
