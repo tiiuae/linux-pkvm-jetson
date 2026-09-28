@@ -4903,6 +4903,7 @@ int pci_bridge_wait_for_secondary_bus(struct pci_dev *dev, char *reset_type)
 	return pci_dev_wait(child, reset_type,
 			    PCIE_RESET_READY_POLL_MS - delay);
 }
+EXPORT_SYMBOL_GPL(pci_bridge_wait_for_secondary_bus);
 
 void pci_reset_secondary_bus(struct pci_dev *dev)
 {

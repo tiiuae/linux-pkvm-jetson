@@ -22,6 +22,7 @@
 #include <linux/of.h>
 #include <linux/of_pci.h>
 #include <linux/pci.h>
+#include <linux/pci_hotplug.h>
 #include <linux/phy/phy.h>
 #include <linux/pinctrl/consumer.h>
 #include <linux/platform_device.h>
@@ -212,6 +213,8 @@
 #define LTR_MSG_TIMEOUT		(100 * 1000)
 
 #define PERST_DEBOUNCE_TIME	(5 * 1000)
+/* How long a slot reset holds PERST# asserted */
+#define PERST_SLOT_RESET_TIME_MS	100
 
 #define EP_STATE_DISABLED	0
 #define EP_STATE_ENABLED	1
@@ -275,6 +278,10 @@ struct tegra_pcie_dw {
 	struct phy **phys;
 
 	struct dentry *debugfs;
+
+	/* Root port mode specific */
+	struct hotplug_slot hp_slot;
+	bool hp_slot_registered;
 
 	/* Endpoint mode specific */
 	struct gpio_desc *pex_rst_gpiod;
@@ -1654,6 +1661,107 @@ static void tegra_pcie_deinit_controller(struct tegra_pcie_dw *pcie)
 	tegra_pcie_unconfig_controller(pcie);
 }
 
+#if IS_ENABLED(CONFIG_HOTPLUG_PCI)
+/*
+ * Do a PERST# based reset of the PCIe slot.
+ */
+static int tegra_pcie_slot_reset(struct hotplug_slot *slot, bool probe)
+{
+	struct tegra_pcie_dw *pcie = container_of(slot, struct tegra_pcie_dw,
+						  hp_slot);
+	struct pci_dev *rp = slot->pci_slot->bus->self;
+	u32 val;
+	int ret;
+
+	if (probe)
+		return 0;
+
+	/* Disable LTSSM to bring the link to detect state */
+	val = appl_readl(pcie, APPL_CTRL);
+	val &= ~APPL_CTRL_LTSSM_EN;
+	appl_writel(pcie, val, APPL_CTRL);
+
+	ret = readl_poll_timeout(pcie->appl_base + APPL_DEBUG, val,
+				 ((val & APPL_DEBUG_LTSSM_STATE_MASK) >>
+				 APPL_DEBUG_LTSSM_STATE_SHIFT) ==
+				 LTSSM_STATE_PRE_DETECT,
+				 1, LTSSM_TIMEOUT);
+	if (ret)
+		dev_info(pcie->dev, "Link didn't go to detect state\n");
+
+	/* Assert RST */
+	val = appl_readl(pcie, APPL_PINMUX);
+	val &= ~APPL_PINMUX_PEX_RST;
+	appl_writel(pcie, val, APPL_PINMUX);
+
+	/*
+	 * T_PERST is only 100 us minimum. Hold PERST# for longer so that the
+	 * endpoint logic behind the PCIe interface is reset as well.
+	 */
+	msleep(PERST_SLOT_RESET_TIME_MS);
+
+	/* Enable LTSSM */
+	val = appl_readl(pcie, APPL_CTRL);
+	val |= APPL_CTRL_LTSSM_EN;
+	appl_writel(pcie, val, APPL_CTRL);
+
+	/* De-assert RST */
+	val = appl_readl(pcie, APPL_PINMUX);
+	val |= APPL_PINMUX_PEX_RST;
+	appl_writel(pcie, val, APPL_PINMUX);
+
+	msleep(100);
+
+	ret = dw_pcie_wait_for_link(&pcie->pci);
+	if (ret)
+		return ret;
+
+	tegra_pcie_icc_set(pcie);
+
+	return pci_bridge_wait_for_secondary_bus(rp, "PERST# reset");
+}
+
+static const struct hotplug_slot_ops tegra_pcie_slot_ops = {
+	.reset_slot = tegra_pcie_slot_reset,
+};
+
+static void tegra_pcie_register_slot(struct tegra_pcie_dw *pcie)
+{
+	struct pci_dev *rp;
+	int ret;
+
+	rp = pci_get_slot(pcie->pci.pp.bridge->bus, PCI_DEVFN(0, 0));
+	if (!rp)
+		return;
+
+	if (rp->subordinate) {
+		pcie->hp_slot.ops = &tegra_pcie_slot_ops;
+		ret = pci_hp_register(&pcie->hp_slot, rp->subordinate, 0,
+				      dev_name(pcie->dev));
+		if (ret)
+			dev_warn(pcie->dev,
+				 "Failed to register slot, falling back to secondary bus reset: %d\n",
+				 ret);
+		else
+			pcie->hp_slot_registered = true;
+	}
+
+	pci_dev_put(rp);
+}
+
+static void tegra_pcie_deregister_slot(struct tegra_pcie_dw *pcie)
+{
+	if (!pcie->hp_slot_registered)
+		return;
+
+	pci_hp_deregister(&pcie->hp_slot);
+	pcie->hp_slot_registered = false;
+}
+#else
+static inline void tegra_pcie_register_slot(struct tegra_pcie_dw *pcie) { return; }
+static inline void tegra_pcie_deregister_slot(struct tegra_pcie_dw *pcie) { return; }
+#endif
+
 static int tegra_pcie_config_rp(struct tegra_pcie_dw *pcie)
 {
 	struct device *dev = pcie->dev;
@@ -1687,6 +1795,8 @@ static int tegra_pcie_config_rp(struct tegra_pcie_dw *pcie)
 	}
 
 	init_debugfs(pcie);
+
+	tegra_pcie_register_slot(pcie);
 
 	return ret;
 
@@ -2329,6 +2439,7 @@ static void tegra_pcie_dw_remove(struct platform_device *pdev)
 		if (!pcie->link_state)
 			return;
 
+		tegra_pcie_deregister_slot(pcie);
 		debugfs_remove_recursive(pcie->debugfs);
 		tegra_pcie_deinit_controller(pcie);
 		pm_runtime_put_sync(pcie->dev);
