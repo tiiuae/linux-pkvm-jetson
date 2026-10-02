@@ -1174,3 +1174,31 @@ int atomic_dec_and_mutex_lock(atomic_t *cnt, struct mutex *lock)
 	return 1;
 }
 EXPORT_SYMBOL(atomic_dec_and_mutex_lock);
+
+#ifdef CONFIG_DEBUG_LOCK_ALLOC
+#undef mutex_lock
+#undef mutex_lock_interruptible
+#undef mutex_trylock
+
+void __sched mutex_lock(struct mutex *lock);
+int __must_check __sched mutex_lock_interruptible(struct mutex *lock);
+int __sched mutex_trylock(struct mutex *lock);
+
+void __sched mutex_lock(struct mutex *lock)
+{
+	__mutex_lock(lock, TASK_UNINTERRUPTIBLE, 0, NULL, _RET_IP_);
+}
+EXPORT_SYMBOL(mutex_lock);
+
+int __sched mutex_lock_interruptible(struct mutex *lock)
+{
+	return __mutex_lock(lock, TASK_INTERRUPTIBLE, 0, NULL, _RET_IP_);
+}
+EXPORT_SYMBOL(mutex_lock_interruptible);
+
+int __sched mutex_trylock(struct mutex *lock)
+{
+	return _mutex_trylock_nest_lock(lock, NULL);
+}
+EXPORT_SYMBOL(mutex_trylock);
+#endif /* CONFIG_DEBUG_LOCK_ALLOC */
