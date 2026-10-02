@@ -56,7 +56,6 @@ static struct pkvm_audit_driver *driver_get_by_id(unsigned short id)
 bool pkvm_audit_handle_guest_call(struct pkvm_hyp_vcpu *hyp_vcpu, u64 *exit_code)
 {
 	int ret;
-	struct pkvm_hyp_vm *vm = pkvm_hyp_vcpu_to_hyp_vm(hyp_vcpu);
 	struct kvm_vcpu *vcpu = &hyp_vcpu->vcpu;
 	struct pkvm_audit_driver *drv;
 	u64 drvid = smccc_get_arg1(vcpu);
@@ -75,13 +74,12 @@ bool pkvm_audit_handle_guest_call(struct pkvm_hyp_vcpu *hyp_vcpu, u64 *exit_code
 	}
 
 	ret = drv->handle_guest_hcall(arg1, arg2, arg3);
-	if (ret)
-		goto out_ret;
-
-	smccc_set_retval(vcpu, SMCCC_RET_SUCCESS, 0, 0, 0);
-	return true;
+	if (ret == SMCCC_RET_NOT_SUPPORTED) {
+		hyp_warn("audit: driver returned SMCCC_RET_NOT_SUPPORTED, changing to SMCCC_RET_INVALID_PARAMETER");
+		ret = SMCCC_RET_INVALID_PARAMETER;
+	}
 out_ret:
-	smccc_set_retval(vcpu, SMCCC_RET_INVALID_PARAMETER, 0, 0, 0);
+	smccc_set_retval(vcpu, ret, 0, 0, 0);
 	return true;
 }
 
