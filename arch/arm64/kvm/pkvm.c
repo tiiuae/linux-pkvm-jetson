@@ -92,6 +92,10 @@ extern unsigned long kvm_nvhe_sym(registered_devices_nr);
 extern u32 kvm_nvhe_sym(pkvm_g2g_selftest_pairs);
 extern u32 kvm_nvhe_sym(pkvm_g2g_selftest_cases);
 extern u32 kvm_nvhe_sym(pkvm_g2g_selftest_failures);
+extern u32 kvm_nvhe_sym(pkvm_g2g_msg_selftest_inputs);
+extern u32 kvm_nvhe_sym(pkvm_g2g_msg_selftest_cases);
+extern u32 kvm_nvhe_sym(pkvm_g2g_msg_selftest_failures);
+extern u32 kvm_nvhe_sym(pkvm_g2g_msg_selftest_first_bad);
 extern bool kvm_nvhe_sym(pkvm_g2g_enabled);
 
 /*
@@ -106,6 +110,7 @@ static void __init pkvm_g2g_report_selftest(void)
 	u32 pairs = READ_ONCE(kvm_nvhe_sym(pkvm_g2g_selftest_pairs));
 	u32 cases = READ_ONCE(kvm_nvhe_sym(pkvm_g2g_selftest_cases));
 	u32 bad = READ_ONCE(kvm_nvhe_sym(pkvm_g2g_selftest_failures));
+	u32 inputs;
 
 	if (!pairs)
 		pr_err("pkvm-g2g: EL2 reclaim matrix self-check did not run\n");
@@ -115,6 +120,25 @@ static void __init pkvm_g2g_report_selftest(void)
 	else
 		pr_info("pkvm-g2g: EL2 reclaim matrix self-check: PASS (%u pairs, %u named cases, 0 failures)\n",
 			pairs, cases);
+
+	/*
+	 * The guest-to-guest mailbox self-check, pkvm_g2g_msg_selftest(), is
+	 * reported the same way and for the same reason. first_bad names the
+	 * first failure as (check << 16 | input); see the comment there.
+	 */
+	inputs = READ_ONCE(kvm_nvhe_sym(pkvm_g2g_msg_selftest_inputs));
+	cases = READ_ONCE(kvm_nvhe_sym(pkvm_g2g_msg_selftest_cases));
+	bad = READ_ONCE(kvm_nvhe_sym(pkvm_g2g_msg_selftest_failures));
+
+	if (!inputs)
+		pr_err("pkvm-g2g: EL2 mailbox self-check did not run\n");
+	else if (bad)
+		pr_err("pkvm-g2g: EL2 mailbox self-check: FAIL (%u inputs, %u named cases, %u failures, first 0x%08x)\n",
+		       inputs, cases, bad,
+		       READ_ONCE(kvm_nvhe_sym(pkvm_g2g_msg_selftest_first_bad)));
+	else
+		pr_info("pkvm-g2g: EL2 mailbox self-check: PASS (%u inputs, %u named cases, 0 failures)\n",
+			inputs, cases);
 
 	if (!READ_ONCE(kvm_nvhe_sym(pkvm_g2g_enabled)))
 		pr_err("pkvm-g2g: guest-to-guest DISABLED: an EL2 self-check failed or did not run, so calls 12-20 are not advertised and are refused\n");

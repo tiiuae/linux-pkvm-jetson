@@ -315,7 +315,9 @@ bool pkvm_g2g_enabled;
 
 #define PKVM_G2G_FEATURES	(BIT(ARM_SMCCC_KVM_FUNC_GUEST_ID_REGISTER) |	\
 				 BIT(ARM_SMCCC_KVM_FUNC_GUEST_ID_SELF) |	\
-				 BIT(ARM_SMCCC_KVM_FUNC_GUEST_ID_PEER_LOOKUP))
+				 BIT(ARM_SMCCC_KVM_FUNC_GUEST_ID_PEER_LOOKUP) | \
+				 BIT(ARM_SMCCC_KVM_FUNC_GUEST_MSG_SEND) |	\
+				 BIT(ARM_SMCCC_KVM_FUNC_GUEST_MSG_RECV))
 
 static u64 pkvm_g2g_features(void)
 {
@@ -334,6 +336,8 @@ static bool pkvm_g2g_call_refused(struct kvm_vcpu *vcpu, u32 fn)
 	case ARM_SMCCC_VENDOR_HYP_KVM_GUEST_ID_REGISTER_FUNC_ID:
 	case ARM_SMCCC_VENDOR_HYP_KVM_GUEST_ID_SELF_FUNC_ID:
 	case ARM_SMCCC_VENDOR_HYP_KVM_GUEST_ID_PEER_LOOKUP_FUNC_ID:
+	case ARM_SMCCC_VENDOR_HYP_KVM_GUEST_MSG_SEND_FUNC_ID:
+	case ARM_SMCCC_VENDOR_HYP_KVM_GUEST_MSG_RECV_FUNC_ID:
 		break;
 	default:
 		return false;
@@ -918,6 +922,15 @@ static int __insert_vm_table_entry(pkvm_handle_t handle,
 	hyp_vm->g2g_id.lo = 0;
 	hyp_vm->g2g_id.hi = 0;
 	hyp_vm->g2g_id.incarnation = ++pkvm_g2g_incarnation;
+
+	/*
+	 * The message slot starts empty. It is guarded by its own lock rather
+	 * than by vm_table_lock, but it is set up here for the same reason:
+	 * no sender can find this VM before the write lock is dropped, and no
+	 * vCPU of it can be loaded before then either.
+	 */
+	memset(&hyp_vm->g2g_mbox, 0, sizeof(hyp_vm->g2g_mbox));
+	hyp_spin_lock_init(&hyp_vm->g2g_mbox.lock);
 #endif
 
 	list_add(&hyp_vm->vm_list, &running_vms);
@@ -2169,6 +2182,721 @@ static bool pkvm_guest_id_peer_lookup_call(struct pkvm_hyp_vcpu *hyp_vcpu)
 
 	return true;
 }
+
+/*
+ * ============================================================================
+ * Guest-to-guest messages: GUEST_MSG_SEND / GUEST_MSG_RECV. IMPLEMENTED.
+ * ============================================================================
+ *
+ * The register-level contract, and what these calls do and do not guarantee,
+ * are in the ARM_SMCCC_KVM_FUNC_GUEST_MSG_* comment in <linux/arm-smccc.h>. In
+ * one line: a few words from one protected VM to another, in registers, through
+ * a one-slot mailbox in the receiver's struct pkvm_hyp_vm. The host is not on
+ * the path at all: these calls are answered here without any exit to it, and
+ * a protected vCPU's registers reach the host only where an exit to it forwards
+ * a few of them on purpose (handle_pvm_exit_hvc64(), for PSCI and relinquish),
+ * which never happens for these two.
+ *
+ * The decision is kept apart from the mechanism. Everything a handler finds out
+ * about a call is reduced to a set of facts (the PKVM_G2G_SEND_* and
+ * PKVM_G2G_RECV_* bits below), and a pure function maps the facts to a verdict.
+ * The handlers only gather facts and carry the verdict out, and
+ * pkvm_g2g_msg_selftest() enumerates every combination of facts at EL2 init. A
+ * decision written inline in a locked path could not be enumerated.
+ *
+ * Why nothing here can touch a freed VM, or one being torn down:
+ *
+ *  - SEND holds vm_table_lock for read from the identity lookup until after
+ *    the deposit. A VM is freed only by __pkvm_finalize_teardown_vm(), after
+ *    remove_vm_table_entry() under the write lock, and is_dying is only ever
+ *    set under the write lock, by __pkvm_start_teardown_vm(). So while the read
+ *    lock is held, a target found in vm_table stays allocated and its is_dying
+ *    cannot change: "not dying" is a decision and not a snapshot, and nothing
+ *    is ever deposited into a VM that has started teardown;
+ *  - RECV touches only the caller's own VM. That VM cannot be torn down under
+ *    it: the calling vCPU is loaded, so the VM's refcount is non-zero, and
+ *    __pkvm_start_teardown_vm() refuses a VM whose refcount is non-zero;
+ *  - the sender's identity is read under vm_table_lock, which is what guards
+ *    it, and copied into the message. RECV never looks at the sender, which
+ *    may be long gone by then.
+ *
+ * Lock order: vm_table_lock (read) -> one mailbox lock, the same shape as
+ * __pkvm_init_vcpu() taking vcpus_lock under the read lock. The mailbox lock
+ * is a leaf: nothing is acquired while it is held, and in particular never
+ * vm_table_lock and never a second mailbox lock, so there is no cycle with
+ * anything. RECV takes only its own mailbox lock. Page-table, host and
+ * allocator locks are not involved at all.
+ *
+ * Both handlers always return true: the call is always answered here, never
+ * forwarded. handle_pvm_exit_hvc64() BUG()s on a function id it does not know,
+ * so returning false would turn a guest's call into a hypervisor panic.
+ *
+ * Nothing here allocates, sleeps, loops more than KVM_MAX_PVMS times, or WARNs
+ * (a hyp WARN is fatal on this tree). Every guest-supplied register is either
+ * validated or, for the payload, carried without ever being interpreted.
+ */
+
+/*
+ * The register layout in <linux/arm-smccc.h> - payload in x5-x8 on SEND and
+ * x4-x7 on RECV - is written for exactly four words.
+ */
+static_assert(ARM_SMCCC_KVM_G2G_MSG_WORDS == 4);
+
+/* What a SEND handler can find out. */
+#define PKVM_G2G_SEND_FLAGS_SET		BIT(0)	/* x4 != 0 */
+#define PKVM_G2G_SEND_ID_ZERO		BIT(1)	/* target identity is (0, 0) */
+#define PKVM_G2G_SEND_INC_ZERO		BIT(2)	/* target incarnation is 0 */
+#define PKVM_G2G_SEND_TO_SELF		BIT(3)	/* target is the caller */
+#define PKVM_G2G_SEND_UNREGISTERED	BIT(4)	/* caller has no identity */
+#define PKVM_G2G_SEND_FOUND		BIT(5)	/* a VM holds the identity... */
+#define PKVM_G2G_SEND_DYING		BIT(6)	/* ...and is being torn down */
+#define PKVM_G2G_SEND_UNPROTECTED	BIT(7)	/* ...and is not protected */
+#define PKVM_G2G_SEND_STALE		BIT(8)	/* ...at another incarnation */
+#define PKVM_G2G_SEND_SLOT_FULL		BIT(9)	/* ...and its slot is in use */
+#define PKVM_G2G_SEND_NR_FACTS		10
+
+/*
+ * The SEND facts a handler knows before it looks for the target: the
+ * arguments, and the caller's own identity.
+ */
+#define PKVM_G2G_SEND_CALLER_FACTS	(PKVM_G2G_SEND_FLAGS_SET |	\
+					 PKVM_G2G_SEND_ID_ZERO |	\
+					 PKVM_G2G_SEND_INC_ZERO |	\
+					 PKVM_G2G_SEND_TO_SELF |	\
+					 PKVM_G2G_SEND_UNREGISTERED)
+
+/* What a RECV handler can find out. */
+#define PKVM_G2G_RECV_FLAGS_SET		BIT(0)	/* x1 != 0 */
+#define PKVM_G2G_RECV_SLOT_FULL		BIT(1)	/* own slot holds a message */
+#define PKVM_G2G_RECV_NR_FACTS		2
+
+enum pkvm_g2g_msg_verdict {
+	PKVM_G2G_MSG_DELIVER,		/* SEND: deposit. RECV: take. */
+	PKVM_G2G_MSG_INVALID,
+	PKVM_G2G_MSG_NO_IDENTITY,
+	PKVM_G2G_MSG_NO_PEER,
+	PKVM_G2G_MSG_BUSY,
+	PKVM_G2G_MSG_EMPTY,
+	PKVM_G2G_MSG_NR_VERDICTS,
+};
+
+/*
+ * Pure and total: every u32 maps to a verdict. The order of the tests is the
+ * order of precedence and it is deliberate:
+ *
+ *  1. a malformed call is refused before anything about the target is
+ *     consulted, so that it learns nothing about the target or its slot;
+ *  2. a caller with no identity is refused next: a receiver must always be
+ *     able to tell who sent a message and to reply to it;
+ *  3. anything short of "a live protected VM holds this identity at this
+ *     incarnation" is NO_PEER, one answer for all of them, the same existence
+ *     answer GUEST_ID_PEER_LOOKUP already gives;
+ *  4. only then is the slot looked at. A full slot is never overwritten.
+ *
+ * DELIVER therefore results from exactly one input: FOUND and nothing else.
+ */
+static enum pkvm_g2g_msg_verdict pkvm_g2g_msg_send_verdict(u32 facts)
+{
+	/* A fact no handler can produce: refuse rather than guess. */
+	if (facts & ~GENMASK(PKVM_G2G_SEND_NR_FACTS - 1, 0))
+		return PKVM_G2G_MSG_INVALID;
+
+	if (facts & (PKVM_G2G_SEND_FLAGS_SET | PKVM_G2G_SEND_ID_ZERO |
+		     PKVM_G2G_SEND_INC_ZERO | PKVM_G2G_SEND_TO_SELF))
+		return PKVM_G2G_MSG_INVALID;
+
+	if (facts & PKVM_G2G_SEND_UNREGISTERED)
+		return PKVM_G2G_MSG_NO_IDENTITY;
+
+	if (!(facts & PKVM_G2G_SEND_FOUND) ||
+	    (facts & (PKVM_G2G_SEND_DYING | PKVM_G2G_SEND_UNPROTECTED |
+		      PKVM_G2G_SEND_STALE)))
+		return PKVM_G2G_MSG_NO_PEER;
+
+	if (facts & PKVM_G2G_SEND_SLOT_FULL)
+		return PKVM_G2G_MSG_BUSY;
+
+	return PKVM_G2G_MSG_DELIVER;
+}
+
+/*
+ * Whether a SEND is decided by @facts, which hold caller-side facts only
+ * (PKVM_G2G_SEND_CALLER_FACTS), so that the handler can answer it without
+ * scanning for the target or taking the target's mailbox lock.
+ *
+ * pkvm_g2g_msg_send_verdict() answers this, not a second copy of its rules.
+ * Without PKVM_G2G_SEND_FOUND it returns NO_PEER unless a caller-side fact
+ * has already decided the call, and NO_PEER is the one answer target-side
+ * facts can still change; any other answer - a malformed call, a caller with
+ * no identity - is final. S5 in pkvm_g2g_msg_selftest() checks that for every
+ * fact set. Whether a call is answered early depends only on what the caller
+ * passed and who the caller is, so it tells the caller nothing about the
+ * target.
+ */
+static bool pkvm_g2g_msg_send_decided_early(u32 facts)
+{
+	return pkvm_g2g_msg_send_verdict(facts) != PKVM_G2G_MSG_NO_PEER;
+}
+
+/*
+ * Pure and total. A malformed RECV must not consume a pending message, so the
+ * flags are tested before the slot.
+ */
+static enum pkvm_g2g_msg_verdict pkvm_g2g_msg_recv_verdict(u32 facts)
+{
+	if (facts & ~GENMASK(PKVM_G2G_RECV_NR_FACTS - 1, 0))
+		return PKVM_G2G_MSG_INVALID;
+
+	if (facts & PKVM_G2G_RECV_FLAGS_SET)
+		return PKVM_G2G_MSG_INVALID;
+
+	if (!(facts & PKVM_G2G_RECV_SLOT_FULL))
+		return PKVM_G2G_MSG_EMPTY;
+
+	return PKVM_G2G_MSG_DELIVER;
+}
+
+static unsigned long pkvm_g2g_msg_verdict_to_smccc(enum pkvm_g2g_msg_verdict v)
+{
+	switch (v) {
+	case PKVM_G2G_MSG_DELIVER:
+		return SMCCC_RET_SUCCESS;
+	case PKVM_G2G_MSG_INVALID:
+		return SMCCC_RET_INVALID_PARAMETER;
+	case PKVM_G2G_MSG_NO_IDENTITY:
+		return ARM_SMCCC_KVM_G2G_MSG_NO_IDENTITY;
+	case PKVM_G2G_MSG_NO_PEER:
+		return ARM_SMCCC_KVM_G2G_MSG_NO_PEER;
+	case PKVM_G2G_MSG_BUSY:
+		return ARM_SMCCC_KVM_G2G_MSG_BUSY;
+	case PKVM_G2G_MSG_EMPTY:
+		return ARM_SMCCC_KVM_G2G_MSG_EMPTY;
+	default:
+		/* Unreachable: every verdict is listed above. */
+		return SMCCC_RET_NOT_SUPPORTED;
+	}
+}
+
+/*
+ * The only two places a mailbox changes. Caller holds @mbox->lock, which is
+ * what makes "the slot is empty" part of the decision rather than a snapshot.
+ * The slot state is added to the caller's facts here, under the lock, and the
+ * verdict function decides; these only carry it out.
+ */
+static enum pkvm_g2g_msg_verdict
+pkvm_g2g_mbox_send_locked(struct pkvm_g2g_mailbox *mbox, u32 facts,
+			  const struct pkvm_g2g_msg *msg)
+{
+	enum pkvm_g2g_msg_verdict v;
+
+	if (mbox->full)
+		facts |= PKVM_G2G_SEND_SLOT_FULL;
+
+	v = pkvm_g2g_msg_send_verdict(facts);
+	if (v == PKVM_G2G_MSG_DELIVER) {
+		mbox->msg = *msg;
+		mbox->full = true;
+	}
+
+	return v;
+}
+
+static enum pkvm_g2g_msg_verdict
+pkvm_g2g_mbox_recv_locked(struct pkvm_g2g_mailbox *mbox, u32 facts,
+			  struct pkvm_g2g_msg *out)
+{
+	enum pkvm_g2g_msg_verdict v;
+
+	if (mbox->full)
+		facts |= PKVM_G2G_RECV_SLOT_FULL;
+
+	v = pkvm_g2g_msg_recv_verdict(facts);
+	if (v == PKVM_G2G_MSG_DELIVER) {
+		*out = mbox->msg;
+		/* Keep the invariant: an empty slot holds no stale payload. */
+		memset(&mbox->msg, 0, sizeof(mbox->msg));
+		mbox->full = false;
+	} else {
+		memset(out, 0, sizeof(*out));
+	}
+
+	return v;
+}
+
+static bool pkvm_guest_msg_send_call(struct pkvm_hyp_vcpu *hyp_vcpu)
+{
+	struct pkvm_hyp_vm *self = pkvm_hyp_vcpu_to_hyp_vm(hyp_vcpu);
+	struct kvm_vcpu *vcpu = &hyp_vcpu->vcpu;
+	u64 lo = smccc_get_arg1(vcpu);
+	u64 hi = smccc_get_arg2(vcpu);
+	u64 incarnation = smccc_get_arg3(vcpu);
+	u64 flags = smccc_get_arg4(vcpu);
+	enum pkvm_g2g_msg_verdict v;
+	struct pkvm_hyp_vm *target;
+	struct pkvm_g2g_msg msg;
+	u32 facts = 0;
+	int i;
+
+	/* Carried, never interpreted. */
+	for (i = 0; i < ARM_SMCCC_KVM_G2G_MSG_WORDS; i++)
+		msg.payload[i] = vcpu_get_reg(vcpu, 5 + i);
+
+	if (flags)
+		facts |= PKVM_G2G_SEND_FLAGS_SET;
+	if (!lo && !hi)
+		facts |= PKVM_G2G_SEND_ID_ZERO;
+	if (!incarnation)
+		facts |= PKVM_G2G_SEND_INC_ZERO;
+
+	hyp_read_lock(&vm_table_lock);
+
+	msg.from_lo = self->g2g_id.lo;
+	msg.from_hi = self->g2g_id.hi;
+	msg.from_incarnation = self->g2g_id.incarnation;
+	if (!msg.from_lo && !msg.from_hi)
+		facts |= PKVM_G2G_SEND_UNREGISTERED;
+	else if (msg.from_lo == lo && msg.from_hi == hi)
+		facts |= PKVM_G2G_SEND_TO_SELF;
+
+	/*
+	 * Everything so far is known without the target. A malformed call or
+	 * a caller with no identity is decided already: answer it without the
+	 * scan and without the target's mailbox lock.
+	 */
+	if (pkvm_g2g_msg_send_decided_early(facts)) {
+		v = pkvm_g2g_msg_send_verdict(facts);
+		goto unlock;
+	}
+
+	/*
+	 * The one VM in vm_table holding the name, if any - possibly dying,
+	 * which is one of the facts gathered below. (0, 0) never gets here: it
+	 * was answered above.
+	 */
+	target = pkvm_g2g_vm_by_identity(lo, hi);
+	if (!target) {
+		v = pkvm_g2g_msg_send_verdict(facts);
+	} else {
+		facts |= PKVM_G2G_SEND_FOUND;
+		/*
+		 * Implied by the identity test above, since identities are
+		 * unique among live VMs; tested on the pointer as well so
+		 * that self-delivery does not rest on that alone.
+		 */
+		if (target == self)
+			facts |= PKVM_G2G_SEND_TO_SELF;
+		if (target->is_dying)
+			facts |= PKVM_G2G_SEND_DYING;
+		if (!pkvm_hyp_vm_is_protected(target))
+			facts |= PKVM_G2G_SEND_UNPROTECTED;
+		if (target->g2g_id.incarnation != incarnation)
+			facts |= PKVM_G2G_SEND_STALE;
+
+		hyp_spin_lock(&target->g2g_mbox.lock);
+		v = pkvm_g2g_mbox_send_locked(&target->g2g_mbox, facts, &msg);
+		hyp_spin_unlock(&target->g2g_mbox.lock);
+	}
+
+unlock:
+	hyp_read_unlock(&vm_table_lock);
+
+	smccc_set_retval(vcpu, pkvm_g2g_msg_verdict_to_smccc(v), 0, 0, 0);
+
+	return true;
+}
+
+static bool pkvm_guest_msg_recv_call(struct pkvm_hyp_vcpu *hyp_vcpu)
+{
+	struct pkvm_hyp_vm *self = pkvm_hyp_vcpu_to_hyp_vm(hyp_vcpu);
+	struct kvm_vcpu *vcpu = &hyp_vcpu->vcpu;
+	enum pkvm_g2g_msg_verdict v;
+	struct pkvm_g2g_msg msg;
+	u32 facts = 0;
+	int i;
+
+	if (smccc_get_arg1(vcpu))
+		facts |= PKVM_G2G_RECV_FLAGS_SET;
+
+	hyp_spin_lock(&self->g2g_mbox.lock);
+	v = pkvm_g2g_mbox_recv_locked(&self->g2g_mbox, facts, &msg);
+	hyp_spin_unlock(&self->g2g_mbox.lock);
+
+	/* All zeroes unless a message was taken; see the _recv_locked() above. */
+	smccc_set_retval(vcpu, pkvm_g2g_msg_verdict_to_smccc(v),
+			 msg.from_lo, msg.from_hi, msg.from_incarnation);
+	for (i = 0; i < ARM_SMCCC_KVM_G2G_MSG_WORDS; i++)
+		vcpu_set_reg(vcpu, 4 + i, msg.payload[i]);
+
+	return true;
+}
+
+/*
+ * Exhaustive check of the mailbox decisions, run once at EL2 init.
+ *
+ * What it covers: the decision functions, exhaustively, and by example the
+ * code that changes a mailbox. pkvm_g2g_msg_send_verdict() and
+ * pkvm_g2g_msg_recv_verdict() are run on every combination of facts -
+ * including combinations no handler can produce, because they are total and
+ * are checked as such - and so is pkvm_g2g_msg_send_decided_early() on every
+ * caller-side fact set. pkvm_g2g_msg_verdict_to_smccc() is run on every
+ * verdict. The two helpers that change a mailbox, pkvm_g2g_mbox_send_locked()
+ * and pkvm_g2g_mbox_recv_locked(), are run through a fixed sequence of
+ * operations.
+ *
+ * What it does not cover: the handlers. Nothing here runs
+ * pkvm_guest_msg_send_call() or pkvm_guest_msg_recv_call(), so it does not
+ * check that they gather the right facts - x4 as the flags, the target's
+ * identity and incarnation compared against the right VM, the VM found by
+ * pkvm_g2g_vm_by_identity(), is_dying and protection read from it, the
+ * caller's own identity read under vm_table_lock - nor that they marshal the
+ * vCPU registers correctly: the payload taken from x5-x8 on SEND, x1-x3
+ * zeroed on SEND, the sender and payload written to x1-x7 on RECV and zeroed
+ * on anything but a delivery. Nor does it check the locking the handlers wrap
+ * around the helpers: vm_table_lock, and which VM's mailbox lock. A handler
+ * that set a wrong fact would get the right verdict for the wrong question and
+ * this check would still pass. Those parts are argued in the comments on the
+ * handlers above, and exercised only end to end, by two guests running the
+ * ping-pong in drivers/virt/coco/pkvm-guest/arm-pkvm-guest.c
+ * (CONFIG_PKVM_GUEST_TO_GUEST_SELFTEST).
+ *
+ * Three parts:
+ *
+ *  1. every SEND fact set (1 << PKVM_G2G_SEND_NR_FACTS of them) and every RECV
+ *     fact set against the invariants whose violation would be a bug rather
+ *     than a wrong error code:
+ *
+ *       S1  SEND delivers for exactly one fact set: FOUND and nothing else.
+ *           In particular never into a full slot (no overwrite), never into
+ *           a dying, stale, unprotected or unknown target, never to self, and
+ *           never for a caller with no identity;
+ *       S2  a malformed SEND is INVALID whatever the state;
+ *       S3  the slot is observable only through a well-formed call by a
+ *           registered caller that named a live peer correctly: setting
+ *           SLOT_FULL changes no other verdict than DELIVER, which it turns
+ *           into BUSY;
+ *       S4  SEND never answers EMPTY, and every verdict is in range;
+ *       S5  a SEND that pkvm_g2g_msg_send_decided_early() answers from its
+ *           caller-side facts alone gets the verdict it would have got with
+ *           any target-side facts added: answering early never changes the
+ *           answer;
+ *       R1  RECV takes a message for exactly one fact set: a full slot and
+ *           no flags. A malformed RECV never consumes a message;
+ *       R2  RECV answers only DELIVER, EMPTY or INVALID;
+ *       M1  the verdicts map to pairwise distinct SMCCC codes, only DELIVER
+ *           maps to SMCCC_RET_SUCCESS, and none maps to
+ *           SMCCC_RET_NOT_SUPPORTED, the -1 a layer that never recognised the
+ *           call returns;
+ *
+ *  2. named cases, so that a later edit which keeps the invariants but changes
+ *     the meaning of a case is still caught - including which calls are
+ *     answered before the target is looked up;
+ *
+ *  3. a sequence of operations on a mailbox on this stack, through the same
+ *     pkvm_g2g_mbox_*_locked() helpers the handlers use, under the mailbox's
+ *     own lock, checking the contents after each step: a message arrives
+ *     intact, BUSY and refusals leave the slot untouched, RECV empties it and
+ *     leaves no payload behind.
+ *
+ * The verdict is left in hyp globals for the host to report from
+ * finalize_pkvm(), as for pkvm_g2g_reclaim_selftest(): no hyp serial driver
+ * exists this early, and a hyp WARN would be fatal. pkvm_g2g_msg_selftest_inputs
+ * == 0 means the check did not run. pkvm_g2g_msg_selftest_first_bad names the
+ * first failure: the check (high 16 bits, PKVM_G2G_MSG_CHK_*) and the input
+ * or step that failed it (low 16 bits); 0 if there was none. The verdict is
+ * also returned, and a failure disables guest-to-guest as a whole: see
+ * pkvm_g2g_enabled.
+ */
+u32 pkvm_g2g_msg_selftest_inputs;
+u32 pkvm_g2g_msg_selftest_cases;
+u32 pkvm_g2g_msg_selftest_failures;
+u32 pkvm_g2g_msg_selftest_first_bad;
+
+enum {
+	PKVM_G2G_MSG_CHK_S1 = 1,
+	PKVM_G2G_MSG_CHK_S2,
+	PKVM_G2G_MSG_CHK_S3,
+	PKVM_G2G_MSG_CHK_S4,
+	PKVM_G2G_MSG_CHK_R1,
+	PKVM_G2G_MSG_CHK_R2,
+	PKVM_G2G_MSG_CHK_M1,
+	PKVM_G2G_MSG_CHK_SEND_CASE,
+	PKVM_G2G_MSG_CHK_RECV_CASE,
+	PKVM_G2G_MSG_CHK_SEQUENCE,
+	/* Appended, so that the numbers above keep their documented meaning. */
+	PKVM_G2G_MSG_CHK_S5,
+	PKVM_G2G_MSG_CHK_EARLY_CASE,
+};
+
+static void pkvm_g2g_msg_check(bool ok, u32 check, u32 what, u32 *bad,
+			       u32 *first_bad)
+{
+	if (ok)
+		return;
+	if (!*bad)
+		*first_bad = (check << 16) | (what & 0xffff);
+	(*bad)++;
+}
+
+static bool pkvm_g2g_msg_eq(const struct pkvm_g2g_msg *a,
+			    const struct pkvm_g2g_msg *b)
+{
+	int i;
+
+	if (a->from_lo != b->from_lo || a->from_hi != b->from_hi ||
+	    a->from_incarnation != b->from_incarnation)
+		return false;
+	for (i = 0; i < ARM_SMCCC_KVM_G2G_MSG_WORDS; i++)
+		if (a->payload[i] != b->payload[i])
+			return false;
+	return true;
+}
+
+static bool pkvm_g2g_msg_is_zero(const struct pkvm_g2g_msg *m)
+{
+	static const struct pkvm_g2g_msg zero;
+
+	return pkvm_g2g_msg_eq(m, &zero);
+}
+
+bool pkvm_g2g_msg_selftest(void)
+{
+	static const struct {
+		u32 facts;
+		enum pkvm_g2g_msg_verdict want;
+	} send_cases[] = {
+		/* a registered caller, a live peer, an empty slot */
+		{ PKVM_G2G_SEND_FOUND, PKVM_G2G_MSG_DELIVER },
+		/* never overwrite */
+		{ PKVM_G2G_SEND_FOUND | PKVM_G2G_SEND_SLOT_FULL, PKVM_G2G_MSG_BUSY },
+		/* the target has started teardown */
+		{ PKVM_G2G_SEND_FOUND | PKVM_G2G_SEND_DYING, PKVM_G2G_MSG_NO_PEER },
+		/* the name is now held by a later incarnation */
+		{ PKVM_G2G_SEND_FOUND | PKVM_G2G_SEND_STALE, PKVM_G2G_MSG_NO_PEER },
+		{ PKVM_G2G_SEND_FOUND | PKVM_G2G_SEND_UNPROTECTED, PKVM_G2G_MSG_NO_PEER },
+		/* nobody holds the name */
+		{ 0, PKVM_G2G_MSG_NO_PEER },
+		{ PKVM_G2G_SEND_FOUND | PKVM_G2G_SEND_TO_SELF, PKVM_G2G_MSG_INVALID },
+		{ PKVM_G2G_SEND_FOUND | PKVM_G2G_SEND_UNREGISTERED, PKVM_G2G_MSG_NO_IDENTITY },
+		{ PKVM_G2G_SEND_FOUND | PKVM_G2G_SEND_FLAGS_SET, PKVM_G2G_MSG_INVALID },
+		{ PKVM_G2G_SEND_ID_ZERO, PKVM_G2G_MSG_INVALID },
+		{ PKVM_G2G_SEND_FOUND | PKVM_G2G_SEND_INC_ZERO, PKVM_G2G_MSG_INVALID },
+		/* malformed beats busy: no slot oracle for a malformed call */
+		{ PKVM_G2G_SEND_FOUND | PKVM_G2G_SEND_SLOT_FULL |
+		  PKVM_G2G_SEND_FLAGS_SET, PKVM_G2G_MSG_INVALID },
+		/* no identity beats busy: no slot oracle for an anonymous caller */
+		{ PKVM_G2G_SEND_FOUND | PKVM_G2G_SEND_SLOT_FULL |
+		  PKVM_G2G_SEND_UNREGISTERED, PKVM_G2G_MSG_NO_IDENTITY },
+		/* dying beats busy */
+		{ PKVM_G2G_SEND_FOUND | PKVM_G2G_SEND_SLOT_FULL |
+		  PKVM_G2G_SEND_DYING, PKVM_G2G_MSG_NO_PEER },
+		/* facts no handler produces */
+		{ BIT(PKVM_G2G_SEND_NR_FACTS), PKVM_G2G_MSG_INVALID },
+		{ ~0U, PKVM_G2G_MSG_INVALID },
+	};
+	static const struct {
+		u32 facts;
+		enum pkvm_g2g_msg_verdict want;
+	} recv_cases[] = {
+		{ PKVM_G2G_RECV_SLOT_FULL, PKVM_G2G_MSG_DELIVER },
+		{ 0, PKVM_G2G_MSG_EMPTY },
+		/* a malformed RECV must not consume the message */
+		{ PKVM_G2G_RECV_FLAGS_SET | PKVM_G2G_RECV_SLOT_FULL, PKVM_G2G_MSG_INVALID },
+		{ PKVM_G2G_RECV_FLAGS_SET, PKVM_G2G_MSG_INVALID },
+		{ BIT(PKVM_G2G_RECV_NR_FACTS), PKVM_G2G_MSG_INVALID },
+	};
+	static const struct {
+		u32 facts;
+		bool early;
+	} early_cases[] = {
+		/* a well-formed call by a registered caller needs the target */
+		{ 0, false },
+		/* everything malformed, and an anonymous caller, does not */
+		{ PKVM_G2G_SEND_FLAGS_SET, true },
+		{ PKVM_G2G_SEND_ID_ZERO, true },
+		{ PKVM_G2G_SEND_INC_ZERO, true },
+		{ PKVM_G2G_SEND_TO_SELF, true },
+		{ PKVM_G2G_SEND_UNREGISTERED, true },
+	};
+	static const struct pkvm_g2g_msg a = {
+		.from_lo = 0x1111, .from_hi = 0x2222, .from_incarnation = 3,
+		.payload = { 0xa0, ~0ULL, 0, 0x8000000000000000ULL },
+	};
+	static const struct pkvm_g2g_msg b = {
+		.from_lo = 0x5555, .from_hi = 0x6666, .from_incarnation = 7,
+		.payload = { 0xb0, 0xb1, 0xb2, 0xb3 },
+	};
+	const u32 send_mask = GENMASK(PKVM_G2G_SEND_NR_FACTS - 1, 0);
+	const u32 recv_mask = GENMASK(PKVM_G2G_RECV_NR_FACTS - 1, 0);
+	u32 inputs = 0, cases = 0, bad = 0, first_bad = 0;
+	struct pkvm_g2g_mailbox mbox;
+	enum pkvm_g2g_msg_verdict v;
+	struct pkvm_g2g_msg out;
+	u32 f, i, j, step;
+
+	/* 1. Every SEND fact set. */
+	for (f = 0; f <= send_mask; f++) {
+		enum pkvm_g2g_msg_verdict full;
+		u32 caller = f & PKVM_G2G_SEND_CALLER_FACTS;
+
+		v = pkvm_g2g_msg_send_verdict(f);
+		inputs++;
+
+		pkvm_g2g_msg_check((v == PKVM_G2G_MSG_DELIVER) ==
+				   (f == PKVM_G2G_SEND_FOUND),
+				   PKVM_G2G_MSG_CHK_S1, f, &bad, &first_bad);
+
+		if (f & (PKVM_G2G_SEND_FLAGS_SET | PKVM_G2G_SEND_ID_ZERO |
+			 PKVM_G2G_SEND_INC_ZERO | PKVM_G2G_SEND_TO_SELF))
+			pkvm_g2g_msg_check(v == PKVM_G2G_MSG_INVALID,
+					   PKVM_G2G_MSG_CHK_S2, f, &bad,
+					   &first_bad);
+
+		if (!(f & PKVM_G2G_SEND_SLOT_FULL)) {
+			full = pkvm_g2g_msg_send_verdict(f | PKVM_G2G_SEND_SLOT_FULL);
+			pkvm_g2g_msg_check(v == PKVM_G2G_MSG_DELIVER ?
+					   full == PKVM_G2G_MSG_BUSY : full == v,
+					   PKVM_G2G_MSG_CHK_S3, f, &bad,
+					   &first_bad);
+		}
+
+		pkvm_g2g_msg_check(v < PKVM_G2G_MSG_NR_VERDICTS &&
+				   v != PKVM_G2G_MSG_EMPTY,
+				   PKVM_G2G_MSG_CHK_S4, f, &bad, &first_bad);
+
+		if (pkvm_g2g_msg_send_decided_early(caller))
+			pkvm_g2g_msg_check(v == pkvm_g2g_msg_send_verdict(caller),
+					   PKVM_G2G_MSG_CHK_S5, f, &bad,
+					   &first_bad);
+	}
+
+	/* Every RECV fact set. */
+	for (f = 0; f <= recv_mask; f++) {
+		v = pkvm_g2g_msg_recv_verdict(f);
+		inputs++;
+
+		pkvm_g2g_msg_check((v == PKVM_G2G_MSG_DELIVER) ==
+				   (f == PKVM_G2G_RECV_SLOT_FULL),
+				   PKVM_G2G_MSG_CHK_R1, f, &bad, &first_bad);
+		pkvm_g2g_msg_check(v == PKVM_G2G_MSG_DELIVER ||
+				   v == PKVM_G2G_MSG_EMPTY ||
+				   v == PKVM_G2G_MSG_INVALID,
+				   PKVM_G2G_MSG_CHK_R2, f, &bad, &first_bad);
+	}
+
+	/* Every verdict's SMCCC code. */
+	for (i = 0; i < PKVM_G2G_MSG_NR_VERDICTS; i++) {
+		unsigned long code = pkvm_g2g_msg_verdict_to_smccc(i);
+
+		inputs++;
+		pkvm_g2g_msg_check((code == SMCCC_RET_SUCCESS) ==
+				   (i == PKVM_G2G_MSG_DELIVER) &&
+				   code != (unsigned long)SMCCC_RET_NOT_SUPPORTED,
+				   PKVM_G2G_MSG_CHK_M1, i, &bad, &first_bad);
+		for (j = i + 1; j < PKVM_G2G_MSG_NR_VERDICTS; j++)
+			pkvm_g2g_msg_check(code != pkvm_g2g_msg_verdict_to_smccc(j),
+					   PKVM_G2G_MSG_CHK_M1, (i << 8) | j,
+					   &bad, &first_bad);
+	}
+
+	/* 2. Named cases. */
+	for (i = 0; i < ARRAY_SIZE(send_cases); i++, cases++)
+		pkvm_g2g_msg_check(pkvm_g2g_msg_send_verdict(send_cases[i].facts) ==
+				   send_cases[i].want,
+				   PKVM_G2G_MSG_CHK_SEND_CASE, i, &bad, &first_bad);
+	for (i = 0; i < ARRAY_SIZE(recv_cases); i++, cases++)
+		pkvm_g2g_msg_check(pkvm_g2g_msg_recv_verdict(recv_cases[i].facts) ==
+				   recv_cases[i].want,
+				   PKVM_G2G_MSG_CHK_RECV_CASE, i, &bad, &first_bad);
+	for (i = 0; i < ARRAY_SIZE(early_cases); i++, cases++)
+		pkvm_g2g_msg_check(pkvm_g2g_msg_send_decided_early(early_cases[i].facts) ==
+				   early_cases[i].early,
+				   PKVM_G2G_MSG_CHK_EARLY_CASE, i, &bad, &first_bad);
+
+	/* 3. A sequence on a real mailbox, through the handlers' helpers. */
+	memset(&mbox, 0, sizeof(mbox));
+	hyp_spin_lock_init(&mbox.lock);
+	step = 0;
+
+#define PKVM_G2G_MSG_STEP(cond)						\
+	do {								\
+		pkvm_g2g_msg_check(cond, PKVM_G2G_MSG_CHK_SEQUENCE,	\
+				   step, &bad, &first_bad);		\
+		step++;							\
+		cases++;						\
+	} while (0)
+
+	/* Nothing to take from a fresh slot, and nothing comes back. */
+	memset(&out, 0xff, sizeof(out));
+	hyp_spin_lock(&mbox.lock);
+	v = pkvm_g2g_mbox_recv_locked(&mbox, 0, &out);
+	hyp_spin_unlock(&mbox.lock);
+	PKVM_G2G_MSG_STEP(v == PKVM_G2G_MSG_EMPTY && !mbox.full &&
+			  pkvm_g2g_msg_is_zero(&out));
+
+	/* A refused SEND leaves an empty slot empty. */
+	hyp_spin_lock(&mbox.lock);
+	v = pkvm_g2g_mbox_send_locked(&mbox, PKVM_G2G_SEND_FOUND |
+				      PKVM_G2G_SEND_STALE, &b);
+	hyp_spin_unlock(&mbox.lock);
+	PKVM_G2G_MSG_STEP(v == PKVM_G2G_MSG_NO_PEER && !mbox.full &&
+			  pkvm_g2g_msg_is_zero(&mbox.msg));
+
+	/* Deposit. */
+	hyp_spin_lock(&mbox.lock);
+	v = pkvm_g2g_mbox_send_locked(&mbox, PKVM_G2G_SEND_FOUND, &a);
+	hyp_spin_unlock(&mbox.lock);
+	PKVM_G2G_MSG_STEP(v == PKVM_G2G_MSG_DELIVER && mbox.full &&
+			  pkvm_g2g_msg_eq(&mbox.msg, &a));
+
+	/* A second SEND is BUSY and does not overwrite. */
+	hyp_spin_lock(&mbox.lock);
+	v = pkvm_g2g_mbox_send_locked(&mbox, PKVM_G2G_SEND_FOUND, &b);
+	hyp_spin_unlock(&mbox.lock);
+	PKVM_G2G_MSG_STEP(v == PKVM_G2G_MSG_BUSY && mbox.full &&
+			  pkvm_g2g_msg_eq(&mbox.msg, &a));
+
+	/* A malformed RECV neither consumes nor reveals. */
+	memset(&out, 0xff, sizeof(out));
+	hyp_spin_lock(&mbox.lock);
+	v = pkvm_g2g_mbox_recv_locked(&mbox, PKVM_G2G_RECV_FLAGS_SET, &out);
+	hyp_spin_unlock(&mbox.lock);
+	PKVM_G2G_MSG_STEP(v == PKVM_G2G_MSG_INVALID && mbox.full &&
+			  pkvm_g2g_msg_eq(&mbox.msg, &a) &&
+			  pkvm_g2g_msg_is_zero(&out));
+
+	/* Take it: intact, and the slot is left empty and clean. */
+	hyp_spin_lock(&mbox.lock);
+	v = pkvm_g2g_mbox_recv_locked(&mbox, 0, &out);
+	hyp_spin_unlock(&mbox.lock);
+	PKVM_G2G_MSG_STEP(v == PKVM_G2G_MSG_DELIVER && !mbox.full &&
+			  pkvm_g2g_msg_eq(&out, &a) &&
+			  pkvm_g2g_msg_is_zero(&mbox.msg));
+
+	/* Taken once only. */
+	hyp_spin_lock(&mbox.lock);
+	v = pkvm_g2g_mbox_recv_locked(&mbox, 0, &out);
+	hyp_spin_unlock(&mbox.lock);
+	PKVM_G2G_MSG_STEP(v == PKVM_G2G_MSG_EMPTY && pkvm_g2g_msg_is_zero(&out));
+
+	/* The slot is reusable. */
+	hyp_spin_lock(&mbox.lock);
+	v = pkvm_g2g_mbox_send_locked(&mbox, PKVM_G2G_SEND_FOUND, &b);
+	if (v == PKVM_G2G_MSG_DELIVER)
+		v = pkvm_g2g_mbox_recv_locked(&mbox, 0, &out);
+	hyp_spin_unlock(&mbox.lock);
+	PKVM_G2G_MSG_STEP(v == PKVM_G2G_MSG_DELIVER && !mbox.full &&
+			  pkvm_g2g_msg_eq(&out, &b));
+
+#undef PKVM_G2G_MSG_STEP
+
+	pkvm_g2g_msg_selftest_cases = cases;
+	pkvm_g2g_msg_selftest_failures = bad;
+	pkvm_g2g_msg_selftest_first_bad = first_bad;
+	/* Last: non-zero is what tells the host the check ran to the end. */
+	pkvm_g2g_msg_selftest_inputs = inputs;
+
+	return !bad;
+}
 #endif /* CONFIG_PKVM_GUEST_TO_GUEST */
 
 static bool pkvm_install_ioguard_page(struct pkvm_hyp_vcpu *hyp_vcpu,
@@ -2563,6 +3291,10 @@ bool kvm_handle_pvm_hvc64(struct kvm_vcpu *vcpu, u64 *exit_code)
 		return pkvm_guest_id_self_call(hyp_vcpu);
 	case ARM_SMCCC_VENDOR_HYP_KVM_GUEST_ID_PEER_LOOKUP_FUNC_ID:
 		return pkvm_guest_id_peer_lookup_call(hyp_vcpu);
+	case ARM_SMCCC_VENDOR_HYP_KVM_GUEST_MSG_SEND_FUNC_ID:
+		return pkvm_guest_msg_send_call(hyp_vcpu);
+	case ARM_SMCCC_VENDOR_HYP_KVM_GUEST_MSG_RECV_FUNC_ID:
+		return pkvm_guest_msg_recv_call(hyp_vcpu);
 #endif
 	case ARM_SMCCC_TRNG_VERSION ... ARM_SMCCC_TRNG_RND32:
 	case ARM_SMCCC_TRNG_RND64:

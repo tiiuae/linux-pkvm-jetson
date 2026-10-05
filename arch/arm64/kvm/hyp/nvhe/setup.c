@@ -411,7 +411,7 @@ void __noreturn __pkvm_init_finalise(void)
 	unsigned long nr_pages, reserved_pages, pfn;
 	int ret;
 #ifdef CONFIG_PKVM_GUEST_TO_GUEST
-	bool g2g_reclaim_ok;
+	bool g2g_reclaim_ok, g2g_msg_ok;
 #endif
 
 	/* Now that the vmemmap is backed, install the full-fledged allocator */
@@ -490,8 +490,14 @@ void __noreturn __pkvm_init_finalise(void)
 	 */
 	g2g_reclaim_ok = pkvm_g2g_reclaim_selftest();
 
-	/* Fail closed: guest-to-guest is enabled only if the check passed. */
-	pkvm_g2g_enabled = g2g_reclaim_ok;
+	/*
+	 * Likewise for the guest-to-guest mailbox: pure decisions plus a
+	 * mailbox on the stack, so no scratch page either.
+	 */
+	g2g_msg_ok = pkvm_g2g_msg_selftest();
+
+	/* Fail closed: guest-to-guest is enabled only if both checks passed. */
+	pkvm_g2g_enabled = g2g_reclaim_ok && g2g_msg_ok;
 #endif
 out:
 	/*

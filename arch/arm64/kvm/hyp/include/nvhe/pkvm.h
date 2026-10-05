@@ -81,6 +81,34 @@ struct pkvm_g2g_identity {
 	 */
 	u64 incarnation;
 };
+
+/*
+ * One guest-to-guest message as it sits in a receiver's mailbox. The sender
+ * fields are copied from the sender's pkvm_g2g_identity at SEND time, so that
+ * RECV never has to look at the sender - which may be gone by then.
+ */
+struct pkvm_g2g_msg {
+	u64 from_lo;
+	u64 from_hi;
+	u64 from_incarnation;
+	u64 payload[ARM_SMCCC_KVM_G2G_MSG_WORDS];
+};
+
+/*
+ * The one-slot mailbox of ARM_SMCCC_KVM_FUNC_GUEST_MSG_SEND/RECV, embedded in
+ * the receiver's struct pkvm_hyp_vm so that nothing is ever allocated for it.
+ *
+ * @lock is a leaf: nothing is acquired while it is held. A sender takes it
+ * with vm_table_lock held for read, which is what keeps the receiver from
+ * being freed (or starting teardown) under it; the receiver takes it on its
+ * own, its VM being pinned by its own loaded vCPU.
+ */
+struct pkvm_g2g_mailbox {
+	hyp_spinlock_t lock;
+	/* Guarded by @lock. @msg is all zeroes whenever @full is false. */
+	bool full;
+	struct pkvm_g2g_msg msg;
+};
 #endif
 
 /*
@@ -139,6 +167,9 @@ struct pkvm_hyp_vm {
 #ifdef CONFIG_PKVM_GUEST_TO_GUEST
 	/* Guest-to-guest identity. Guarded by vm_table_lock. */
 	struct pkvm_g2g_identity g2g_id;
+
+	/* Guest-to-guest message slot. Guarded by its own lock. */
+	struct pkvm_g2g_mailbox g2g_mbox;
 #endif
 
 	/* Array of the hyp vCPU structures for this VM. */
@@ -207,6 +238,13 @@ bool kvm_hyp_handle_hvc64(struct kvm_vcpu *vcpu, u64 *exit_code);
 bool kvm_handle_pvm_smc64(struct kvm_vcpu *vcpu, u64 *exit_code);
 
 #ifdef CONFIG_PKVM_GUEST_TO_GUEST
+/*
+ * Exhaustive check of the guest-to-guest mailbox decisions. Run once from
+ * __pkvm_init_finalise(); see the comment at the definition for what it proves.
+ * Returns true if it passed: guest-to-guest stays disabled unless it did.
+ */
+bool pkvm_g2g_msg_selftest(void);
+
 /*
  * True only if all three EL2 guest-to-guest self-checks,
  * pkvm_g2g_reclaim_selftest(), pkvm_g2g_msg_selftest() and
