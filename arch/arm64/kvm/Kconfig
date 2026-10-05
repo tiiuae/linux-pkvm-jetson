@@ -92,6 +92,47 @@ config PKVM_GUEST_SELF_ASSIGN_DEVICE
 
 	  If unsure, say N.
 
+config PKVM_GUEST_TO_GUEST
+	bool "pKVM guest-to-guest identity, messages and page sharing"
+	depends on KVM
+	default n
+	help
+	  Let protected VMs name each other, exchange short messages and
+	  share pages through the pKVM hypervisor, without the host being
+	  able to read what passes between them: a message travels in
+	  registers and hypervisor memory, and the host never gains access to
+	  a shared page. See Documentation/virt/kvm/arm/pkvm-guest-to-guest.rst.
+
+	  In the hypervisor this adds vendor hypervisor calls 12 to 20 for
+	  protected guests, advertised in ARM_SMCCC_KVM_FUNC_FEATURES:
+
+	  - guest identity (14-16): a protected VM registers a 128-bit name
+	    it chose itself, reads it back, and asks whether a name it was
+	    given belongs to a live protected peer. A name authorises
+	    nothing;
+	  - messages (17, 18): four 64-bit words to a peer named by identity
+	    and incarnation, through a one-slot mailbox at EL2. Delivery is
+	    not guaranteed, and the receiver polls;
+	  - page sharing (12, 13, 19, 20): an owner offers pages to a peer it
+	    names, the peer maps them into its own address space, and either
+	    side ends the share. A VM's teardown dismantles its shares at
+	    EL2.
+
+	  It also adds the page states guest-to-guest teardown needs, and
+	  three self-checks at EL2 init (the reclaim decisions, the mailbox
+	  and sharing) whose results the host kernel prints. If any of them
+	  fails, none of the calls is advertised or answered.
+
+	  In a guest kernel with CONFIG_ARM_PKVM_GUEST it adds /dev/pkvm-g2g
+	  (include/uapi/linux/pkvm_g2g.h), which gives root in the guest
+	  these calls through ioctl() and mmap(). The option lives under
+	  CONFIG_KVM, which a guest kernel does not otherwise need.
+
+	  Nothing in the kernel registers an identity on a guest's behalf
+	  unless CONFIG_PKVM_GUEST_TO_GUEST_SELFTEST is set as well.
+
+	  If unsure, say N.
+
 menuconfig PKVM_DEBUG
 	bool "Debug mode for Protected KVM hypervisor"
 	help

@@ -149,15 +149,37 @@
 #define ARM_SMCCC_KVM_FUNC_MEM_RELINQUISH	9
 #define ARM_SMCCC_KVM_FUNC_MMIO_RGUARD_MAP	10
 #define ARM_SMCCC_KVM_FUNC_MMIO_RGUARD_UNMAP	11
-#define ARM_SMCCC_KVM_FUNC_PKVM_RESV_12		12
-#define ARM_SMCCC_KVM_FUNC_PKVM_RESV_13		13
-#define ARM_SMCCC_KVM_FUNC_PKVM_RESV_14		14
-#define ARM_SMCCC_KVM_FUNC_PKVM_RESV_15		15
-#define ARM_SMCCC_KVM_FUNC_PKVM_RESV_16		16
-#define ARM_SMCCC_KVM_FUNC_PKVM_RESV_17		17
-#define ARM_SMCCC_KVM_FUNC_PKVM_RESV_18		18
-#define ARM_SMCCC_KVM_FUNC_PKVM_RESV_19		19
-#define ARM_SMCCC_KVM_FUNC_PKVM_RESV_20		20
+/*
+ * Guest-to-guest page sharing, allocated out of the reserved pKVM block: an
+ * owner OFFERs pages to a peer it names, the peer ACCEPTs them into its own
+ * address space, and either side ends it (owner REVOKE, borrower RELEASE).
+ *
+ * Implemented and advertised in ARM_SMCCC_KVM_FUNC_FEATURES only with
+ * CONFIG_PKVM_GUEST_TO_GUEST, as are 14-20 below; without it none of 12-20
+ * exists. The register-level contract is at
+ * ARM_SMCCC_VENDOR_HYP_KVM_GUEST_SHARE_OFFER_FUNC_ID below. See
+ * Documentation/virt/kvm/arm/pkvm-guest-to-guest.rst before changing any of
+ * this.
+ */
+#define ARM_SMCCC_KVM_FUNC_GUEST_SHARE_OFFER	12
+#define ARM_SMCCC_KVM_FUNC_GUEST_SHARE_REVOKE	13
+/*
+ * Guest identity, the naming half of guest-to-guest sharing. See
+ * Documentation/virt/kvm/arm/pkvm-guest-to-guest.rst.
+ */
+#define ARM_SMCCC_KVM_FUNC_GUEST_ID_REGISTER	14
+#define ARM_SMCCC_KVM_FUNC_GUEST_ID_SELF	15
+#define ARM_SMCCC_KVM_FUNC_GUEST_ID_PEER_LOOKUP	16
+/*
+ * Guest-to-guest messages: a few words from one protected VM to another, carried
+ * in registers through EL2 and never through the host. See
+ * Documentation/virt/kvm/arm/pkvm-guest-to-guest.rst.
+ */
+#define ARM_SMCCC_KVM_FUNC_GUEST_MSG_SEND	17
+#define ARM_SMCCC_KVM_FUNC_GUEST_MSG_RECV	18
+/* The borrower's half of guest-to-guest page sharing; see 12 and 13 above. */
+#define ARM_SMCCC_KVM_FUNC_GUEST_SHARE_ACCEPT	19
+#define ARM_SMCCC_KVM_FUNC_GUEST_SHARE_RELEASE	20
 #define ARM_SMCCC_KVM_FUNC_PKVM_RESV_21		21
 #define ARM_SMCCC_KVM_FUNC_PKVM_RESV_22		22
 #define ARM_SMCCC_KVM_FUNC_PKVM_RESV_23		23
@@ -317,6 +339,292 @@
 			   ARM_SMCCC_SMC_64,				\
 			   ARM_SMCCC_OWNER_VENDOR_HYP,			\
 			   ARM_SMCCC_KVM_FUNC_AUDIT_OP)
+
+/*
+ * Guest-to-guest page sharing. CONFIG_PKVM_GUEST_TO_GUEST only.
+ *
+ * Both sides are protected VMs with registered identities (GUEST_ID_* below),
+ * and each names the other: the owner names the borrower when it offers, the
+ * borrower names the owner when it accepts, and the hypervisor requires both to
+ * match. The untrusted host cannot issue these calls, cannot choose either name,
+ * and never gains access to a shared page. Pages stay owned by the owner; the
+ * borrower maps them read-write or read-only, never executable. One borrower
+ * per share.
+ *
+ * ARM_SMCCC_VENDOR_HYP_KVM_GUEST_SHARE_OFFER_FUNC_ID  (owner)
+ *   x1: IPA of the first page; page aligned
+ *   x2: number of pages, 1..512; IPA-contiguous, not necessarily physically
+ *   x3, x4: borrower identity (lo, hi), as GUEST_ID_PEER_LOOKUP takes it
+ *   x5: borrower incarnation, as GUEST_ID_PEER_LOOKUP returned it
+ *   x6: flags: ARM_SMCCC_KVM_G2G_SHARE_RO, or 0
+ *   Every page must be mapped, exclusively the owner's, and not in DMA use.
+ *   Returns x0 status; x1 the share handle on SUCCESS, else 0.
+ *
+ * ARM_SMCCC_VENDOR_HYP_KVM_GUEST_SHARE_ACCEPT_FUNC_ID  (borrower)
+ *   x1: IPA in the caller where the pages are to appear; page aligned; the
+ *       range must not cross a 2 MiB boundary and must be entirely unmapped
+ *   x2: number of pages; must equal the offer's
+ *   x3, x4: owner identity (lo, hi)
+ *   x5: owner incarnation
+ *   x6: the handle the owner was given
+ *   x7: flags, must be 0
+ *   The caller must be enrolled in MMIO guard: an access to the window after the
+ *   share ends then faults with no data shown to the host.
+ *   Returns x0 status; x1 the share's flags on SUCCESS.
+ *
+ * ARM_SMCCC_VENDOR_HYP_KVM_GUEST_SHARE_REVOKE_FUNC_ID  (owner)
+ *   x1: handle; x2: flags, must be 0
+ *   Ends the share whatever the borrower is doing: the pages leave the
+ *   borrower's address space (its next access faults) and become the owner's
+ *   exclusively again. Not poisoned: they never left the owner.
+ *
+ * ARM_SMCCC_VENDOR_HYP_KVM_GUEST_SHARE_RELEASE_FUNC_ID  (borrower)
+ *   x1: handle; x2: flags, must be 0
+ *   The pages leave the caller's address space. The share stays offered, so the
+ *   borrower may accept it again and the owner must still revoke it.
+ *
+ * Status in x0: SMCCC_RET_SUCCESS, SMCCC_RET_INVALID_PARAMETER (malformed),
+ * ARM_SMCCC_KVM_G2G_MSG_NO_IDENTITY (the caller has no identity),
+ * ARM_SMCCC_KVM_G2G_MSG_NO_PEER (the named peer is not a live, protected,
+ * non-dying VM at that incarnation), or one of the ARM_SMCCC_KVM_G2G_SHARE_*
+ * codes below. Transient conditions (an owner page inside a block mapping, not
+ * yet mapped, or a short page-table memcache) are never returned: the
+ * hypervisor asks the host for the work and the call is re-executed.
+ *
+ * Teardown is the hypervisor's alone. When a VM dies, its borrowed pages leave
+ * its address space and its own shares are revoked from their borrowers, in the
+ * same step that marks it dying; the owner's pages then reach the host only
+ * through the ordinary reclaim, which scrubs them.
+ */
+#define ARM_SMCCC_VENDOR_HYP_KVM_GUEST_SHARE_OFFER_FUNC_ID		\
+	ARM_SMCCC_CALL_VAL(ARM_SMCCC_FAST_CALL,				\
+			   ARM_SMCCC_SMC_64,				\
+			   ARM_SMCCC_OWNER_VENDOR_HYP,			\
+			   ARM_SMCCC_KVM_FUNC_GUEST_SHARE_OFFER)
+
+#define ARM_SMCCC_VENDOR_HYP_KVM_GUEST_SHARE_REVOKE_FUNC_ID		\
+	ARM_SMCCC_CALL_VAL(ARM_SMCCC_FAST_CALL,				\
+			   ARM_SMCCC_SMC_64,				\
+			   ARM_SMCCC_OWNER_VENDOR_HYP,			\
+			   ARM_SMCCC_KVM_FUNC_GUEST_SHARE_REVOKE)
+
+#define ARM_SMCCC_VENDOR_HYP_KVM_GUEST_SHARE_ACCEPT_FUNC_ID		\
+	ARM_SMCCC_CALL_VAL(ARM_SMCCC_FAST_CALL,				\
+			   ARM_SMCCC_SMC_64,				\
+			   ARM_SMCCC_OWNER_VENDOR_HYP,			\
+			   ARM_SMCCC_KVM_FUNC_GUEST_SHARE_ACCEPT)
+
+#define ARM_SMCCC_VENDOR_HYP_KVM_GUEST_SHARE_RELEASE_FUNC_ID		\
+	ARM_SMCCC_CALL_VAL(ARM_SMCCC_FAST_CALL,				\
+			   ARM_SMCCC_SMC_64,				\
+			   ARM_SMCCC_OWNER_VENDOR_HYP,			\
+			   ARM_SMCCC_KVM_FUNC_GUEST_SHARE_RELEASE)
+
+/* GUEST_SHARE_OFFER flags. */
+#define ARM_SMCCC_KVM_G2G_SHARE_RO		BIT(0)	/* borrower maps read-only */
+
+/*
+ * Guest identity: how a protected VM learns what it is called, and how it names
+ * a peer. CONFIG_PKVM_GUEST_TO_GUEST only.
+ *
+ * The problem they solve. Guest-to-guest sharing needs a guest to be able to
+ * say which peer it wants to share with, and without these calls no VM
+ * identity is visible to a guest. The obvious candidate, pkvm_handle_t, is
+ * unusable: handles are allocated by the untrusted host at VM creation
+ * (insert_vm_table_entry()), so if a guest named a peer by handle the host
+ * would be choosing which pVMs can read each other's memory. That is
+ * indefensible between mutually distrusting protected VMs, and it is the trust
+ * root this ABI is shaped to avoid.
+ *
+ * The shape instead:
+ *
+ *  - a VM's identity is a 128-bit value the VM *chooses itself*, from inside
+ *    its own protected memory, and registers once with the hypervisor. The host
+ *    cannot read it before registration (the memory is protected), cannot
+ *    choose it, and cannot predict it;
+ *  - the hypervisor enforces that a registration is unique among live VMs and
+ *    immutable for the VM's lifetime, so a name resolves to exactly one VM;
+ *  - a guest names a peer by that peer's identity, which it learns through a
+ *    channel it trusts - attestation, measured boot, a pre-shared value -
+ *    never from the host;
+ *  - an identity is a NAME, not a secret and not a capability. Learning one
+ *    grants nothing: an identity cannot be used to reach a peer's memory, only
+ *    to refer to it. What authorises a share is mutual naming - the owner
+ *    names the borrower when it offers, the borrower names the owner when it
+ *    accepts (GUEST_SHARE_* above) - which is why publishing an identity is
+ *    safe.
+ *
+ * What this deliberately does not do. GUEST_ID_PEER_LOOKUP does not return the
+ * peer's pkvm_handle_t, does not create any binding between the two VMs, and
+ * does not authorise anything. It answers "is the name I was told about a live
+ * protected peer right now", which is what a guest needs before it offers,
+ * accepts or sends, and nothing else. A host that lies about it can only deny
+ * service, which it can do anyway.
+ *
+ * Known limitation, stated so it is not mistaken for a guarantee: uniqueness is
+ * scoped to live VMs. If a VM dies its name becomes available again, so a name
+ * on its own does not authenticate an incarnation. The incarnation number
+ * returned by all three calls is a hypervisor-assigned counter that is never
+ * reused within a hypervisor boot. The message and share calls take it along
+ * with the identity, so what was meant for one incarnation of a name never
+ * reaches a later VM that registered the same name. Binding a name to what
+ * runs behind it (attestation) is not part of this ABI.
+ *
+ * ARM_SMCCC_VENDOR_HYP_KVM_GUEST_ID_REGISTER_FUNC_ID
+ *   x1: identity, low 64 bits
+ *   x2: identity, high 64 bits. (0, 0) is reserved and rejected.
+ * Returns:
+ *   x0: SMCCC_RET_SUCCESS, or
+ *       SMCCC_RET_INVALID_PARAMETER if the identity is (0, 0), or
+ *       SMCCC_RET_NOT_REQUIRED if this VM already registered one, or if a live
+ *       VM already holds this identity. The two are deliberately not
+ *       distinguished: telling a caller which of the two happened would turn
+ *       this into an oracle for other VMs' identities.
+ *   x1: this VM's incarnation number
+ *
+ * ARM_SMCCC_VENDOR_HYP_KVM_GUEST_ID_SELF_FUNC_ID
+ *   no arguments
+ * Returns:
+ *   x0: SMCCC_RET_SUCCESS
+ *   x1: identity low, 0 if none registered
+ *   x2: identity high, 0 if none registered
+ *   x3: this VM's incarnation number, always valid
+ *
+ * ARM_SMCCC_VENDOR_HYP_KVM_GUEST_ID_PEER_LOOKUP_FUNC_ID
+ *   x1: peer identity, low 64 bits
+ *   x2: peer identity, high 64 bits
+ * Returns:
+ *   x0: SMCCC_RET_SUCCESS, or SMCCC_RET_INVALID_PARAMETER for (0, 0) or for
+ *       the caller's own identity
+ *   x1: the peer's incarnation number, or 0 if no live protected VM holds that
+ *       identity. Incarnations start at 1, so 0 is unambiguous.
+ */
+#define ARM_SMCCC_VENDOR_HYP_KVM_GUEST_ID_REGISTER_FUNC_ID		\
+	ARM_SMCCC_CALL_VAL(ARM_SMCCC_FAST_CALL,				\
+			   ARM_SMCCC_SMC_64,				\
+			   ARM_SMCCC_OWNER_VENDOR_HYP,			\
+			   ARM_SMCCC_KVM_FUNC_GUEST_ID_REGISTER)
+
+#define ARM_SMCCC_VENDOR_HYP_KVM_GUEST_ID_SELF_FUNC_ID			\
+	ARM_SMCCC_CALL_VAL(ARM_SMCCC_FAST_CALL,				\
+			   ARM_SMCCC_SMC_64,				\
+			   ARM_SMCCC_OWNER_VENDOR_HYP,			\
+			   ARM_SMCCC_KVM_FUNC_GUEST_ID_SELF)
+
+#define ARM_SMCCC_VENDOR_HYP_KVM_GUEST_ID_PEER_LOOKUP_FUNC_ID		\
+	ARM_SMCCC_CALL_VAL(ARM_SMCCC_FAST_CALL,				\
+			   ARM_SMCCC_SMC_64,				\
+			   ARM_SMCCC_OWNER_VENDOR_HYP,			\
+			   ARM_SMCCC_KVM_FUNC_GUEST_ID_PEER_LOOKUP)
+
+/*
+ * Guest-to-guest messages: GUEST_MSG_SEND and GUEST_MSG_RECV.
+ * CONFIG_PKVM_GUEST_TO_GUEST only.
+ *
+ * What they are for. A protected VM can name a peer (GUEST_ID_* above), but
+ * apart from these calls and page sharing every path between two guests is a
+ * host-emulated device, so whatever goes over it the host can read. These two
+ * calls carry a few words from one protected VM to another *in registers*,
+ * through a one-slot mailbox kept in the receiver's hypervisor structure. A
+ * protected VM's registers never reach the host, and neither does hypervisor
+ * memory, so the host never sees the payload.
+ *
+ * Addressing is by the identity *and* incarnation that GUEST_ID_PEER_LOOKUP
+ * returns (or that GUEST_MSG_RECV reported for a sender, to reply). Requiring
+ * both is what keeps a message for one incarnation of a name from being
+ * delivered to a later VM that registered the same name after the first died.
+ * As everywhere in this interface, the peer's pkvm_handle_t is neither accepted
+ * nor returned.
+ *
+ * What they do NOT give, stated so it is not mistaken for a guarantee:
+ *  - delivery. The host schedules both vCPUs and can simply stop running
+ *    either one. SUCCESS from SEND means "deposited in the receiver's slot",
+ *    not "read"; a message still in the slot when the receiver dies is
+ *    discarded with it (and scrubbed with the rest of its hypervisor memory);
+ *  - notification. There is no interrupt; a receiver polls RECV;
+ *  - fairness or sender filtering. The slot is first come, first served: any
+ *    protected VM that knows a receiver's identity and incarnation can fill
+ *    it, and BUSY tells such a sender that the slot is occupied;
+ *  - attestation. EL2 vouches for the sender's identity and incarnation, which
+ *    no other VM can hold at the same time. It does not vouch for what runs
+ *    behind them: the host can start a protected VM of its own and have it
+ *    register any name that is free.
+ *
+ * Register convention: SMCCC v1.2 (arguments in x1-x8, results in x0-x7),
+ * which is what the hypervisor reports to protected guests.
+ *
+ * ARM_SMCCC_VENDOR_HYP_KVM_GUEST_MSG_SEND_FUNC_ID
+ *   x1: target identity, low 64 bits
+ *   x2: target identity, high 64 bits
+ *   x3: target incarnation
+ *   x4: flags. None are defined; must be 0
+ *   x5-x8: payload, ARM_SMCCC_KVM_G2G_MSG_WORDS words, opaque to the hypervisor
+ * Returns:
+ *   x0: SMCCC_RET_SUCCESS: deposited in the target's slot, or
+ *       SMCCC_RET_INVALID_PARAMETER: x4 != 0, the identity is (0, 0), the
+ *         incarnation is 0, or the identity is the caller's own. Checked
+ *         before anything about the target, so a malformed call learns
+ *         nothing about it, or
+ *       ARM_SMCCC_KVM_G2G_MSG_NO_IDENTITY: the caller has not registered an
+ *         identity (GUEST_ID_REGISTER). A receiver must always be able to
+ *         tell who sent a message and reply to it, or
+ *       ARM_SMCCC_KVM_G2G_MSG_NO_PEER: no live protected VM holds that
+ *         identity at that incarnation - unknown, dead, being torn down, or
+ *         the name is now held by a different incarnation, or
+ *       ARM_SMCCC_KVM_G2G_MSG_BUSY: the target's slot already holds a
+ *         message. Nothing was changed; try again later. A message is never
+ *         overwritten
+ *   x1-x3: 0
+ *
+ * ARM_SMCCC_VENDOR_HYP_KVM_GUEST_MSG_RECV_FUNC_ID
+ *   x1: flags. None are defined; must be 0
+ * Returns:
+ *   x0: SMCCC_RET_SUCCESS: a message was taken, and the slot is now empty, or
+ *       ARM_SMCCC_KVM_G2G_MSG_EMPTY: no message, or
+ *       SMCCC_RET_INVALID_PARAMETER: x1 != 0. A pending message is NOT taken
+ *   x1: sender identity, low 64 bits    } as the sender held them when it
+ *   x2: sender identity, high 64 bits   } sent. Identities are immutable, so
+ *   x3: sender incarnation              } this is also what to reply to
+ *   x4-x7: payload
+ *   On anything but SUCCESS, x1-x7 are 0.
+ */
+#define ARM_SMCCC_VENDOR_HYP_KVM_GUEST_MSG_SEND_FUNC_ID			\
+	ARM_SMCCC_CALL_VAL(ARM_SMCCC_FAST_CALL,				\
+			   ARM_SMCCC_SMC_64,				\
+			   ARM_SMCCC_OWNER_VENDOR_HYP,			\
+			   ARM_SMCCC_KVM_FUNC_GUEST_MSG_SEND)
+
+#define ARM_SMCCC_VENDOR_HYP_KVM_GUEST_MSG_RECV_FUNC_ID			\
+	ARM_SMCCC_CALL_VAL(ARM_SMCCC_FAST_CALL,				\
+			   ARM_SMCCC_SMC_64,				\
+			   ARM_SMCCC_OWNER_VENDOR_HYP,			\
+			   ARM_SMCCC_KVM_FUNC_GUEST_MSG_RECV)
+
+#define ARM_SMCCC_KVM_G2G_MSG_WORDS		4
+
+/*
+ * Function-specific results of GUEST_MSG_SEND/RECV. Deliberately outside the
+ * -1..-3 range the generic SMCCC_RET_* codes use, so that none of them can be
+ * mistaken for the -1 a layer that never recognised the call would return.
+ */
+#define ARM_SMCCC_KVM_G2G_MSG_EMPTY		-64
+#define ARM_SMCCC_KVM_G2G_MSG_BUSY		-65
+#define ARM_SMCCC_KVM_G2G_MSG_NO_PEER		-66
+#define ARM_SMCCC_KVM_G2G_MSG_NO_IDENTITY	-67
+
+/*
+ * Function-specific results of GUEST_SHARE_*. Next to the message codes and,
+ * like them, outside -1..-3, so that none can be mistaken for the -1 of a layer
+ * that never recognised the call. NO_PEER and NO_IDENTITY above are reused with
+ * the same meaning.
+ *
+ *   NO_SHARE  no such share for the caller
+ *   DENIED    a page or the caller is in the wrong state
+ *   LIMIT     the share table or the owner's quota is full
+ */
+#define ARM_SMCCC_KVM_G2G_SHARE_NO_SHARE	-68
+#define ARM_SMCCC_KVM_G2G_SHARE_DENIED		-69
+#define ARM_SMCCC_KVM_G2G_SHARE_LIMIT		-70
 
 /* ptp_kvm counter type ID */
 #define KVM_PTP_VIRT_COUNTER			0
