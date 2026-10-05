@@ -62,6 +62,27 @@ enum protected_vm_state {
 	PROTECTED_VM_DEAD,
 };
 
+#ifdef CONFIG_PKVM_GUEST_TO_GUEST
+/*
+ * A protected VM's identity, as used by guest-to-guest sharing. See the
+ * ARM_SMCCC_KVM_FUNC_GUEST_ID_* block in <linux/arm-smccc.h> for the contract
+ * and the threat model; the short version is that @lo/@hi are chosen by the VM
+ * itself, not by the host, and are immutable once set.
+ */
+struct pkvm_g2g_identity {
+	/* (0, 0) means "not registered". Guarded by vm_table_lock. */
+	u64 lo;
+	u64 hi;
+
+	/*
+	 * Hypervisor-assigned, never reused within a hypervisor boot, assigned
+	 * at VM table insertion whether or not an identity is ever registered.
+	 * Always non-zero for a live VM.
+	 */
+	u64 incarnation;
+};
+#endif
+
 /*
  * Holds the relevant data for running a vm in protected mode.
  */
@@ -114,6 +135,11 @@ struct pkvm_hyp_vm {
 	u64 its_doorbell_guest_ipa;
 	u64 its_doorbell_phys_addr;
 	bool its_doorbell_mapped;
+
+#ifdef CONFIG_PKVM_GUEST_TO_GUEST
+	/* Guest-to-guest identity. Guarded by vm_table_lock. */
+	struct pkvm_g2g_identity g2g_id;
+#endif
 
 	/* Array of the hyp vCPU structures for this VM. */
 	struct pkvm_hyp_vcpu *vcpus[];

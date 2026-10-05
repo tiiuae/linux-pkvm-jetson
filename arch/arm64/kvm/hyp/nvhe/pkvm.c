@@ -276,6 +276,19 @@ static struct pkvm_hyp_vm **vm_table;
 
 #ifdef CONFIG_PKVM_GUEST_TO_GUEST
 /*
+ * Monotonic VM incarnation counter for guest-to-guest identity. Guarded by the
+ * vm_table_lock write lock. Starts at 1 (pre-incremented), so 0 is never a
+ * valid incarnation and can be used as "no such peer".
+ *
+ * Deliberately never decremented and never reused, including across VM table
+ * slot reuse: a guest-to-guest identity is unique only among *live* VMs, so the
+ * incarnation is the only thing that distinguishes one VM's use of a name from
+ * a later VM's. A u64 at one per VM creation does not wrap in any realistic
+ * uptime.
+ */
+static u64 pkvm_g2g_incarnation;
+
+/*
  * Whether guest-to-guest is enabled at all. Fail closed: __pkvm_init_finalise()
  * sets this once, before any guest exists, and only if all three EL2
  * self-checks - pkvm_g2g_reclaim_selftest(), pkvm_g2g_msg_selftest() and
@@ -288,6 +301,10 @@ static struct pkvm_hyp_vm **vm_table;
  * has just found wrong advertised and live. So a failure turns guest-to-guest
  * off as a whole:
  *
+ *  - pkvm_g2g_features() advertises none of the calls 12-20;
+ *  - pkvm_g2g_call_refused() answers each of them SMCCC_RET_NOT_SUPPORTED
+ *    before any handler runs, for a guest that calls without looking, so no
+ *    share can be made;
  *  - pkvm_g2g_reclaim_page() hands every page to the pre-existing reclaim
  *    switch, which the comment there argues is then safe.
  *
@@ -295,6 +312,39 @@ static struct pkvm_hyp_vm **vm_table;
  * disabled, from pkvm_g2g_report_selftest() in arch/arm64/kvm/pkvm.c.
  */
 bool pkvm_g2g_enabled;
+
+#define PKVM_G2G_FEATURES	(BIT(ARM_SMCCC_KVM_FUNC_GUEST_ID_REGISTER) |	\
+				 BIT(ARM_SMCCC_KVM_FUNC_GUEST_ID_SELF) |	\
+				 BIT(ARM_SMCCC_KVM_FUNC_GUEST_ID_PEER_LOOKUP))
+
+static u64 pkvm_g2g_features(void)
+{
+	return pkvm_g2g_enabled ? PKVM_G2G_FEATURES : 0;
+}
+
+/*
+ * True, with SMCCC_RET_NOT_SUPPORTED and zeroes already set as the result, if
+ * @fn is a guest-to-guest call and guest-to-guest is disabled. The calls are
+ * those of PKVM_G2G_FEATURES, so a call is answered exactly when it is
+ * advertised.
+ */
+static bool pkvm_g2g_call_refused(struct kvm_vcpu *vcpu, u32 fn)
+{
+	switch (fn) {
+	case ARM_SMCCC_VENDOR_HYP_KVM_GUEST_ID_REGISTER_FUNC_ID:
+	case ARM_SMCCC_VENDOR_HYP_KVM_GUEST_ID_SELF_FUNC_ID:
+	case ARM_SMCCC_VENDOR_HYP_KVM_GUEST_ID_PEER_LOOKUP_FUNC_ID:
+		break;
+	default:
+		return false;
+	}
+
+	if (pkvm_g2g_enabled)
+		return false;
+
+	smccc_set_retval(vcpu, SMCCC_RET_NOT_SUPPORTED, 0, 0, 0);
+	return true;
+}
 #endif
 
 void pkvm_hyp_vm_table_init(void *tbl)
@@ -851,6 +901,24 @@ static int __insert_vm_table_entry(pkvm_handle_t handle,
 		return -EINVAL;
 
 	vm_table[idx] = hyp_vm;
+
+#ifdef CONFIG_PKVM_GUEST_TO_GUEST
+	/*
+	 * Guest-to-guest identity. Initialised here rather than in
+	 * init_pkvm_hyp_vm() because this is where the vm_table_lock write lock
+	 * is held, and vm_table_lock is what guards every identity field - both
+	 * the per-VM value and the uniqueness of it across the table.
+	 *
+	 * The identity itself starts unset: only the VM can choose it, via
+	 * ARM_SMCCC_KVM_FUNC_GUEST_ID_REGISTER. The incarnation is assigned now,
+	 * unconditionally, and is never reused for the life of the hypervisor,
+	 * so that a name can be pinned to one incarnation of a VM even though
+	 * names themselves become free again when a VM dies.
+	 */
+	hyp_vm->g2g_id.lo = 0;
+	hyp_vm->g2g_id.hi = 0;
+	hyp_vm->g2g_id.incarnation = ++pkvm_g2g_incarnation;
+#endif
 
 	list_add(&hyp_vm->vm_list, &running_vms);
 	return 0;
@@ -1907,6 +1975,202 @@ out_guest_err:
 	return true;
 }
 
+#ifdef CONFIG_PKVM_GUEST_TO_GUEST
+
+/*
+ * ============================================================================
+ * Guest identity: the naming half of guest-to-guest sharing. IMPLEMENTED.
+ * ============================================================================
+ *
+ * The contract, the threat model and the known limitation are in the
+ * ARM_SMCCC_KVM_FUNC_GUEST_ID_* comment in <linux/arm-smccc.h>. Read that
+ * first. What matters here:
+ *
+ *  - the host never chooses, predicts or supplies an identity. A protected VM
+ *    picks its own, out of memory the host cannot read, and registers it once;
+ *  - the hypervisor's whole job is to make the binding from name to VM unique
+ *    among live VMs and immutable for the VM's lifetime, so that no second VM
+ *    - including one the host starts specifically to impersonate - can answer
+ *    to a name that is already taken;
+ *  - nothing here authorises anything. These calls cannot move a page, cannot
+ *    create a binding between two VMs, and cannot be used to reach a peer's
+ *    memory. They let a guest say which peer it means. Consent is the share
+ *    calls' job: a share needs the owner to name the borrower and the
+ *    borrower to name the owner.
+ *
+ * Why not simply let a guest name a peer by pkvm_handle_t: handles are
+ * allocated by the untrusted host at VM creation, so the host would be
+ * deciding which protected VMs can read each other. That is the one design
+ * error this interface exists to avoid, and a reviewer should check that no
+ * later patch quietly reintroduces it by returning a handle from
+ * pkvm_guest_id_peer_lookup_call() below.
+ */
+
+/*
+ * Find the live VM holding an identity. Caller must hold vm_table_lock (read is
+ * enough for a lookup; the write lock is required when the result decides
+ * whether a registration may proceed).
+ *
+ * O(KVM_MAX_PVMS) = 255 slots, with no way to index by identity: identities are
+ * chosen by guests, so there is nothing to hash them into that the host does not
+ * also get to influence the size of. Registration and peer lookup are rare (once
+ * per VM, and once per peer a guest wants to name). GUEST_MSG_SEND scans once
+ * per well-formed message from an identified caller (a malformed or anonymous
+ * one is answered without it), which is still at most one bounded scan per
+ * guest exit, under the read lock, so a scan remains the right trade against
+ * carrying another table.
+ */
+static struct pkvm_hyp_vm *pkvm_g2g_vm_by_identity(u64 lo, u64 hi)
+{
+	unsigned int idx;
+
+	if (unlikely(!vm_table) || (!lo && !hi))
+		return NULL;
+
+	for (idx = 0; idx < KVM_MAX_PVMS; idx++) {
+		struct pkvm_hyp_vm *vm = vm_table[idx];
+
+		if (!vm || vm == RESERVED_ENTRY || vm == LEAKED_ENTRY)
+			continue;
+		if (vm->g2g_id.lo == lo && vm->g2g_id.hi == hi)
+			return vm;
+	}
+
+	return NULL;
+}
+
+static bool pkvm_guest_id_register_call(struct pkvm_hyp_vcpu *hyp_vcpu)
+{
+	struct pkvm_hyp_vm *vm = pkvm_hyp_vcpu_to_hyp_vm(hyp_vcpu);
+	struct kvm_vcpu *vcpu = &hyp_vcpu->vcpu;
+	u64 lo = smccc_get_arg1(vcpu);
+	u64 hi = smccc_get_arg2(vcpu);
+	u64 ret = SMCCC_RET_SUCCESS;
+	u64 incarnation;
+
+	/* (0, 0) is reserved: it is how "no identity registered" is stored. */
+	if (!lo && !hi) {
+		smccc_set_retval(vcpu, SMCCC_RET_INVALID_PARAMETER, 0, 0, 0);
+		return true;
+	}
+
+	/*
+	 * The write lock, not the read lock: the uniqueness test and the
+	 * assignment have to be atomic against another VM registering the same
+	 * identity concurrently, and the lock is what makes the scan below a
+	 * decision rather than a snapshot.
+	 *
+	 * Taking the vm_table write lock from a guest exit path is new, so be
+	 * precise about what it costs and why it cannot deadlock.
+	 *
+	 * It cannot deadlock: this path holds no page-table lock and takes no
+	 * allocator, and the guest exit path does not already hold
+	 * vm_table_lock - pkvm_load_hyp_vcpu() drops the read lock before
+	 * returning, and pkvm_put_hyp_vcpu() documents that it holds none.
+	 *
+	 * It does contend with every reader, which includes pkvm_load_hyp_vcpu()
+	 * on other CPUs, not just VM creation and teardown. The hold is bounded
+	 * by one scan of KVM_MAX_PVMS pointers, and a VM that has registered
+	 * takes the lock but skips the scan, so the only way to repeat a scan is
+	 * to keep failing - which costs the caller a full guest exit per attempt,
+	 * considerably more than it imposes on anyone else. Not worth a mechanism,
+	 * but worth knowing before moving this call anywhere hotter.
+	 */
+	hyp_write_lock(&vm_table_lock);
+
+	if (vm->g2g_id.lo || vm->g2g_id.hi) {
+		/*
+		 * Immutability is what makes a name worth anything: if a VM
+		 * could re-register, a name would only ever describe the
+		 * present instant, and a peer that had checked it would have
+		 * checked nothing.
+		 */
+		ret = SMCCC_RET_NOT_REQUIRED;
+	} else if (pkvm_g2g_vm_by_identity(lo, hi)) {
+		/*
+		 * Already taken. Reported with the same error as
+		 * already-registered, deliberately: distinguishing the two
+		 * would turn this call into an oracle that tells one guest
+		 * whether another guest holds a given identity, a question
+		 * GUEST_ID_PEER_LOOKUP is meant to be the only way to ask.
+		 */
+		ret = SMCCC_RET_NOT_REQUIRED;
+	} else {
+		vm->g2g_id.lo = lo;
+		vm->g2g_id.hi = hi;
+	}
+	incarnation = vm->g2g_id.incarnation;
+
+	hyp_write_unlock(&vm_table_lock);
+
+	smccc_set_retval(vcpu, ret, incarnation, 0, 0);
+
+	return true;
+}
+
+static bool pkvm_guest_id_self_call(struct pkvm_hyp_vcpu *hyp_vcpu)
+{
+	struct pkvm_hyp_vm *vm = pkvm_hyp_vcpu_to_hyp_vm(hyp_vcpu);
+	struct kvm_vcpu *vcpu = &hyp_vcpu->vcpu;
+	u64 lo, hi, incarnation;
+
+	hyp_read_lock(&vm_table_lock);
+	lo = vm->g2g_id.lo;
+	hi = vm->g2g_id.hi;
+	incarnation = vm->g2g_id.incarnation;
+	hyp_read_unlock(&vm_table_lock);
+
+	smccc_set_retval(vcpu, SMCCC_RET_SUCCESS, lo, hi, incarnation);
+
+	return true;
+}
+
+static bool pkvm_guest_id_peer_lookup_call(struct pkvm_hyp_vcpu *hyp_vcpu)
+{
+	struct pkvm_hyp_vm *self = pkvm_hyp_vcpu_to_hyp_vm(hyp_vcpu);
+	struct kvm_vcpu *vcpu = &hyp_vcpu->vcpu;
+	u64 lo = smccc_get_arg1(vcpu);
+	u64 hi = smccc_get_arg2(vcpu);
+	u64 incarnation = 0;
+	bool bad_args;
+
+	hyp_read_lock(&vm_table_lock);
+
+	bad_args = (!lo && !hi) ||
+		   (self->g2g_id.lo == lo && self->g2g_id.hi == hi);
+	if (!bad_args) {
+		struct pkvm_hyp_vm *peer = pkvm_g2g_vm_by_identity(lo, hi);
+
+		/*
+		 * A dying VM must not be nameable: anything built on this must
+		 * not be able to bind to a VM that is already going away.
+		 *
+		 * The protection test is belt and braces - this handler is only
+		 * reachable from pvm_exit_handlers[], so only a protected VM can
+		 * ever have registered - but it states the rule that matters: a
+		 * non-protected VM's memory is readable by the host, so an
+		 * identity it "chose" would be a host-chosen identity, and
+		 * resolving one would hand the host the naming decision.
+		 *
+		 * Note what is NOT returned: the peer's pkvm_handle_t. A handle
+		 * is host-allocated, and a guest that held one could name a
+		 * peer the host picked. Only the incarnation leaves here.
+		 */
+		if (peer && !peer->is_dying && pkvm_hyp_vm_is_protected(peer))
+			incarnation = peer->g2g_id.incarnation;
+	}
+
+	hyp_read_unlock(&vm_table_lock);
+
+	if (bad_args)
+		smccc_set_retval(vcpu, SMCCC_RET_INVALID_PARAMETER, 0, 0, 0);
+	else
+		smccc_set_retval(vcpu, SMCCC_RET_SUCCESS, incarnation, 0, 0);
+
+	return true;
+}
+#endif /* CONFIG_PKVM_GUEST_TO_GUEST */
+
 static bool pkvm_install_ioguard_page(struct pkvm_hyp_vcpu *hyp_vcpu,
 				      u64 *exit_code)
 {
@@ -2236,6 +2500,12 @@ bool kvm_handle_pvm_hvc64(struct kvm_vcpu *vcpu, u64 *exit_code)
 
 	hyp_vcpu = container_of(vcpu, struct pkvm_hyp_vcpu, vcpu);
 
+#ifdef CONFIG_PKVM_GUEST_TO_GUEST
+	/* Calls 12-20 reach their handlers only while they are advertised. */
+	if (pkvm_g2g_call_refused(vcpu, fn))
+		return true;
+#endif
+
 	switch (fn) {
 	case ARM_SMCCC_VERSION_FUNC_ID:
 		/* Nothing to be handled by the host. Go back to the guest. */
@@ -2262,6 +2532,10 @@ bool kvm_handle_pvm_hvc64(struct kvm_vcpu *vcpu, u64 *exit_code)
 		__smccc_kvm_func_to_feature_args(val, ARM_SMCCC_KVM_FUNC_MMIO_RGUARD_UNMAP);
 		__smccc_kvm_func_to_feature_args(val, ARM_SMCCC_KVM_FUNC_MEM_RELINQUISH);
 		__smccc_kvm_func_to_feature_args(val, ARM_SMCCC_KVM_FUNC_DEV_REQ_PWR);
+#ifdef CONFIG_PKVM_GUEST_TO_GUEST
+		/* Calls 12-20, or none of them if an EL2 self-check failed. */
+		val[0] |= pkvm_g2g_features();
+#endif
 		break;
 	case ARM_SMCCC_VENDOR_HYP_KVM_MMIO_GUARD_ENROLL_FUNC_ID:
 		set_bit(KVM_ARCH_FLAG_MMIO_GUARD, &vcpu->kvm->arch.flags);
@@ -2282,6 +2556,14 @@ bool kvm_handle_pvm_hvc64(struct kvm_vcpu *vcpu, u64 *exit_code)
 		return pkvm_memunshare_call(hyp_vcpu, exit_code);
 	case ARM_SMCCC_VENDOR_HYP_KVM_MEM_RELINQUISH_FUNC_ID:
 		return pkvm_memrelinquish_call(hyp_vcpu, exit_code);
+#ifdef CONFIG_PKVM_GUEST_TO_GUEST
+	case ARM_SMCCC_VENDOR_HYP_KVM_GUEST_ID_REGISTER_FUNC_ID:
+		return pkvm_guest_id_register_call(hyp_vcpu);
+	case ARM_SMCCC_VENDOR_HYP_KVM_GUEST_ID_SELF_FUNC_ID:
+		return pkvm_guest_id_self_call(hyp_vcpu);
+	case ARM_SMCCC_VENDOR_HYP_KVM_GUEST_ID_PEER_LOOKUP_FUNC_ID:
+		return pkvm_guest_id_peer_lookup_call(hyp_vcpu);
+#endif
 	case ARM_SMCCC_TRNG_VERSION ... ARM_SMCCC_TRNG_RND32:
 	case ARM_SMCCC_TRNG_RND64:
 		if (module_handle_guest_trng(vcpu))
