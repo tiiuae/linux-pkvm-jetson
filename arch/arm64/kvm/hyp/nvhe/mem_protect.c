@@ -25,6 +25,9 @@
 #include <nvhe/pkvm.h>
 #include <nvhe/mm.h>
 #include <nvhe/modules.h>
+#ifdef CONFIG_PKVM_GUEST_TO_GUEST
+#include <nvhe/serial.h>
+#endif
 
 #define KVM_HOST_S2_FLAGS (KVM_PGTABLE_S2_NOFWB | KVM_PGTABLE_S2_IDMAP)
 
@@ -1370,6 +1373,17 @@ static enum pkvm_page_state guest_get_page_state(kvm_pte_t pte, u64 addr)
 	if (kvm_pte_valid(pte) && ((prot & KVM_PGTABLE_PROT_RWX) != KVM_PGTABLE_PROT_RWX))
 		state = PKVM_PAGE_RESTRICTED_PROT;
 
+#ifdef CONFIG_PKVM_GUEST_TO_GUEST
+	/*
+	 * Surface the guest-to-guest marker, so that every consumer of a guest
+	 * page state can tell a share with a peer VM from a share with the
+	 * host. Only valid PTEs can carry it; PKVM_NOPAGE returned above has
+	 * no prot to read it from.
+	 */
+	if (pkvm_prot_is_g2g(prot))
+		state |= PKVM_PAGE_G2G;
+#endif
+
 	return state | pkvm_getstate(prot);
 }
 
@@ -2430,6 +2444,431 @@ static int ___pkvm_module_unshare_guest(struct pkvm_hyp_vm *vm, u64 phys, u64 ip
 	return 0;
 }
 
+#ifdef CONFIG_PKVM_GUEST_TO_GUEST
+
+/*
+ * ============================================================================
+ * Guest-to-guest teardown.
+ * ============================================================================
+ *
+ * The reclaim path below is a matrix over (guest PTE state, host vmemmap
+ * state) written on the assumption that a page lives in exactly one guest. The
+ * two guest-to-guest orderings fall into it as follows *without* this code:
+ *
+ *  - borrower torn down first: its PTE is PKVM_PAGE_SHARED_BORROWED but the
+ *    host state is PKVM_NOPAGE rather than PKVM_PAGE_SHARED_OWNED, so the
+ *    WARN_ON fires, execution CONTINUES, and the function hands the owner's
+ *    live, still-mapped page to the untrusted host. A WARN and then success;
+ *
+ *  - owner torn down first: -EBUSY, which the host's teardown loop in
+ *    arch/arm64/kvm/pkvm.c treats as "retry", so the loop never terminates.
+ *
+ * Rather than bolt more cases onto that switch, the decision is lifted out
+ * into a pure, total function over the two states. Lifting it out is what
+ * makes it testable: pkvm_g2g_reclaim_selftest() below enumerates every
+ * possible (guest, host) pair and checks the safety invariants, which a switch
+ * embedded in a locked mutation path cannot be made to do.
+ *
+ * Naming: A is the VM that owns the page and lent it; B is the peer VM that
+ * borrows it. "host" is the untrusted pKVM host.
+ */
+enum pkvm_g2g_reclaim_action {
+	/*
+	 * Not a guest-to-guest page. Run the legacy switch unchanged. This is
+	 * the only action that reaches the pre-existing code.
+	 */
+	PKVM_G2G_RECLAIM_NOT_G2G,
+
+	/*
+	 * The two sides disagree, or a state combination exists that no
+	 * transition can produce. Mutate nothing and return -ENOTRECOVERABLE.
+	 * Refusing loses the page; repairing a divergence we do not understand
+	 * could lose a guest's confidentiality, so refusing is the only answer.
+	 */
+	PKVM_G2G_RECLAIM_REFUSE,
+
+	/*
+	 * B is being reclaimed while A is still alive. Unmap from B and drop
+	 * the host-side borrow marker. Do NOT poison: the contents belong to A,
+	 * which still owns the page. Do NOT give the page to the host: A still
+	 * maps it. This is the one teardown path in the file that deliberately
+	 * does not poison on the way out, and the reason is that the page is
+	 * not leaving its owner.
+	 */
+	PKVM_G2G_RECLAIM_DROP_BORROW,
+
+	/*
+	 * B is being reclaimed and A is already gone, so B is the last holder.
+	 * Poison and hand the page back to the host. The poison is NOT
+	 * redundant with the poison A's teardown already did: B had a writable
+	 * mapping afterwards and may have written to the page, so it must be
+	 * scrubbed again before the host can see it.
+	 */
+	PKVM_G2G_RECLAIM_LAST_HOLDER,
+
+	/*
+	 * A is being reclaimed and its PTE still says it lent the page, but the
+	 * host side says no borrower remains - B released it, leaving A's PTE
+	 * stale. A owns the page exclusively, so this is the ordinary
+	 * PKVM_PAGE_OWNED case: poison and hand it to the host.
+	 */
+	PKVM_G2G_RECLAIM_SOLE_OWNER,
+
+	/*
+	 * A is being reclaimed while B still borrows. Not reached while a VM's
+	 * shares are dismantled in the step that marks it dying, and refused
+	 * with a distinguishable error if it ever is; see
+	 * pkvm_g2g_reclaim_page().
+	 */
+	PKVM_G2G_RECLAIM_REFUSE_OWNER_FIRST,
+};
+
+/*
+ * pkvm_g2g_reclaim_action - decide what reclaiming one page from one guest does
+ * @guest_state: guest_get_page_state() of the page in the guest being reclaimed
+ * @host_state:  get_host_state() of the same physical page
+ *
+ * Pure and total: every one of the possible inputs maps to exactly one action,
+ * with no case falling into another and no reliance on a state combination
+ * being unreachable. Called with both the host and the guest component locks
+ * held, but it takes no locks and touches nothing itself.
+ */
+static enum pkvm_g2g_reclaim_action
+pkvm_g2g_reclaim_action(enum pkvm_page_state guest_state,
+			enum pkvm_page_state host_state)
+{
+	if (!(guest_state & PKVM_PAGE_G2G)) {
+		/*
+		 * The guest's PTE does not claim a peer relationship. If the
+		 * host side says the page is in one, the two have diverged.
+		 */
+		if (pkvm_host_state_is_g2g(host_state))
+			return PKVM_G2G_RECLAIM_REFUSE;
+
+		/*
+		 * A guest page in PKVM_PAGE_SHARED_BORROWED was lent either by
+		 * the host, which then reads PKVM_PAGE_SHARED_OWNED, or by a
+		 * hyp module, which then reads PKVM_MODULE_SHARED_OWNED_PAGE and
+		 * is undone by ___pkvm_module_unshare_guest() in the switch below.
+		 * Any other host state means we do not know who else maps the
+		 * page. Refuse rather than hand it to the host.
+		 */
+		if ((guest_state & PKVM_PAGE_STATE_MASK) == PKVM_PAGE_SHARED_BORROWED &&
+		    host_state != PKVM_PAGE_SHARED_OWNED &&
+		    host_state != PKVM_MODULE_SHARED_OWNED_PAGE)
+			return PKVM_G2G_RECLAIM_REFUSE;
+
+		return PKVM_G2G_RECLAIM_NOT_G2G;
+	}
+
+	/*
+	 * A peer relationship is claimed by the guest's PTE. Only the two
+	 * SHARED states can carry it - PKVM_PAGE_OWNED means no counterparty
+	 * and PKVM_NOPAGE has no PTE to carry a software bit in, so either
+	 * combined with PKVM_PAGE_G2G is a contradiction.
+	 */
+	switch (guest_state & PKVM_PAGE_STATE_MASK) {
+	case PKVM_PAGE_SHARED_OWNED:
+		switch (host_state) {
+		case PKVM_PAGE_G2G_LENT:
+			return PKVM_G2G_RECLAIM_REFUSE_OWNER_FIRST;
+		case PKVM_NOPAGE:
+			return PKVM_G2G_RECLAIM_SOLE_OWNER;
+		default:
+			return PKVM_G2G_RECLAIM_REFUSE;
+		}
+	case PKVM_PAGE_SHARED_BORROWED:
+		switch (host_state) {
+		case PKVM_PAGE_G2G_LENT:
+			return PKVM_G2G_RECLAIM_DROP_BORROW;
+		case PKVM_PAGE_G2G_ORPHANED:
+			return PKVM_G2G_RECLAIM_LAST_HOLDER;
+		default:
+			return PKVM_G2G_RECLAIM_REFUSE;
+		}
+	default:
+		return PKVM_G2G_RECLAIM_REFUSE;
+	}
+}
+
+/*
+ * Returns true if the page was fully handled (and sets *ret), false if it is
+ * not a guest-to-guest page and the caller should run the legacy switch.
+ *
+ * *ret is 0, or one of two codes meaning "EL2 deliberately kept the page,
+ * mutated nothing, and the host must keep its pin". Nothing else on the
+ * reclaim path returns either, so the host's teardown loop can match exactly
+ * these and still treat every other error, the legacy switch's -EPERM
+ * included, as before:
+ *
+ *   -EOWNERDEAD       the owner is being reclaimed while a peer still
+ *                     borrows (PKVM_G2G_RECLAIM_REFUSE_OWNER_FIRST);
+ *   -ENOTRECOVERABLE  the guest and host states disagree, or describe a
+ *                     state no transition produces (PKVM_G2G_RECLAIM_REFUSE).
+ *
+ * Called with the host component lock and @vm's guest component lock held.
+ * Only ever touches @vm's own stage-2 and the host side, never a peer's
+ * stage-2, so it needs no second guest lock: the peer's stale PTE is resolved
+ * by the host-side state, which is the point of keeping the last-holder fact
+ * there rather than in the owner's page table.
+ */
+static bool pkvm_g2g_reclaim_page(struct pkvm_hyp_vm *vm, u64 ipa, u64 phys,
+				  u64 size, u64 nr_pages, kvm_pte_t pte,
+				  int *ret)
+{
+	enum pkvm_page_state host_state = get_host_state(hyp_phys_to_page(phys));
+	enum pkvm_page_state guest_state = guest_get_page_state(pte, ipa);
+
+	/*
+	 * Fail closed. With guest-to-guest disabled - an EL2 self-check failed,
+	 * see pkvm_g2g_enabled - nothing below is used and every page takes the
+	 * legacy switch, exactly as with the option off.
+	 *
+	 * That is safe because no guest-to-guest share can exist. The only
+	 * possible writers of guest-to-guest marking - PKVM_PAGE_G2G in a guest
+	 * PTE, PKVM_PAGE_G2G_LENT/_ORPHANED in the host state - are the share
+	 * transitions behind calls 12-20, which are refused before dispatch
+	 * while guest-to-guest is disabled, and the share self-check, which
+	 * runs them on two scratch VMs in pages the host reserved for nothing
+	 * else, so no guest's page is marked by it (it runs with the flag set
+	 * provisionally, see __pkvm_init_finalise()). The flag is final before
+	 * any guest exists and never changes after, so no marking can survive
+	 * from an earlier, enabled period either. What the legacy switch gets
+	 * back is only the one non-guest-to-guest case this path also
+	 * intercepts (see the comment at the call site), with the default
+	 * build's behaviour.
+	 */
+	if (!pkvm_g2g_enabled)
+		return false;
+
+	/*
+	 * The action is decided from the first page's host state but applied
+	 * to the whole range, which is a 2 MiB block when the host pinned at
+	 * PMD level. The guest state cannot vary across the range - it is one
+	 * PTE - but the host state is per page. If the pages disagree and any
+	 * of them is in a guest-to-guest relationship, refuse: deciding from
+	 * page 0 could hand a peer's live page to the host (I1) or send a
+	 * marked page to the legacy switch (I2). A range that disagrees with no
+	 * guest-to-guest marking anywhere goes to the legacy switch, as before.
+	 */
+	for_each_hyp_page(page, phys, size) {
+		enum pkvm_page_state s = get_host_state(page);
+
+		if (s != host_state &&
+		    ((guest_state & PKVM_PAGE_G2G) ||
+		     pkvm_host_state_is_g2g(host_state) ||
+		     pkvm_host_state_is_g2g(s))) {
+			*ret = -ENOTRECOVERABLE;
+			return true;
+		}
+	}
+
+	switch (pkvm_g2g_reclaim_action(guest_state, host_state)) {
+	case PKVM_G2G_RECLAIM_NOT_G2G:
+		return false;
+
+	case PKVM_G2G_RECLAIM_REFUSE:
+		*ret = -ENOTRECOVERABLE;
+		return true;
+
+	case PKVM_G2G_RECLAIM_REFUSE_OWNER_FIRST:
+		/*
+		 * The owner is being reclaimed while a peer still borrows the
+		 * page. No sequence of calls reaches this: only a dying VM's
+		 * pages are reclaimed, and the step that marks a VM dying,
+		 * __pkvm_start_teardown_vm(), first takes its shares out of
+		 * their borrowers (pkvm_g2g_share_vm_dying()). It is refused,
+		 * not acted on, if it ever happens.
+		 *
+		 * Acting on it would mean poisoning the page (the owner is
+		 * dying, so its contents must not survive), unmapping it from
+		 * the owner, and marking it PKVM_PAGE_G2G_ORPHANED so that the
+		 * borrower's own reclaim returns it to the host later -
+		 * poison-on-last-holder, the borrower side of which is
+		 * PKVM_G2G_RECLAIM_LAST_HOLDER. EL2 cannot finish that alone,
+		 * because the host's teardown loop in arch/arm64/kvm/pkvm.c
+		 * (__pkvm_pgtable_stage2_unmap()) would have only two outcomes
+		 * for it, and neither is "keep your pin, this page is not
+		 * yours yet":
+		 *
+		 *   -EBUSY         -> nr_busy++, "goto retry", i.e. retry
+		 *                     forever. Nothing can clear this one: the
+		 *                     borrower is a different struct kvm and
+		 *                     is torn down by a separate sequence, so
+		 *                     the loop would never terminate.
+		 *   anything else  -> WARN_ON(ret), then
+		 *                     unpin_user_pages_dirty_lock() and
+		 *                     kvm_pinned_pages_remove(). The host drops
+		 *                     its pin and forgets the page while the
+		 *                     borrower's stage-2 still maps it. The
+		 *                     host cannot read it - the host stage-2
+		 *                     annotation is still PKVM_ID_GUEST - but
+		 *                     its allocator now believes it owns a page
+		 *                     it will fault on, and the borrower retains
+		 *                     a mapping to memory the host may reuse.
+		 *
+		 * So EL2 refuses with -EOWNERDEAD, and the host loop has a
+		 * third outcome for exactly this code (and for
+		 * -ENOTRECOVERABLE, the other "EL2 kept the page" answer): it
+		 * keeps its pin and stops tracking the page, so the page leaks
+		 * and the loop terminates. Neither code is returned by anything
+		 * else on this path, so the legacy switch's -EPERM keeps its
+		 * legacy handling. Refusing at EL2 is not enough on its own -
+		 * without that host branch the refusal would land in the second
+		 * case above.
+		 */
+		*ret = -EOWNERDEAD;
+		return true;
+
+	case PKVM_G2G_RECLAIM_DROP_BORROW:
+		__host_update_page_state(phys, size, PKVM_NOPAGE);
+		/* TLB: done per VMID on the dying guest's finalize path. */
+		WARN_ON(kvm_pgtable_stage2_unmap(&vm->pgt, ipa, size));
+		*ret = 0;
+		return true;
+
+	case PKVM_G2G_RECLAIM_LAST_HOLDER:
+	case PKVM_G2G_RECLAIM_SOLE_OWNER:
+		/*
+		 * The page is leaving every guest, so it is poisoned and
+		 * psci_mem_protect_dec()'d exactly once here - the owner's
+		 * reclaim did not decrement, because the page did not reach the
+		 * host then.
+		 */
+		hyp_poison_page(phys, size);
+		psci_mem_protect_dec(nr_pages);
+		WARN_ON(kvm_pgtable_stage2_unmap(&vm->pgt, ipa, size));
+		WARN_ON(host_stage2_set_owner_locked(phys, size, PKVM_ID_HOST));
+		*ret = 0;
+		return true;
+	}
+
+	/* Unreachable: pkvm_g2g_reclaim_action() is total. Refuse anyway. */
+	*ret = -ENOTRECOVERABLE;
+	return true;
+}
+
+/*
+ * Exhaustive check of pkvm_g2g_reclaim_action() over every (guest state, host
+ * state) pair, run once at EL2 init.
+ *
+ * This is what makes the state machine above verified rather than merely
+ * written. Running guests reach few of these cases: every share a VM is part
+ * of is dismantled in the step that marks it dying, so the host's reclaim meets
+ * a guest-to-guest page only as PKVM_G2G_RECLAIM_SOLE_OWNER. An argument that
+ * the rest are correct has to come from somewhere else.
+ *
+ * The two invariants are the ones whose violation is a security bug rather than
+ * an error:
+ *
+ *   I1  no input produces an action that hands the page to the host while the
+ *       host side still says a peer holds it;
+ *   I2  no input in which either side carries guest-to-guest marking is routed
+ *       to the legacy switch, which is the code that gets I1 wrong.
+ *
+ * Followed by the named transitions, so that a later edit which keeps the
+ * invariants but changes the meaning of a case is still caught.
+ */
+/*
+ * The self-check's verdict, read and reported by the host in finalize_pkvm():
+ * this runs before any hyp serial driver has registered, so the hyp_info() and
+ * hyp_err() calls below normally print nothing. pkvm_g2g_selftest_pairs == 0
+ * means it did not run.
+ *
+ * The verdict is also returned, and a failure turns guest-to-guest off as a
+ * whole (see pkvm_g2g_enabled) instead of WARNing: a hyp WARN is fatal on this
+ * tree, so it would stop the machine before the host could print the FAIL
+ * line, which is the only place a failure here can be read.
+ */
+u32 pkvm_g2g_selftest_pairs;
+u32 pkvm_g2g_selftest_cases;
+u32 pkvm_g2g_selftest_failures;
+
+bool pkvm_g2g_reclaim_selftest(void)
+{
+	static const struct {
+		enum pkvm_page_state guest, host;
+		enum pkvm_g2g_reclaim_action want;
+		const char *what;
+	} cases[] = {
+		{ PKVM_PAGE_SHARED_OWNED | PKVM_PAGE_G2G, PKVM_PAGE_G2G_LENT,
+		  PKVM_G2G_RECLAIM_REFUSE_OWNER_FIRST, "owner first, borrower live" },
+		{ PKVM_PAGE_SHARED_OWNED | PKVM_PAGE_G2G, PKVM_NOPAGE,
+		  PKVM_G2G_RECLAIM_SOLE_OWNER, "owner, borrower already gone" },
+		{ PKVM_PAGE_SHARED_BORROWED | PKVM_PAGE_G2G, PKVM_PAGE_G2G_LENT,
+		  PKVM_G2G_RECLAIM_DROP_BORROW, "borrower first, owner live" },
+		{ PKVM_PAGE_SHARED_BORROWED | PKVM_PAGE_G2G, PKVM_PAGE_G2G_ORPHANED,
+		  PKVM_G2G_RECLAIM_LAST_HOLDER, "borrower last, owner gone" },
+		{ PKVM_PAGE_SHARED_BORROWED, PKVM_NOPAGE,
+		  PKVM_G2G_RECLAIM_REFUSE, "the silently-unsafe legacy case" },
+		{ PKVM_PAGE_SHARED_BORROWED, PKVM_PAGE_SHARED_OWNED,
+		  PKVM_G2G_RECLAIM_NOT_G2G, "ordinary host-to-guest borrow" },
+		{ PKVM_PAGE_OWNED, PKVM_NOPAGE,
+		  PKVM_G2G_RECLAIM_NOT_G2G, "ordinary donated guest page" },
+		{ PKVM_PAGE_SHARED_OWNED, PKVM_PAGE_SHARED_BORROWED,
+		  PKVM_G2G_RECLAIM_NOT_G2G, "ordinary guest-to-host share" },
+		{ PKVM_PAGE_OWNED | PKVM_PAGE_G2G, PKVM_NOPAGE,
+		  PKVM_G2G_RECLAIM_REFUSE, "owned page claiming a peer" },
+		{ PKVM_PAGE_SHARED_OWNED, PKVM_PAGE_G2G_LENT,
+		  PKVM_G2G_RECLAIM_REFUSE, "host side says peer, guest side does not" },
+	};
+	unsigned int guest, host, i, pairs = 0, bad = 0;
+
+	/*
+	 * Guest states span every state/meta bit up to PKVM_PAGE_G2G;
+	 * host states are whatever fits hyp_page.__host_state, which is 4 bits.
+	 */
+	for (guest = 0; guest < 2 * PKVM_PAGE_G2G; guest++) {
+		for (host = 0; host < BIT(4); host++) {
+			enum pkvm_g2g_reclaim_action act =
+				pkvm_g2g_reclaim_action(guest, host);
+			bool gives_to_host =
+				act == PKVM_G2G_RECLAIM_LAST_HOLDER ||
+				act == PKVM_G2G_RECLAIM_SOLE_OWNER;
+			bool marked = (guest & PKVM_PAGE_G2G) ||
+				      pkvm_host_state_is_g2g(host);
+
+			pairs++;
+
+			/* I1 */
+			if (host == PKVM_PAGE_G2G_LENT && gives_to_host) {
+				hyp_err("pkvm-g2g: I1 violated: guest=0x%x host=0x%x act=%d",
+					guest, host, (int)act);
+				bad++;
+			}
+
+			/* I2 */
+			if (marked && act == PKVM_G2G_RECLAIM_NOT_G2G) {
+				hyp_err("pkvm-g2g: I2 violated: guest=0x%x host=0x%x",
+					guest, host);
+				bad++;
+			}
+		}
+	}
+
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
+		enum pkvm_g2g_reclaim_action act =
+			pkvm_g2g_reclaim_action(cases[i].guest, cases[i].host);
+
+		if (act != cases[i].want) {
+			hyp_err("pkvm-g2g: case \"%s\" gave %d, wanted %d",
+				cases[i].what, (int)act, (int)cases[i].want);
+			bad++;
+		}
+	}
+
+	pkvm_g2g_selftest_pairs = pairs;
+	pkvm_g2g_selftest_cases = ARRAY_SIZE(cases);
+	pkvm_g2g_selftest_failures = bad;
+
+	hyp_info("pkvm-g2g: reclaim matrix self-check: %s (%u pairs, %u named cases, %u failures)",
+		 bad ? "FAIL" : "PASS", pairs, (unsigned int)ARRAY_SIZE(cases), bad);
+
+	return !bad;
+}
+
+#endif /* CONFIG_PKVM_GUEST_TO_GUEST */
+
 int __pkvm_host_reclaim_page_guest(u64 gfn, u64 nr_pages, struct pkvm_hyp_vm *vm)
 {
 	u64 phys, size, ipa = hyp_pfn_to_phys(gfn);
@@ -2450,6 +2889,28 @@ int __pkvm_host_reclaim_page_guest(u64 gfn, u64 nr_pages, struct pkvm_hyp_vm *vm
 	ret = get_valid_guest_pte(vm, ipa, &pte, &phys, size);
 	if (ret)
 		goto unlock;
+
+#ifdef CONFIG_PKVM_GUEST_TO_GUEST
+	/*
+	 * Guest-to-guest pages are decided by pkvm_g2g_reclaim_action() and
+	 * never reach the switch below, which assumes a page lives in exactly
+	 * one guest and hands a peer's live page to the host when that
+	 * assumption breaks. See the block comment above
+	 * pkvm_g2g_reclaim_action().
+	 *
+	 * This also intercepts one combination that is not guest-to-guest at
+	 * all: a PKVM_PAGE_SHARED_BORROWED guest page whose host state is not
+	 * PKVM_PAGE_SHARED_OWNED. The switch below merely WARNs about that and
+	 * then hands the page over; it is refused here instead. A reviewer may
+	 * reasonably want that one fix unconditional rather than under this
+	 * option - it is correct in every configuration. It is gated so that a
+	 * kernel without CONFIG_PKVM_GUEST_TO_GUEST generates the code it
+	 * always has, and because the situation it guards against requires
+	 * bookkeeping that is already corrupt.
+	 */
+	if (pkvm_g2g_reclaim_page(vm, ipa, phys, size, nr_pages, pte, &ret))
+		goto unlock;
+#endif
 
 	switch ((int)guest_get_page_state(pte, ipa)) {
 	case PKVM_PAGE_OWNED:

@@ -88,6 +88,39 @@ phys_addr_t hyp_mem_size;
 extern struct pkvm_device *kvm_nvhe_sym(registered_devices);
 extern unsigned long kvm_nvhe_sym(registered_devices_nr);
 
+#ifdef CONFIG_PKVM_GUEST_TO_GUEST
+extern u32 kvm_nvhe_sym(pkvm_g2g_selftest_pairs);
+extern u32 kvm_nvhe_sym(pkvm_g2g_selftest_cases);
+extern u32 kvm_nvhe_sym(pkvm_g2g_selftest_failures);
+extern bool kvm_nvhe_sym(pkvm_g2g_enabled);
+
+/*
+ * The EL2 self-checks run from __pkvm_init_finalise(), before any hyp serial
+ * driver has registered (those register from a host module_init, after KVM
+ * init), so neither can print its own verdict. Each leaves its counts in hyp
+ * globals and the host reports them here, which must happen before
+ * pkvm_drop_host_privileges(): after that the host stage-2 hides hyp memory.
+ */
+static void __init pkvm_g2g_report_selftest(void)
+{
+	u32 pairs = READ_ONCE(kvm_nvhe_sym(pkvm_g2g_selftest_pairs));
+	u32 cases = READ_ONCE(kvm_nvhe_sym(pkvm_g2g_selftest_cases));
+	u32 bad = READ_ONCE(kvm_nvhe_sym(pkvm_g2g_selftest_failures));
+
+	if (!pairs)
+		pr_err("pkvm-g2g: EL2 reclaim matrix self-check did not run\n");
+	else if (bad)
+		pr_err("pkvm-g2g: EL2 reclaim matrix self-check: FAIL (%u pairs, %u named cases, %u failures)\n",
+		       pairs, cases, bad);
+	else
+		pr_info("pkvm-g2g: EL2 reclaim matrix self-check: PASS (%u pairs, %u named cases, 0 failures)\n",
+			pairs, cases);
+
+	if (!READ_ONCE(kvm_nvhe_sym(pkvm_g2g_enabled)))
+		pr_err("pkvm-g2g: guest-to-guest DISABLED: an EL2 self-check failed or did not run, so calls 12-20 are not advertised and are refused\n");
+}
+#endif
+
 extern struct pkvm_mediated_device *kvm_nvhe_sym(mediated_devices);
 extern u32 kvm_nvhe_sym(mediated_devices_nr);
 
@@ -1482,6 +1515,10 @@ static int __init finalize_pkvm(void)
 
 	pkvm_host_stage2_drain();
 
+#ifdef CONFIG_PKVM_GUEST_TO_GUEST
+	pkvm_g2g_report_selftest();
+#endif
+
 	ret = pkvm_drop_host_privileges();
 	if (ret) {
 		pr_err("Failed to finalize Hyp protection: %d\n", ret);
@@ -2058,6 +2095,38 @@ retry:
 			ppage = next;
 			continue;
 		}
+#ifdef CONFIG_PKVM_GUEST_TO_GUEST
+		/*
+		 * EL2 deliberately kept the page. pkvm_g2g_reclaim_page() returns
+		 * -EOWNERDEAD when the owner is reclaimed while a peer still
+		 * borrows, and -ENOTRECOVERABLE when the guest and host states
+		 * disagree; nothing else on this path returns either code.
+		 * Either way the host stage-2 still annotates the page as
+		 * guest-owned and a peer may still map it, so unpinning would
+		 * hand the page allocator a page the host faults on. Keep the
+		 * pin and stop tracking the page: it leaks, on purpose, and the
+		 * loop terminates. Every other error, including the -EPERM the
+		 * legacy reclaim switch returns for a page in an unexpected
+		 * state, takes the legacy path below, as it always has.
+		 *
+		 * The pin stays, but the VMM no longer owns the page: nothing
+		 * tracks it for the VMM and nothing will ever unpin it on its
+		 * behalf. So release its locked-memory charge here, as the
+		 * legacy path does when it unpins. Left charged, every leaked
+		 * page would count against the VMM's RLIMIT_MEMLOCK for as long
+		 * as its mm lives, across every VM it creates after this one.
+		 */
+		if (ret == -EOWNERDEAD || ret == -ENOTRECOVERABLE) {
+			WARN_ON_ONCE(ret == -ENOTRECOVERABLE);
+			pr_warn_ratelimited("pkvm-g2g: EL2 kept the guest page at IPA 0x%llx (%d), leaking %u page(s)\n",
+					    (u64)ppage->ipa, ret, 1U << ppage->order);
+			account_locked_vm(mm, 1 << ppage->order, false);
+			kvm_pinned_pages_remove(ppage, &kvm->arch.pkvm.pinned_pages);
+			kfree(ppage);
+			ppage = next;
+			continue;
+		}
+#endif
 		WARN_ON(ret);
 		if (ppage->pinned) {
 			pkvm_release_ppage(ppage, true);

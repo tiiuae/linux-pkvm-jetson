@@ -410,6 +410,9 @@ void __noreturn __pkvm_init_finalise(void)
 	struct kvm_cpu_context *host_ctxt = host_data_ptr(host_ctxt);
 	unsigned long nr_pages, reserved_pages, pfn;
 	int ret;
+#ifdef CONFIG_PKVM_GUEST_TO_GUEST
+	bool g2g_reclaim_ok;
+#endif
 
 	/* Now that the vmemmap is backed, install the full-fledged allocator */
 	pfn = hyp_virt_to_pfn(hyp_pgt_base);
@@ -476,6 +479,20 @@ void __noreturn __pkvm_init_finalise(void)
 	pkvm_hyp_vm_table_init(vm_table_base);
 
 	pkvm_ownership_selftest(selftest_base);
+
+#ifdef CONFIG_PKVM_GUEST_TO_GUEST
+	/*
+	 * Unlike pkvm_ownership_selftest() this needs no scratch page and no
+	 * page tables: it only exercises the pure decision function behind
+	 * guest-to-guest teardown. It is here rather than under
+	 * CONFIG_NVHE_EL2_DEBUG so that the configuration which exposes the
+	 * guest-to-guest hypercalls is also the one that checks them.
+	 */
+	g2g_reclaim_ok = pkvm_g2g_reclaim_selftest();
+
+	/* Fail closed: guest-to-guest is enabled only if the check passed. */
+	pkvm_g2g_enabled = g2g_reclaim_ok;
+#endif
 out:
 	/*
 	 * We tail-called to here from handle___pkvm_init() and will not return,

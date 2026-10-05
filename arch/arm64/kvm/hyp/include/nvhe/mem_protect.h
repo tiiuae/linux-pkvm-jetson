@@ -55,6 +55,15 @@ int __pkvm_guest_share_hyp_page(struct pkvm_hyp_vcpu *vcpu, u64 ipa, u64 *hyp_va
 int __pkvm_guest_unshare_hyp_page(struct pkvm_hyp_vm *vm, u64 ipa);
 int __pkvm_guest_share_ffa_page(struct pkvm_hyp_vcpu *vcpu, u64 ipa, phys_addr_t *phys);
 int __pkvm_guest_unshare_ffa_page(struct pkvm_hyp_vm *vm, u64 ipa);
+#ifdef CONFIG_PKVM_GUEST_TO_GUEST
+/*
+ * Exhaustive check of the guest-to-guest reclaim decision matrix. Run once from
+ * __pkvm_init_finalise(); see the comment at the definition for what it proves
+ * and why it exists at all. Returns true if it passed: guest-to-guest stays
+ * disabled unless it did (see pkvm_g2g_enabled).
+ */
+bool pkvm_g2g_reclaim_selftest(void);
+#endif
 int __pkvm_host_share_ffa(u64 pfn, u64 nr_pages);
 int __pkvm_host_unshare_ffa(u64 pfn, u64 nr_pages);
 int __pkvm_host_donate_guest(u64 pfn, u64 gfn, u64 nr_pages, struct pkvm_hyp_vcpu *vcpu);

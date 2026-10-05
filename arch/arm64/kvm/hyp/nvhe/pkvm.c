@@ -274,6 +274,29 @@ DEFINE_HYP_RWLOCK(vm_table_lock);
  */
 static struct pkvm_hyp_vm **vm_table;
 
+#ifdef CONFIG_PKVM_GUEST_TO_GUEST
+/*
+ * Whether guest-to-guest is enabled at all. Fail closed: __pkvm_init_finalise()
+ * sets this once, before any guest exists, and only if all three EL2
+ * self-checks - pkvm_g2g_reclaim_selftest(), pkvm_g2g_msg_selftest() and
+ * pkvm_g2g_share_selftest() - ran and passed. A check that did not run counts
+ * as failed.
+ *
+ * No check can simply WARN on failure: a hyp WARN is fatal on this tree,
+ * so the machine would stop before the host could print which check failed.
+ * Nor can a check merely record its failure, which would leave the calls it
+ * has just found wrong advertised and live. So a failure turns guest-to-guest
+ * off as a whole:
+ *
+ *  - pkvm_g2g_reclaim_page() hands every page to the pre-existing reclaim
+ *    switch, which the comment there argues is then safe.
+ *
+ * The host reports the checks and, if this is false, that guest-to-guest is
+ * disabled, from pkvm_g2g_report_selftest() in arch/arm64/kvm/pkvm.c.
+ */
+bool pkvm_g2g_enabled;
+#endif
+
 void pkvm_hyp_vm_table_init(void *tbl)
 {
 	WARN_ON(vm_table);

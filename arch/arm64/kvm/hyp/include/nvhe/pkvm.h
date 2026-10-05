@@ -180,6 +180,19 @@ bool kvm_hyp_handle_hvc64(struct kvm_vcpu *vcpu, u64 *exit_code);
 
 bool kvm_handle_pvm_smc64(struct kvm_vcpu *vcpu, u64 *exit_code);
 
+#ifdef CONFIG_PKVM_GUEST_TO_GUEST
+/*
+ * True only if all three EL2 guest-to-guest self-checks,
+ * pkvm_g2g_reclaim_selftest(), pkvm_g2g_msg_selftest() and
+ * pkvm_g2g_share_selftest(), ran and passed. Written once, by
+ * __pkvm_init_finalise(), before any guest exists. While it is false the
+ * guest-to-guest calls (12-20) are neither advertised nor answered, a dying
+ * VM has no shares to dismantle, and every page is reclaimed through the
+ * pre-existing path. See the comment at the definition in pkvm.c.
+ */
+extern bool pkvm_g2g_enabled;
+#endif
+
 struct pkvm_hyp_vcpu *pkvm_mpidr_to_hyp_vcpu(struct pkvm_hyp_vm *vm, u64 mpidr);
 
 static inline bool pkvm_hyp_vm_has_pvmfw(struct pkvm_hyp_vm *vm)
