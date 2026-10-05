@@ -133,6 +133,33 @@ config PKVM_GUEST_TO_GUEST
 
 	  If unsure, say N.
 
+config PKVM_GUEST_TO_GUEST_SELFTEST
+	bool "pKVM guest-to-guest self-test in protected guests"
+	depends on PKVM_GUEST_TO_GUEST
+	default n
+	help
+	  Test guest-to-guest identity, messages and page sharing from inside
+	  a protected guest, in the CONFIG_ARM_PKVM_GUEST driver. At boot the
+	  guest checks the identity calls and registers an identity. After
+	  boot, for up to about 15 minutes, it looks for every peer that
+	  registered the same way, exchanges a message with each and shares
+	  pages with each in both directions, and logs a verdict.
+	  arm_pkvm_guest.g2g_runtime_test=0 on the guest command line skips
+	  the part after boot and leaves the guest's mailbox to user space.
+
+	  The identity the test registers is predictable, which is what lets
+	  two guests find each other with no channel between them. A real
+	  guest must register a name the host cannot predict: the host can
+	  start a protected VM of its own that claims a predictable one first.
+	  This option is the only thing in the kernel that registers an
+	  identity on a guest's behalf. Without it a guest has none, and the
+	  calls that need one (sending a message, offering or accepting a
+	  share) are refused.
+
+	  For testing only; do not enable this in a production kernel.
+
+	  If unsure, say N.
+
 menuconfig PKVM_DEBUG
 	bool "Debug mode for Protected KVM hypervisor"
 	help
