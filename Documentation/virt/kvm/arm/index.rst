@@ -11,6 +11,7 @@ ARM
    hyp-abi
    hypercalls
    pkvm
+   pkvm-guest-to-guest
    pkvm-iommu
    pvtime
    ptp_kvm
