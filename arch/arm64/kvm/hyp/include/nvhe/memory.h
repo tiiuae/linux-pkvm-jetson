@@ -137,6 +137,11 @@ static_assert(!(PKVM_PAGE_G2G & (PKVM_PAGE_RESTRICTED_PROT | PKVM_MMIO |
  */
 #define PKVM_PAGE_G2G_PROT_MASK		KVM_PGTABLE_PROT_SW2
 
+static inline enum kvm_pgtable_prot pkvm_mkprot_g2g(enum kvm_pgtable_prot prot)
+{
+	return prot | PKVM_PAGE_G2G_PROT_MASK;
+}
+
 static inline bool pkvm_prot_is_g2g(enum kvm_pgtable_prot prot)
 {
 	return !!(prot & PKVM_PAGE_G2G_PROT_MASK);

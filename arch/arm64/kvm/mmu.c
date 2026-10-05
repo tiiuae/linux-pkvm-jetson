@@ -1535,6 +1535,24 @@ static bool kvm_vma_is_cacheable(struct vm_area_struct *vma)
 	}
 }
 
+/*
+ * TODO(g2g): OPEN QUESTION, settled for teardown only.
+ *
+ * The host tracks every page it has handed to a protected guest in this
+ * interval tree, and guest_request_walker() in hyp/nvhe/mem_protect.c warns
+ * that "the stage-2 geometry must remain synchronized with the host's
+ * kvm_pinned_page tree at all time".
+ *
+ * A guest-to-guest borrower has a stage-2 mapping that the host never created
+ * and never pinned: there is no kvm_pinned_page behind it, and the host's
+ * accounting for VM B therefore does not describe B's stage-2. Teardown does
+ * not mind: the host's reclaim loop walks only this tree, so it never visits a
+ * borrowed page, and EL2 takes borrowed pages out of B's stage-2 in the step
+ * that marks B dying (pkvm_g2g_share_vm_dying()). Whether the memslot paths
+ * that walk this tree, or guest_request_walker(), rely on it describing all of
+ * B's stage-2 was not established. A mistake on this side is a host kernel
+ * oops rather than a contained hypervisor error.
+ */
 static struct kvm_pinned_page *find_ppage(struct kvm *kvm, u64 ipa)
 {
 	return kvm_pinned_pages_iter_first(&kvm->arch.pkvm.pinned_pages,

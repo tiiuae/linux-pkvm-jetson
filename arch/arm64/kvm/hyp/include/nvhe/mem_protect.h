@@ -24,7 +24,21 @@ struct host_mmu {
 };
 extern struct host_mmu host_mmu;
 
-/* This corresponds to page-table locking order */
+/*
+ * This corresponds to page-table locking order.
+ *
+ * TODO(g2g): this is a total order over component *classes*, and every
+ * transition locks at most one guest - the guest-to-guest share transitions
+ * included, which take one guest's pgtable lock at a time under host_mmu.lock.
+ * A transition that ever needs two guests' pgtable locks at once, which sit at
+ * the same level, needs an intra-GUEST ordering rule first, documented here and
+ * defended: ordering by pkvm_handle_t or by struct address are both plausible.
+ * Get it wrong and two CPUs locking in opposite orders deadlock at EL2, which
+ * is an unrecoverable hang of the machine, not a recoverable fault.
+ *
+ * See also the TODO(g2g) on guest_lock_component() in mem_protect.c: the lock
+ * order is not the only obstacle to holding two guest locks at once.
+ */
 enum pkvm_component_id {
 	PKVM_ID_HOST,
 	PKVM_ID_HYP,
@@ -63,6 +77,65 @@ int __pkvm_guest_unshare_ffa_page(struct pkvm_hyp_vm *vm, u64 ipa);
  * disabled unless it did (see pkvm_g2g_enabled).
  */
 bool pkvm_g2g_reclaim_selftest(void);
+
+/*
+ * Guest-to-guest page sharing: GUEST_SHARE_OFFER, _ACCEPT, _REVOKE, _RELEASE.
+ * The contract is at ARM_SMCCC_VENDOR_HYP_KVM_GUEST_SHARE_OFFER_FUNC_ID; the
+ * design is in the three "Guest-to-guest sharing" sections of mem_protect.c.
+ *
+ * The handlers in pkvm.c find out what needs vm_table - who holds the named
+ * identity, whether the caller has one, whether it is enrolled in MMIO guard -
+ * and pass it in as the facts below, with vm_table_lock held for read across
+ * the call. Everything else is found out in mem_protect.c.
+ */
+#define PKVM_G2G_SHARE_PEER_ID_ZERO	BIT(0)	/* the named identity is (0, 0) */
+#define PKVM_G2G_SHARE_PEER_INC_ZERO	BIT(1)	/* the named incarnation is 0 */
+#define PKVM_G2G_SHARE_TO_SELF		BIT(2)	/* the caller named itself */
+#define PKVM_G2G_SHARE_UNREGISTERED	BIT(3)	/* the caller has no identity */
+#define PKVM_G2G_SHARE_PEER_FOUND	BIT(4)	/* a VM holds the named identity... */
+#define PKVM_G2G_SHARE_PEER_DYING	BIT(5)	/* ...and it is being torn down */
+#define PKVM_G2G_SHARE_PEER_UNPROTECTED	BIT(6)	/* ...and it is not protected */
+#define PKVM_G2G_SHARE_PEER_STALE	BIT(7)	/* ...at another incarnation */
+#define PKVM_G2G_SHARE_NO_MMIO_GUARD	BIT(8)	/* ACCEPT: caller not enrolled */
+
+enum pkvm_g2g_share_verdict {
+	PKVM_G2G_SHARE_DO,		/* carried out */
+	PKVM_G2G_SHARE_INVALID,
+	PKVM_G2G_SHARE_NO_IDENTITY,
+	PKVM_G2G_SHARE_NO_PEER,
+	PKVM_G2G_SHARE_NO_SHARE,
+	PKVM_G2G_SHARE_DENIED,
+	PKVM_G2G_SHARE_LIMIT,
+	/* Not answers: the handler asks the host and re-executes the HVC. */
+	PKVM_G2G_SHARE_NEED_MAP,	/* map the owner's range in */
+	PKVM_G2G_SHARE_NEED_SPLIT,	/* split a block at an end of it */
+	PKVM_G2G_SHARE_NEED_MEMCACHE,	/* top up the vCPU memcache */
+	PKVM_G2G_SHARE_NR_VERDICTS,
+};
+
+unsigned long pkvm_g2g_share_verdict_to_smccc(enum pkvm_g2g_share_verdict v);
+void pkvm_g2g_share_verdict_selftest(void);
+
+enum pkvm_g2g_share_verdict
+pkvm_g2g_share_offer(struct pkvm_hyp_vcpu *vcpu, u32 peer_facts, u64 ipa,
+		     u64 nr_pages, u64 flags, const struct pkvm_g2g_identity *to,
+		     u64 *handle);
+enum pkvm_g2g_share_verdict
+pkvm_g2g_share_accept(struct pkvm_hyp_vcpu *vcpu, struct pkvm_hyp_vm *owner,
+		      u32 peer_facts, u64 ipa, u64 nr_pages, u64 handle,
+		      u64 flags, u64 *share_flags);
+enum pkvm_g2g_share_verdict
+pkvm_g2g_share_revoke(struct pkvm_hyp_vcpu *vcpu, u64 handle, u64 flags);
+enum pkvm_g2g_share_verdict
+pkvm_g2g_share_release(struct pkvm_hyp_vcpu *vcpu, u64 handle, u64 flags);
+/* Called from __pkvm_start_teardown_vm(), vm_table write lock held. */
+void pkvm_g2g_share_vm_dying(struct pkvm_hyp_vm *vm);
+/*
+ * Decisions, then transitions on two scratch VMs; run once from
+ * __pkvm_init_finalise(). Returns true if it passed: guest-to-guest stays
+ * disabled unless it did (see pkvm_g2g_enabled).
+ */
+bool pkvm_g2g_share_selftest(void *scratch, unsigned long nr_pages);
 #endif
 int __pkvm_host_share_ffa(u64 pfn, u64 nr_pages);
 int __pkvm_host_unshare_ffa(u64 pfn, u64 nr_pages);

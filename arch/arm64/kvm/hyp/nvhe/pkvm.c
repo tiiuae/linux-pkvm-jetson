@@ -305,6 +305,9 @@ static u64 pkvm_g2g_incarnation;
  *  - pkvm_g2g_call_refused() answers each of them SMCCC_RET_NOT_SUPPORTED
  *    before any handler runs, for a guest that calls without looking, so no
  *    share can be made;
+ *  - __pkvm_start_teardown_vm() does not call pkvm_g2g_share_vm_dying(): a
+ *    dying VM has no shares, and the share table may still hold what a
+ *    failed share self-check left behind about its scratch VMs;
  *  - pkvm_g2g_reclaim_page() hands every page to the pre-existing reclaim
  *    switch, which the comment there argues is then safe.
  *
@@ -313,12 +316,18 @@ static u64 pkvm_g2g_incarnation;
  */
 bool pkvm_g2g_enabled;
 
-#define PKVM_G2G_FEATURES	(BIT(ARM_SMCCC_KVM_FUNC_GUEST_ID_REGISTER) |	\
+/* The guest-to-guest calls, 12-20, as ARM_SMCCC_KVM_FUNC_FEATURES bits. */
+#define PKVM_G2G_FEATURES	(BIT(ARM_SMCCC_KVM_FUNC_GUEST_SHARE_OFFER) |	\
+				 BIT(ARM_SMCCC_KVM_FUNC_GUEST_SHARE_REVOKE) |	\
+				 BIT(ARM_SMCCC_KVM_FUNC_GUEST_SHARE_ACCEPT) |	\
+				 BIT(ARM_SMCCC_KVM_FUNC_GUEST_SHARE_RELEASE) |	\
+				 BIT(ARM_SMCCC_KVM_FUNC_GUEST_ID_REGISTER) |	\
 				 BIT(ARM_SMCCC_KVM_FUNC_GUEST_ID_SELF) |	\
 				 BIT(ARM_SMCCC_KVM_FUNC_GUEST_ID_PEER_LOOKUP) | \
 				 BIT(ARM_SMCCC_KVM_FUNC_GUEST_MSG_SEND) |	\
 				 BIT(ARM_SMCCC_KVM_FUNC_GUEST_MSG_RECV))
 
+/* What ARM_SMCCC_KVM_FUNC_FEATURES adds for guest-to-guest: all or nothing. */
 static u64 pkvm_g2g_features(void)
 {
 	return pkvm_g2g_enabled ? PKVM_G2G_FEATURES : 0;
@@ -333,6 +342,10 @@ static u64 pkvm_g2g_features(void)
 static bool pkvm_g2g_call_refused(struct kvm_vcpu *vcpu, u32 fn)
 {
 	switch (fn) {
+	case ARM_SMCCC_VENDOR_HYP_KVM_GUEST_SHARE_OFFER_FUNC_ID:
+	case ARM_SMCCC_VENDOR_HYP_KVM_GUEST_SHARE_REVOKE_FUNC_ID:
+	case ARM_SMCCC_VENDOR_HYP_KVM_GUEST_SHARE_ACCEPT_FUNC_ID:
+	case ARM_SMCCC_VENDOR_HYP_KVM_GUEST_SHARE_RELEASE_FUNC_ID:
 	case ARM_SMCCC_VENDOR_HYP_KVM_GUEST_ID_REGISTER_FUNC_ID:
 	case ARM_SMCCC_VENDOR_HYP_KVM_GUEST_ID_SELF_FUNC_ID:
 	case ARM_SMCCC_VENDOR_HYP_KVM_GUEST_ID_PEER_LOOKUP_FUNC_ID:
@@ -1289,6 +1302,18 @@ int __pkvm_start_teardown_vm(pkvm_handle_t handle)
 	}
 
 	hyp_vm->is_dying = PROTECTED_VM_DYING;
+#ifdef CONFIG_PKVM_GUEST_TO_GUEST
+	/*
+	 * In the same write-locked step: from here on, no share involving this
+	 * VM exists. Its borrowed pages are out of its stage-2 and its own
+	 * shares are out of their borrowers', so the host's reclaim loop meets
+	 * only pages the existing decision table hands back poisoned. Only EL2
+	 * does any of this; see pkvm_g2g_share_vm_dying(). While guest-to-guest
+	 * is disabled no share can exist, and there is nothing to dismantle.
+	 */
+	if (pkvm_g2g_enabled)
+		pkvm_g2g_share_vm_dying(hyp_vm);
+#endif
 	hyp_write_unlock(&vm_table_lock);
 
 	/*
@@ -2897,6 +2922,189 @@ bool pkvm_g2g_msg_selftest(void)
 
 	return !bad;
 }
+
+/*
+ * ============================================================================
+ * Guest-to-guest page sharing: the handlers. IMPLEMENTED.
+ * ============================================================================
+ *
+ * The contract is at ARM_SMCCC_VENDOR_HYP_KVM_GUEST_SHARE_OFFER_FUNC_ID in
+ * <linux/arm-smccc.h>; the decisions and transitions are in mem_protect.c.
+ * These handlers find out what needs vm_table - who holds a named identity, at
+ * which incarnation, whether it is dying or unprotected, whether the caller has
+ * an identity and is enrolled in MMIO guard - and pass it on as facts. They
+ * hold vm_table_lock for read across the call, so a named peer can be neither
+ * freed nor start teardown meanwhile: the order is vm_table_lock ->
+ * host_mmu.lock -> one guest lock, as __pkvm_reclaim_dying_guest_page() already
+ * takes them.
+ *
+ * NEED_* verdicts become a host request and a re-executed HVC, as
+ * pkvm_memshare_call() does it; that exit carries no guest registers
+ * (sync_hyp_vcpu() copies nothing for ARM_EXCEPTION_HYP_REQ). Every other
+ * verdict is answered here. A handler returns false only once such a request is
+ * set up: handle_pvm_exit_hvc64() BUG()s on a function id it does not know, so
+ * a plain forward would turn a guest's call into a hypervisor panic.
+ */
+
+/* What @self naming @lo:@hi at @incarnation amounts to. vm_table_lock held. */
+static u32 pkvm_g2g_share_peer_facts(struct pkvm_hyp_vm *self, u64 lo, u64 hi,
+				     u64 incarnation, struct pkvm_hyp_vm **peer)
+{
+	u32 facts = 0;
+
+	if (!lo && !hi)
+		facts |= PKVM_G2G_SHARE_PEER_ID_ZERO;
+	if (!incarnation)
+		facts |= PKVM_G2G_SHARE_PEER_INC_ZERO;
+	if (!self->g2g_id.lo && !self->g2g_id.hi)
+		facts |= PKVM_G2G_SHARE_UNREGISTERED;
+	else if (self->g2g_id.lo == lo && self->g2g_id.hi == hi)
+		facts |= PKVM_G2G_SHARE_TO_SELF;
+
+	/* NULL for (0, 0); otherwise the one VM holding the name, if any. */
+	*peer = pkvm_g2g_vm_by_identity(lo, hi);
+	if (*peer) {
+		facts |= PKVM_G2G_SHARE_PEER_FOUND;
+		if (*peer == self)
+			facts |= PKVM_G2G_SHARE_TO_SELF;
+		if ((*peer)->is_dying)
+			facts |= PKVM_G2G_SHARE_PEER_DYING;
+		if (!pkvm_hyp_vm_is_protected(*peer))
+			facts |= PKVM_G2G_SHARE_PEER_UNPROTECTED;
+		if ((*peer)->g2g_id.incarnation != incarnation)
+			facts |= PKVM_G2G_SHARE_PEER_STALE;
+	}
+
+	return facts;
+}
+
+/* Answer, or turn a NEED_* verdict into a host request. Returns as the handlers do. */
+static bool pkvm_g2g_share_answer(struct pkvm_hyp_vcpu *hyp_vcpu,
+				  enum pkvm_g2g_share_verdict v, u64 ipa,
+				  u64 nr_pages, u64 x1, u64 *exit_code)
+{
+	struct kvm_vcpu *vcpu = &hyp_vcpu->vcpu;
+	int ret;
+
+	switch (v) {
+	case PKVM_G2G_SHARE_NEED_MAP:
+		ret = pkvm_request_map(hyp_vcpu, ipa, nr_pages, exit_code);
+		break;
+	case PKVM_G2G_SHARE_NEED_SPLIT:
+		ret = pkvm_request_split(hyp_vcpu, ipa, nr_pages, exit_code);
+		break;
+	case PKVM_G2G_SHARE_NEED_MEMCACHE:
+		ret = pkvm_request_vcpu_memcache(hyp_vcpu, exit_code);
+		break;
+	default:
+		smccc_set_retval(vcpu, pkvm_g2g_share_verdict_to_smccc(v),
+				 v == PKVM_G2G_SHARE_DO ? x1 : 0, 0, 0);
+		return true;
+	}
+
+	if (!ret)
+		return false;	/* to the host, then this HVC again */
+
+	/*
+	 * The request page is full of requests the host has yet to serve.
+	 * That is as transient as the request itself: exit anyway so that the
+	 * host serves them, and run this HVC again, rather than answer the
+	 * guest as though its call were malformed. A split request that
+	 * pkvm_request_split() queued before running out of room is served
+	 * too, which is harmless: the HVC asks again for whatever is left.
+	 */
+	write_sysreg_el2(read_sysreg_el2(SYS_ELR) - 4, SYS_ELR);
+	*exit_code = ARM_EXCEPTION_HYP_REQ;
+	return false;
+}
+
+/*
+ * TODO(g2g): pages an owner has offered are not accounted anywhere. Decide
+ * whether they should be. protected_shared_mem counts memory a guest exposed
+ * to the *host* and must not be reused for this: a guest-to-guest share
+ * exposes nothing to the host, and conflating the two would misreport the
+ * host's view of guest memory.
+ */
+static bool pkvm_guest_share_offer_call(struct pkvm_hyp_vcpu *hyp_vcpu,
+					u64 *exit_code)
+{
+	struct pkvm_hyp_vm *self = pkvm_hyp_vcpu_to_hyp_vm(hyp_vcpu);
+	struct kvm_vcpu *vcpu = &hyp_vcpu->vcpu;
+	u64 ipa = smccc_get_arg1(vcpu), nr_pages = smccc_get_arg2(vcpu);
+	struct pkvm_g2g_identity to = {
+		.lo		= smccc_get_arg3(vcpu),
+		.hi		= smccc_get_arg4(vcpu),
+		.incarnation	= smccc_get_arg5(vcpu),
+	};
+	enum pkvm_g2g_share_verdict v;
+	struct pkvm_hyp_vm *peer;
+	u64 handle;
+	u32 facts;
+
+	hyp_read_lock(&vm_table_lock);
+	facts = pkvm_g2g_share_peer_facts(self, to.lo, to.hi, to.incarnation,
+					  &peer);
+	v = pkvm_g2g_share_offer(hyp_vcpu, facts, ipa, nr_pages,
+				 smccc_get_arg6(vcpu), &to, &handle);
+	hyp_read_unlock(&vm_table_lock);
+
+	return pkvm_g2g_share_answer(hyp_vcpu, v, ipa, nr_pages, handle,
+				     exit_code);
+}
+
+static bool pkvm_guest_share_accept_call(struct pkvm_hyp_vcpu *hyp_vcpu,
+					 u64 *exit_code)
+{
+	struct pkvm_hyp_vm *self = pkvm_hyp_vcpu_to_hyp_vm(hyp_vcpu);
+	struct kvm_vcpu *vcpu = &hyp_vcpu->vcpu;
+	u64 ipa = smccc_get_arg1(vcpu), nr_pages = smccc_get_arg2(vcpu);
+	enum pkvm_g2g_share_verdict v;
+	struct pkvm_hyp_vm *owner;
+	u64 share_flags;
+	u32 facts;
+
+	hyp_read_lock(&vm_table_lock);
+	facts = pkvm_g2g_share_peer_facts(self, smccc_get_arg3(vcpu),
+					  smccc_get_arg4(vcpu),
+					  smccc_get_arg5(vcpu), &owner);
+	if (!test_bit(KVM_ARCH_FLAG_MMIO_GUARD, &self->kvm.arch.flags))
+		facts |= PKVM_G2G_SHARE_NO_MMIO_GUARD;
+	v = pkvm_g2g_share_accept(hyp_vcpu, owner, facts, ipa, nr_pages,
+				  smccc_get_arg6(vcpu), vcpu_get_reg(vcpu, 7),
+				  &share_flags);
+	hyp_read_unlock(&vm_table_lock);
+
+	return pkvm_g2g_share_answer(hyp_vcpu, v, ipa, nr_pages, share_flags,
+				     exit_code);
+}
+
+static bool pkvm_guest_share_revoke_call(struct pkvm_hyp_vcpu *hyp_vcpu,
+					 u64 *exit_code)
+{
+	struct kvm_vcpu *vcpu = &hyp_vcpu->vcpu;
+	enum pkvm_g2g_share_verdict v;
+
+	hyp_read_lock(&vm_table_lock);
+	v = pkvm_g2g_share_revoke(hyp_vcpu, smccc_get_arg1(vcpu),
+				  smccc_get_arg2(vcpu));
+	hyp_read_unlock(&vm_table_lock);
+
+	return pkvm_g2g_share_answer(hyp_vcpu, v, 0, 0, 0, exit_code);
+}
+
+static bool pkvm_guest_share_release_call(struct pkvm_hyp_vcpu *hyp_vcpu,
+					  u64 *exit_code)
+{
+	struct kvm_vcpu *vcpu = &hyp_vcpu->vcpu;
+	enum pkvm_g2g_share_verdict v;
+
+	hyp_read_lock(&vm_table_lock);
+	v = pkvm_g2g_share_release(hyp_vcpu, smccc_get_arg1(vcpu),
+				   smccc_get_arg2(vcpu));
+	hyp_read_unlock(&vm_table_lock);
+
+	return pkvm_g2g_share_answer(hyp_vcpu, v, 0, 0, 0, exit_code);
+}
 #endif /* CONFIG_PKVM_GUEST_TO_GUEST */
 
 static bool pkvm_install_ioguard_page(struct pkvm_hyp_vcpu *hyp_vcpu,
@@ -3264,6 +3472,17 @@ bool kvm_handle_pvm_hvc64(struct kvm_vcpu *vcpu, u64 *exit_code)
 		/* Calls 12-20, or none of them if an EL2 self-check failed. */
 		val[0] |= pkvm_g2g_features();
 #endif
+		/*
+		 * Guest-to-guest calls are advertised only with
+		 * CONFIG_PKVM_GUEST_TO_GUEST (default n): identity (14-16),
+		 * messages (17, 18) and page sharing (12, 13, 19, 20) - and
+		 * none of them if an EL2 guest-to-guest self-check failed (see
+		 * pkvm_g2g_enabled). Without the option none of them exists.
+		 * Do not advertise sharing unconditionally before the items in
+		 * Documentation/virt/kvm/arm/pkvm-guest-to-guest.rst, "What is
+		 * left", are settled: advertising a memory-sharing primitive is
+		 * how a guest ends up trusting it.
+		 */
 		break;
 	case ARM_SMCCC_VENDOR_HYP_KVM_MMIO_GUARD_ENROLL_FUNC_ID:
 		set_bit(KVM_ARCH_FLAG_MMIO_GUARD, &vcpu->kvm->arch.flags);
@@ -3285,6 +3504,14 @@ bool kvm_handle_pvm_hvc64(struct kvm_vcpu *vcpu, u64 *exit_code)
 	case ARM_SMCCC_VENDOR_HYP_KVM_MEM_RELINQUISH_FUNC_ID:
 		return pkvm_memrelinquish_call(hyp_vcpu, exit_code);
 #ifdef CONFIG_PKVM_GUEST_TO_GUEST
+	case ARM_SMCCC_VENDOR_HYP_KVM_GUEST_SHARE_OFFER_FUNC_ID:
+		return pkvm_guest_share_offer_call(hyp_vcpu, exit_code);
+	case ARM_SMCCC_VENDOR_HYP_KVM_GUEST_SHARE_REVOKE_FUNC_ID:
+		return pkvm_guest_share_revoke_call(hyp_vcpu, exit_code);
+	case ARM_SMCCC_VENDOR_HYP_KVM_GUEST_SHARE_ACCEPT_FUNC_ID:
+		return pkvm_guest_share_accept_call(hyp_vcpu, exit_code);
+	case ARM_SMCCC_VENDOR_HYP_KVM_GUEST_SHARE_RELEASE_FUNC_ID:
+		return pkvm_guest_share_release_call(hyp_vcpu, exit_code);
 	case ARM_SMCCC_VENDOR_HYP_KVM_GUEST_ID_REGISTER_FUNC_ID:
 		return pkvm_guest_id_register_call(hyp_vcpu);
 	case ARM_SMCCC_VENDOR_HYP_KVM_GUEST_ID_SELF_FUNC_ID:

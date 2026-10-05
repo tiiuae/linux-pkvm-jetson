@@ -59,8 +59,22 @@ static void enter_vmid_context(struct kvm_s2_mmu *mmu,
 		 * to be called from within __kvm_vcpu_run(), which ensures that
 		 * __hyp_running_vcpu is set to the current guest vcpu.
 		 */
+#ifdef CONFIG_PKVM_GUEST_TO_GUEST
+		/*
+		 * Guest-to-guest sharing: an owner's GUEST_SHARE_REVOKE takes
+		 * the pages out of the borrower's stage-2 while the owner's
+		 * vCPU is the one loaded, so the flush is for another guest's
+		 * VMID. Switch to that guest's stage-2 for the flush, as host
+		 * context already does; exit_vmid_context() puts back the
+		 * running vCPU's. Without the option, a foreign guest stage-2
+		 * here is still a bug, and still WARNs.
+		 */
+		if (mmu == vcpu->arch.hw_mmu)
+			return;
+#else
 		if (mmu == vcpu->arch.hw_mmu || WARN_ON(mmu != host_s2_mmu))
 			return;
+#endif
 
 		cxt->mmu = vcpu->arch.hw_mmu;
 	} else {
@@ -107,10 +121,17 @@ static void enter_vmid_context(struct kvm_s2_mmu *mmu,
 	 * ensuring that we always have an ISB, but not two ISBs back
 	 * to back.
 	 */
+#ifdef CONFIG_PKVM_GUEST_TO_GUEST
+	if (vcpu && mmu == host_s2_mmu)
+		__load_host_stage2();
+	else
+		__load_stage2(mmu, kern_hyp_va(mmu->arch));
+#else
 	if (vcpu)
 		__load_host_stage2();
 	else
 		__load_stage2(mmu, kern_hyp_va(mmu->arch));
+#endif
 
 	asm(ALTERNATIVE("isb", "nop", ARM64_WORKAROUND_SPECULATIVE_AT));
 }

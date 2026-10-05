@@ -45,6 +45,9 @@ static void *hyp_pgt_base;
 static void *host_s2_pgt_base;
 static void *host_s2_mmio_base;
 static void *selftest_base;
+#ifdef CONFIG_PKVM_GUEST_TO_GUEST
+static void *g2g_selftest_base;
+#endif
 static void *ffa_proxy_pages;
 static struct kvm_pgtable_mm_ops pkvm_pgtable_mm_ops;
 static struct hyp_pool hpool;
@@ -60,6 +63,13 @@ static int divide_memory_pool(void *virt, unsigned long size)
 	selftest_base = hyp_early_alloc_contig(nr_pages);
 	if (nr_pages && !selftest_base)
 		return -ENOMEM;
+
+#ifdef CONFIG_PKVM_GUEST_TO_GUEST
+	nr_pages = pkvm_g2g_selftest_pages();
+	g2g_selftest_base = hyp_early_alloc_contig(nr_pages);
+	if (!g2g_selftest_base)
+		return -ENOMEM;
+#endif
 
 	nr_pages = hyp_vmemmap_pages(sizeof(struct hyp_page));
 	vmemmap_base = hyp_early_alloc_contig(nr_pages);
@@ -411,7 +421,7 @@ void __noreturn __pkvm_init_finalise(void)
 	unsigned long nr_pages, reserved_pages, pfn;
 	int ret;
 #ifdef CONFIG_PKVM_GUEST_TO_GUEST
-	bool g2g_reclaim_ok, g2g_msg_ok;
+	bool g2g_reclaim_ok, g2g_msg_ok, g2g_share_ok;
 #endif
 
 	/* Now that the vmemmap is backed, install the full-fledged allocator */
@@ -496,8 +506,25 @@ void __noreturn __pkvm_init_finalise(void)
 	 */
 	g2g_msg_ok = pkvm_g2g_msg_selftest();
 
-	/* Fail closed: guest-to-guest is enabled only if both checks passed. */
-	pkvm_g2g_enabled = g2g_reclaim_ok && g2g_msg_ok;
+	/*
+	 * Guest-to-guest sharing: every decision, then the real transitions on
+	 * two scratch VMs, in the pages the host reserved for nothing else
+	 * (pkvm_g2g_selftest_pages()). Its lifecycle ends by reclaiming those
+	 * pages through the host's real reclaim path, which takes the
+	 * guest-to-guest branch only while pkvm_g2g_enabled is set; so the flag
+	 * is set from the reclaim check's verdict while it runs. No guest exists
+	 * yet, so nothing else sees that provisional value.
+	 */
+	pkvm_g2g_enabled = g2g_reclaim_ok;
+	g2g_share_ok = pkvm_g2g_share_selftest(g2g_selftest_base,
+					       pkvm_g2g_selftest_pages());
+
+	/*
+	 * Fail closed: guest-to-guest is enabled only if all three checks ran
+	 * and passed. All three always run, so that the host can report each.
+	 * This is the flag's last write, and no guest exists yet.
+	 */
+	pkvm_g2g_enabled = g2g_reclaim_ok && g2g_msg_ok && g2g_share_ok;
 #endif
 out:
 	/*

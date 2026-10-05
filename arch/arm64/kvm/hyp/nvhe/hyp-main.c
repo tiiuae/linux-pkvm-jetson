@@ -207,6 +207,26 @@ static void handle_pvm_entry_hvc64(struct pkvm_hyp_vcpu *hyp_vcpu)
 	case ARM_SMCCC_VENDOR_HYP_KVM_DEV_REQ_PWR_FUNC_ID:
 		pkvm_device_request_power_pvm_entry(hyp_vcpu);
 		break;
+#ifdef CONFIG_PKVM_GUEST_TO_GUEST
+	case ARM_SMCCC_VENDOR_HYP_KVM_GUEST_SHARE_OFFER_FUNC_ID:
+		fallthrough;
+	case ARM_SMCCC_VENDOR_HYP_KVM_GUEST_SHARE_REVOKE_FUNC_ID:
+		fallthrough;
+	case ARM_SMCCC_VENDOR_HYP_KVM_GUEST_SHARE_ACCEPT_FUNC_ID:
+		fallthrough;
+	case ARM_SMCCC_VENDOR_HYP_KVM_GUEST_SHARE_RELEASE_FUNC_ID:
+		/*
+		 * Guest-to-guest share calls are answered at EL2, or leave as an
+		 * ARM_EXCEPTION_HYP_REQ exit that re-enters through
+		 * __flush_hyp_reqs() and re-executes the HVC; none of them exits
+		 * to the host as a trap, so the host never gets to influence the
+		 * result of an operation between two VMs that do not trust it.
+		 * They are listed so that one which somehow did is refused here
+		 * rather than taken for a PSCI call.
+		 */
+		vcpu_set_reg(&hyp_vcpu->vcpu, 0, SMCCC_RET_NOT_SUPPORTED);
+		break;
+#endif
 	default:
 		handle_pvm_entry_psci(hyp_vcpu);
 		break;

@@ -110,6 +110,21 @@ static struct kvm_pgtable_pte_ops guest_s2_pte_ops = {
 	.pte_is_counted_cb = guest_stage2_pte_is_counted
 };
 
+/*
+ * TODO(g2g): this cannot nest. current_vm is a single per-CPU slot, consumed
+ * by the guest stage-2 page allocator callbacks (guest_s2_zalloc_page() and
+ * friends) to find the memcache to allocate from. Locking a second guest
+ * clobbers it, and the inner unlock clears it, so the outer VM's allocations
+ * would then run against a NULL current_vm.
+ *
+ * This is why the guest-to-guest share transitions never hold two guest locks:
+ * ACCEPT reads the owner's stage-2 under the owner's lock, drops it, and maps
+ * into the borrower's under the borrower's (see the lock order of the
+ * guest-to-guest share transitions below). Anything that needs two guests'
+ * stage-2 tables locked at once needs current_vm to become a shallow stack
+ * and/or the mm_ops callbacks to take the vm explicitly, which reaches into
+ * guest_s2_pte_ops and the kvm_pgtable_mm_ops plumbing.
+ */
 static void guest_lock_component(struct pkvm_hyp_vm *vm)
 {
 	hyp_spin_lock(&vm->pgtable_lock);
@@ -540,6 +555,15 @@ static int ___pkvm_guest_relinquish_to_module(struct pkvm_hyp_vcpu *vcpu, u64 ip
 
 static enum pkvm_page_state guest_get_page_state(kvm_pte_t pte, u64 addr);
 
+/*
+ * TODO(g2g): this path poisons a page on its way out of a guest and hands
+ * ownership to the host. It requires the page to be PKVM_PAGE_OWNED, so a
+ * page that VM A has offered to a peer (PKVM_PAGE_SHARED_OWNED |
+ * PKVM_PAGE_G2G) is refused here with -EPERM, like any page in the wrong
+ * state. That is the safe answer but not an informative one: either keep
+ * refusing, with an error the caller can tell apart, or revoke the share
+ * first. It must never poison while a peer still has the page mapped.
+ */
 int __pkvm_guest_relinquish_to_host(struct pkvm_hyp_vcpu *vcpu,
 				    u64 ipa, u64 flags, u64 *ppa)
 {
@@ -1723,6 +1747,1427 @@ unlock:
 	return ret;
 }
 
+#ifdef CONFIG_PKVM_GUEST_TO_GUEST
+/*
+ * ============================================================================
+ * Guest-to-guest sharing, 1 of 3: the decisions. Pure; no locks, no state.
+ * ============================================================================
+ *
+ * Every share call is decided the way GUEST_MSG_SEND is: the handler finds out
+ * a set of facts, and a pure, total function of the facts gives the verdict.
+ * The transitions in section 2 only gather facts and carry verdicts out, and
+ * pkvm_g2g_share_verdict_selftest() enumerates every fact set at EL2 init.
+ *
+ * The order of the tests in each function is the order of precedence, and it
+ * is load-bearing twice over:
+ *
+ *  - a malformed call is refused before anything else is consulted, a caller
+ *    with no identity before anything about the peer, and a call naming a dead
+ *    or unknown peer before the share table or a page table is looked at, so
+ *    that a refused call learns as little as possible;
+ *  - every fact a transition can only find out with locks held is tested after
+ *    every fact it can find out without them. A verdict reached before taking
+ *    the locks therefore cannot be changed by what the locks would reveal, and
+ *    the transitions return early without locking. The self-check proves this
+ *    for every input (O3, A3, E1).
+ *
+ * NEED_MAP, NEED_SPLIT and NEED_MEMCACHE are not answers: the handler turns
+ * them into a request to the host and re-executes the HVC. They are reached
+ * only when nothing else stands in the way (O4, A4), so the host is never asked
+ * for work that could not let the call succeed.
+ */
+
+/* OFFER: the shape of the call. */
+#define PKVM_G2G_OFFER_FLAGS_BAD	BIT(9)	/* x6 has a bit other than RO */
+#define PKVM_G2G_OFFER_NR_BAD		BIT(10)	/* nr_pages is 0 or > 512 */
+#define PKVM_G2G_OFFER_IPA_BAD		BIT(11)	/* unaligned, or not inside the IPA space */
+/* OFFER: found out with the host and owner locks held. */
+#define PKVM_G2G_OFFER_STATE		BIT(12)	/* a page is not exclusively the caller's */
+#define PKVM_G2G_OFFER_LIMIT		BIT(13)	/* the table or the caller's quota is full */
+#define PKVM_G2G_OFFER_UNMAPPED		BIT(14)	/* a page is not mapped in yet */
+#define PKVM_G2G_OFFER_STRADDLE		BIT(15)	/* a block crosses an end of the range */
+#define PKVM_G2G_OFFER_LOCKED		GENMASK(15, 12)
+/* Every fact an OFFER can carry. PKVM_G2G_SHARE_NO_MMIO_GUARD is not one. */
+#define PKVM_G2G_OFFER_FACTS		(GENMASK(7, 0) | GENMASK(15, 9))
+
+/* ACCEPT: the shape of the call. */
+#define PKVM_G2G_ACCEPT_FLAGS_BAD	BIT(9)	/* x7 != 0 */
+#define PKVM_G2G_ACCEPT_NR_BAD		BIT(10)	/* nr_pages is 0 or > 512 */
+/* Unaligned, past the IPA space, or crossing a last-level table: */
+#define PKVM_G2G_ACCEPT_IPA_BAD		BIT(11)
+/* ACCEPT: found out with the host lock held. */
+#define PKVM_G2G_ACCEPT_NO_SHARE	BIT(12)	/* no such offer, by that owner, to the caller */
+#define PKVM_G2G_ACCEPT_TAKEN		BIT(13)	/* the share is already accepted */
+#define PKVM_G2G_ACCEPT_OWNER_STATE	BIT(14)	/* the owner's pages are not as offered */
+#define PKVM_G2G_ACCEPT_DEST_BUSY	BIT(15)	/* the destination is not all-empty */
+#define PKVM_G2G_ACCEPT_MEMCACHE_LOW	BIT(16)	/* the memcache cannot cover a table path */
+#define PKVM_G2G_ACCEPT_LOCKED		GENMASK(16, 12)
+#define PKVM_G2G_ACCEPT_FACTS		GENMASK(16, 0)
+
+/* REVOKE and RELEASE. */
+#define PKVM_G2G_END_FLAGS_BAD		BIT(0)	/* x2 != 0 */
+#define PKVM_G2G_END_NO_SHARE		BIT(1)	/* no such share for the caller in this role */
+#define PKVM_G2G_END_DIVERGED		BIT(2)	/* the page tables disagree with the record */
+#define PKVM_G2G_END_LOCKED		GENMASK(2, 1)
+#define PKVM_G2G_END_FACTS		GENMASK(2, 0)
+
+/* A call that names a peer is malformed if the name is not one. */
+#define PKVM_G2G_SHARE_MALFORMED_PEER	(PKVM_G2G_SHARE_PEER_ID_ZERO |	\
+					 PKVM_G2G_SHARE_PEER_INC_ZERO |	\
+					 PKVM_G2G_SHARE_TO_SELF)
+/* ...and has no peer unless a live, protected VM holds it at that incarnation. */
+#define PKVM_G2G_SHARE_PEER_GONE	(PKVM_G2G_SHARE_PEER_DYING |	\
+					 PKVM_G2G_SHARE_PEER_UNPROTECTED | \
+					 PKVM_G2G_SHARE_PEER_STALE)
+
+static enum pkvm_g2g_share_verdict pkvm_g2g_offer_verdict(u32 facts)
+{
+	/* A fact no OFFER can carry: refuse rather than guess. */
+	if (facts & ~PKVM_G2G_OFFER_FACTS)
+		return PKVM_G2G_SHARE_INVALID;
+
+	if (facts & (PKVM_G2G_OFFER_FLAGS_BAD | PKVM_G2G_OFFER_NR_BAD |
+		     PKVM_G2G_OFFER_IPA_BAD | PKVM_G2G_SHARE_MALFORMED_PEER))
+		return PKVM_G2G_SHARE_INVALID;
+
+	if (facts & PKVM_G2G_SHARE_UNREGISTERED)
+		return PKVM_G2G_SHARE_NO_IDENTITY;
+
+	if (!(facts & PKVM_G2G_SHARE_PEER_FOUND) ||
+	    (facts & PKVM_G2G_SHARE_PEER_GONE))
+		return PKVM_G2G_SHARE_NO_PEER;
+
+	if (facts & PKVM_G2G_OFFER_STATE)
+		return PKVM_G2G_SHARE_DENIED;
+
+	if (facts & PKVM_G2G_OFFER_LIMIT)
+		return PKVM_G2G_SHARE_LIMIT;
+
+	if (facts & PKVM_G2G_OFFER_UNMAPPED)
+		return PKVM_G2G_SHARE_NEED_MAP;
+
+	if (facts & PKVM_G2G_OFFER_STRADDLE)
+		return PKVM_G2G_SHARE_NEED_SPLIT;
+
+	return PKVM_G2G_SHARE_DO;
+}
+
+static enum pkvm_g2g_share_verdict pkvm_g2g_accept_verdict(u32 facts)
+{
+	if (facts & ~PKVM_G2G_ACCEPT_FACTS)
+		return PKVM_G2G_SHARE_INVALID;
+
+	if (facts & (PKVM_G2G_ACCEPT_FLAGS_BAD | PKVM_G2G_ACCEPT_NR_BAD |
+		     PKVM_G2G_ACCEPT_IPA_BAD | PKVM_G2G_SHARE_MALFORMED_PEER))
+		return PKVM_G2G_SHARE_INVALID;
+
+	if (facts & PKVM_G2G_SHARE_UNREGISTERED)
+		return PKVM_G2G_SHARE_NO_IDENTITY;
+
+	if (!(facts & PKVM_G2G_SHARE_PEER_FOUND) ||
+	    (facts & PKVM_G2G_SHARE_PEER_GONE))
+		return PKVM_G2G_SHARE_NO_PEER;
+
+	/*
+	 * Without MMIO guard, a touch of the window after the share ends would
+	 * show the host the access's data register. Refused before the share is
+	 * looked at, so the answer says nothing about the table.
+	 */
+	if (facts & PKVM_G2G_SHARE_NO_MMIO_GUARD)
+		return PKVM_G2G_SHARE_DENIED;
+
+	if (facts & PKVM_G2G_ACCEPT_NO_SHARE)
+		return PKVM_G2G_SHARE_NO_SHARE;
+
+	if (facts & (PKVM_G2G_ACCEPT_TAKEN | PKVM_G2G_ACCEPT_OWNER_STATE |
+		     PKVM_G2G_ACCEPT_DEST_BUSY))
+		return PKVM_G2G_SHARE_DENIED;
+
+	if (facts & PKVM_G2G_ACCEPT_MEMCACHE_LOW)
+		return PKVM_G2G_SHARE_NEED_MEMCACHE;
+
+	return PKVM_G2G_SHARE_DO;
+}
+
+/* REVOKE (owner) and RELEASE (borrower) are decided alike. */
+static enum pkvm_g2g_share_verdict pkvm_g2g_end_verdict(u32 facts)
+{
+	if (facts & ~PKVM_G2G_END_FACTS)
+		return PKVM_G2G_SHARE_INVALID;
+
+	if (facts & PKVM_G2G_END_FLAGS_BAD)
+		return PKVM_G2G_SHARE_INVALID;
+
+	if (facts & PKVM_G2G_END_NO_SHARE)
+		return PKVM_G2G_SHARE_NO_SHARE;
+
+	if (facts & PKVM_G2G_END_DIVERGED)
+		return PKVM_G2G_SHARE_DENIED;
+
+	return PKVM_G2G_SHARE_DO;
+}
+
+unsigned long pkvm_g2g_share_verdict_to_smccc(enum pkvm_g2g_share_verdict v)
+{
+	switch (v) {
+	case PKVM_G2G_SHARE_DO:
+		return SMCCC_RET_SUCCESS;
+	case PKVM_G2G_SHARE_INVALID:
+		return SMCCC_RET_INVALID_PARAMETER;
+	case PKVM_G2G_SHARE_NO_IDENTITY:
+		return ARM_SMCCC_KVM_G2G_MSG_NO_IDENTITY;
+	case PKVM_G2G_SHARE_NO_PEER:
+		return ARM_SMCCC_KVM_G2G_MSG_NO_PEER;
+	case PKVM_G2G_SHARE_NO_SHARE:
+		return ARM_SMCCC_KVM_G2G_SHARE_NO_SHARE;
+	case PKVM_G2G_SHARE_DENIED:
+		return ARM_SMCCC_KVM_G2G_SHARE_DENIED;
+	case PKVM_G2G_SHARE_LIMIT:
+		return ARM_SMCCC_KVM_G2G_SHARE_LIMIT;
+	default:
+		/* NEED_*: turned into a host request, never returned. */
+		return SMCCC_RET_NOT_SUPPORTED;
+	}
+}
+
+/*
+ * The share self-check's verdict, read and reported by the host in
+ * finalize_pkvm() like the reclaim and mailbox checks: no hyp serial driver
+ * exists this early, and a hyp WARN is fatal. _inputs == 0 means the decision
+ * check did not run and _steps == 0 that the lifecycle check (section 3) did
+ * not. _first_bad names the first failure as (check << 16) | input, the check
+ * being a PKVM_G2G_SHARE_CHK_* value.
+ */
+u32 pkvm_g2g_share_selftest_inputs;
+u32 pkvm_g2g_share_selftest_cases;
+u32 pkvm_g2g_share_selftest_steps;
+u32 pkvm_g2g_share_selftest_failures;
+u32 pkvm_g2g_share_selftest_first_bad;
+
+enum {
+	PKVM_G2G_SHARE_CHK_O1 = 1,	/* OFFER: DO from exactly one fact set */
+	PKVM_G2G_SHARE_CHK_O2,		/* OFFER: malformed or unknown is INVALID */
+	PKVM_G2G_SHARE_CHK_O3,		/* OFFER: locked facts never change an early verdict */
+	PKVM_G2G_SHARE_CHK_O4,		/* OFFER: a host request only when nothing refuses */
+	PKVM_G2G_SHARE_CHK_O5,		/* OFFER: only verdicts an OFFER can have */
+	PKVM_G2G_SHARE_CHK_A1,		/* ACCEPT: as O1 */
+	PKVM_G2G_SHARE_CHK_A2,		/* ACCEPT: as O2 */
+	PKVM_G2G_SHARE_CHK_A3,		/* ACCEPT: as O3 */
+	PKVM_G2G_SHARE_CHK_A4,		/* ACCEPT: as O4 */
+	PKVM_G2G_SHARE_CHK_A5,		/* ACCEPT: as O5 */
+	PKVM_G2G_SHARE_CHK_E1,		/* REVOKE/RELEASE: all of the above */
+	PKVM_G2G_SHARE_CHK_M1,		/* the SMCCC codes */
+	PKVM_G2G_SHARE_CHK_CASE,	/* a named case */
+	PKVM_G2G_SHARE_CHK_STEP,	/* a lifecycle step, section 3 */
+};
+
+static void pkvm_g2g_share_check(bool ok, u32 check, u32 what)
+{
+	if (ok)
+		return;
+	if (!pkvm_g2g_share_selftest_failures)
+		pkvm_g2g_share_selftest_first_bad = (check << 16) | (what & 0xffff);
+	pkvm_g2g_share_selftest_failures++;
+}
+
+static bool pkvm_g2g_share_is_request(enum pkvm_g2g_share_verdict v)
+{
+	return v == PKVM_G2G_SHARE_NEED_MAP || v == PKVM_G2G_SHARE_NEED_SPLIT ||
+	       v == PKVM_G2G_SHARE_NEED_MEMCACHE;
+}
+
+/*
+ * Every OFFER fact set (2^16), every ACCEPT fact set (2^17), every REVOKE and
+ * RELEASE fact set (2^3), every verdict's SMCCC code, then named cases, so that
+ * a change of meaning that keeps the invariants is still caught.
+ */
+void pkvm_g2g_share_verdict_selftest(void)
+{
+	static const struct {
+		u8 op;			/* 0 OFFER, 1 ACCEPT, 2 REVOKE/RELEASE */
+		u32 facts;
+		enum pkvm_g2g_share_verdict want;
+	} cases[] = {
+		/* OFFER */
+		{ 0, PKVM_G2G_SHARE_PEER_FOUND, PKVM_G2G_SHARE_DO },
+		{ 0, PKVM_G2G_SHARE_PEER_FOUND | PKVM_G2G_SHARE_TO_SELF,
+		  PKVM_G2G_SHARE_INVALID },
+		{ 0, PKVM_G2G_SHARE_PEER_FOUND | PKVM_G2G_SHARE_UNREGISTERED,
+		  PKVM_G2G_SHARE_NO_IDENTITY },
+		{ 0, 0, PKVM_G2G_SHARE_NO_PEER },
+		{ 0, PKVM_G2G_SHARE_PEER_FOUND | PKVM_G2G_SHARE_PEER_DYING,
+		  PKVM_G2G_SHARE_NO_PEER },
+		{ 0, PKVM_G2G_SHARE_PEER_FOUND | PKVM_G2G_SHARE_PEER_STALE,
+		  PKVM_G2G_SHARE_NO_PEER },
+		{ 0, PKVM_G2G_SHARE_PEER_FOUND |
+		     PKVM_G2G_SHARE_PEER_UNPROTECTED, PKVM_G2G_SHARE_NO_PEER },
+		{ 0, PKVM_G2G_SHARE_PEER_FOUND | PKVM_G2G_OFFER_STATE,
+		  PKVM_G2G_SHARE_DENIED },
+		{ 0, PKVM_G2G_SHARE_PEER_FOUND | PKVM_G2G_OFFER_LIMIT,
+		  PKVM_G2G_SHARE_LIMIT },
+		{ 0, PKVM_G2G_SHARE_PEER_FOUND | PKVM_G2G_OFFER_UNMAPPED,
+		  PKVM_G2G_SHARE_NEED_MAP },
+		{ 0, PKVM_G2G_SHARE_PEER_FOUND | PKVM_G2G_OFFER_STRADDLE,
+		  PKVM_G2G_SHARE_NEED_SPLIT },
+		/* a page in the wrong state is refused, not mapped in for nothing */
+		{ 0, PKVM_G2G_SHARE_PEER_FOUND | PKVM_G2G_OFFER_STATE |
+		     PKVM_G2G_OFFER_UNMAPPED, PKVM_G2G_SHARE_DENIED },
+		/* a full table is refused, not split for nothing */
+		{ 0, PKVM_G2G_SHARE_PEER_FOUND | PKVM_G2G_OFFER_LIMIT |
+		     PKVM_G2G_OFFER_STRADDLE, PKVM_G2G_SHARE_LIMIT },
+		{ 0, PKVM_G2G_SHARE_PEER_FOUND | PKVM_G2G_SHARE_NO_MMIO_GUARD,
+		  PKVM_G2G_SHARE_INVALID },
+		/* ACCEPT */
+		{ 1, PKVM_G2G_SHARE_PEER_FOUND, PKVM_G2G_SHARE_DO },
+		{ 1, PKVM_G2G_SHARE_PEER_FOUND | PKVM_G2G_SHARE_UNREGISTERED |
+		     PKVM_G2G_ACCEPT_NO_SHARE, PKVM_G2G_SHARE_NO_IDENTITY },
+		{ 1, PKVM_G2G_SHARE_PEER_FOUND | PKVM_G2G_SHARE_PEER_STALE |
+		     PKVM_G2G_ACCEPT_NO_SHARE, PKVM_G2G_SHARE_NO_PEER },
+		{ 1, PKVM_G2G_SHARE_PEER_FOUND | PKVM_G2G_SHARE_NO_MMIO_GUARD |
+		     PKVM_G2G_ACCEPT_NO_SHARE, PKVM_G2G_SHARE_DENIED },
+		{ 1, PKVM_G2G_SHARE_PEER_FOUND | PKVM_G2G_ACCEPT_NO_SHARE |
+		     PKVM_G2G_ACCEPT_TAKEN, PKVM_G2G_SHARE_NO_SHARE },
+		{ 1, PKVM_G2G_SHARE_PEER_FOUND | PKVM_G2G_ACCEPT_TAKEN,
+		  PKVM_G2G_SHARE_DENIED },
+		{ 1, PKVM_G2G_SHARE_PEER_FOUND | PKVM_G2G_ACCEPT_OWNER_STATE,
+		  PKVM_G2G_SHARE_DENIED },
+		{ 1, PKVM_G2G_SHARE_PEER_FOUND | PKVM_G2G_ACCEPT_DEST_BUSY,
+		  PKVM_G2G_SHARE_DENIED },
+		{ 1, PKVM_G2G_SHARE_PEER_FOUND | PKVM_G2G_ACCEPT_MEMCACHE_LOW,
+		  PKVM_G2G_SHARE_NEED_MEMCACHE },
+		/* a busy destination is refused, not topped up for nothing */
+		{ 1, PKVM_G2G_SHARE_PEER_FOUND | PKVM_G2G_ACCEPT_DEST_BUSY |
+		     PKVM_G2G_ACCEPT_MEMCACHE_LOW, PKVM_G2G_SHARE_DENIED },
+		{ 1, PKVM_G2G_SHARE_PEER_FOUND | PKVM_G2G_ACCEPT_IPA_BAD,
+		  PKVM_G2G_SHARE_INVALID },
+		{ 1, PKVM_G2G_SHARE_PEER_FOUND | PKVM_G2G_SHARE_TO_SELF,
+		  PKVM_G2G_SHARE_INVALID },
+		/* REVOKE / RELEASE */
+		{ 2, 0, PKVM_G2G_SHARE_DO },
+		{ 2, PKVM_G2G_END_FLAGS_BAD | PKVM_G2G_END_NO_SHARE,
+		  PKVM_G2G_SHARE_INVALID },
+		{ 2, PKVM_G2G_END_NO_SHARE | PKVM_G2G_END_DIVERGED,
+		  PKVM_G2G_SHARE_NO_SHARE },
+		{ 2, PKVM_G2G_END_DIVERGED, PKVM_G2G_SHARE_DENIED },
+		/* facts no handler produces */
+		{ 0, ~0U, PKVM_G2G_SHARE_INVALID },
+		{ 1, BIT(17), PKVM_G2G_SHARE_INVALID },
+		{ 2, BIT(3), PKVM_G2G_SHARE_INVALID },
+	};
+	enum pkvm_g2g_share_verdict v, early;
+	u32 f, i, j, inputs = 0;
+
+	for (f = 0; f < BIT(16); f++, inputs++) {
+		v = pkvm_g2g_offer_verdict(f);
+		early = pkvm_g2g_offer_verdict(f & ~PKVM_G2G_OFFER_LOCKED);
+
+		pkvm_g2g_share_check((v == PKVM_G2G_SHARE_DO) ==
+				     (f == PKVM_G2G_SHARE_PEER_FOUND),
+				     PKVM_G2G_SHARE_CHK_O1, f);
+		if (f & (~PKVM_G2G_OFFER_FACTS | PKVM_G2G_OFFER_FLAGS_BAD |
+			 PKVM_G2G_OFFER_NR_BAD | PKVM_G2G_OFFER_IPA_BAD |
+			 PKVM_G2G_SHARE_MALFORMED_PEER))
+			pkvm_g2g_share_check(v == PKVM_G2G_SHARE_INVALID,
+					     PKVM_G2G_SHARE_CHK_O2, f);
+		if (early != PKVM_G2G_SHARE_DO)
+			pkvm_g2g_share_check(v == early, PKVM_G2G_SHARE_CHK_O3, f);
+		if (pkvm_g2g_share_is_request(v))
+			pkvm_g2g_share_check(!(f & (PKVM_G2G_OFFER_STATE |
+						    PKVM_G2G_OFFER_LIMIT)) &&
+					     pkvm_g2g_offer_verdict(f &
+						~(PKVM_G2G_OFFER_UNMAPPED |
+						  PKVM_G2G_OFFER_STRADDLE)) ==
+					     PKVM_G2G_SHARE_DO,
+					     PKVM_G2G_SHARE_CHK_O4, f);
+		pkvm_g2g_share_check(v < PKVM_G2G_SHARE_NR_VERDICTS &&
+				     v != PKVM_G2G_SHARE_NO_SHARE &&
+				     v != PKVM_G2G_SHARE_NEED_MEMCACHE,
+				     PKVM_G2G_SHARE_CHK_O5, f);
+	}
+
+	for (f = 0; f < BIT(17); f++, inputs++) {
+		v = pkvm_g2g_accept_verdict(f);
+		early = pkvm_g2g_accept_verdict(f & ~PKVM_G2G_ACCEPT_LOCKED);
+
+		pkvm_g2g_share_check((v == PKVM_G2G_SHARE_DO) ==
+				     (f == PKVM_G2G_SHARE_PEER_FOUND),
+				     PKVM_G2G_SHARE_CHK_A1, f);
+		if (f & (PKVM_G2G_ACCEPT_FLAGS_BAD | PKVM_G2G_ACCEPT_NR_BAD |
+			 PKVM_G2G_ACCEPT_IPA_BAD | PKVM_G2G_SHARE_MALFORMED_PEER))
+			pkvm_g2g_share_check(v == PKVM_G2G_SHARE_INVALID,
+					     PKVM_G2G_SHARE_CHK_A2, f);
+		if (early != PKVM_G2G_SHARE_DO)
+			pkvm_g2g_share_check(v == early, PKVM_G2G_SHARE_CHK_A3, f);
+		if (pkvm_g2g_share_is_request(v))
+			pkvm_g2g_share_check(pkvm_g2g_accept_verdict(f &
+						~PKVM_G2G_ACCEPT_MEMCACHE_LOW) ==
+					     PKVM_G2G_SHARE_DO,
+					     PKVM_G2G_SHARE_CHK_A4, f);
+		pkvm_g2g_share_check(v < PKVM_G2G_SHARE_NR_VERDICTS &&
+				     v != PKVM_G2G_SHARE_LIMIT &&
+				     v != PKVM_G2G_SHARE_NEED_MAP &&
+				     v != PKVM_G2G_SHARE_NEED_SPLIT,
+				     PKVM_G2G_SHARE_CHK_A5, f);
+	}
+
+	for (f = 0; f < BIT(3); f++, inputs++) {
+		v = pkvm_g2g_end_verdict(f);
+		early = pkvm_g2g_end_verdict(f & ~PKVM_G2G_END_LOCKED);
+
+		pkvm_g2g_share_check((v == PKVM_G2G_SHARE_DO) == !f &&
+				     (early == PKVM_G2G_SHARE_DO || v == early) &&
+				     (v == PKVM_G2G_SHARE_DO ||
+				      v == PKVM_G2G_SHARE_INVALID ||
+				      v == PKVM_G2G_SHARE_NO_SHARE ||
+				      v == PKVM_G2G_SHARE_DENIED),
+				     PKVM_G2G_SHARE_CHK_E1, f);
+	}
+
+	for (i = 0; i < PKVM_G2G_SHARE_NR_VERDICTS; i++, inputs++) {
+		unsigned long code = pkvm_g2g_share_verdict_to_smccc(i);
+
+		if (pkvm_g2g_share_is_request(i)) {
+			pkvm_g2g_share_check(code == (unsigned long)SMCCC_RET_NOT_SUPPORTED,
+					     PKVM_G2G_SHARE_CHK_M1, i);
+			continue;
+		}
+		pkvm_g2g_share_check((code == SMCCC_RET_SUCCESS) ==
+				     (i == PKVM_G2G_SHARE_DO) &&
+				     code != (unsigned long)SMCCC_RET_NOT_SUPPORTED,
+				     PKVM_G2G_SHARE_CHK_M1, i);
+		for (j = i + 1; j < PKVM_G2G_SHARE_NR_VERDICTS; j++)
+			if (!pkvm_g2g_share_is_request(j))
+				pkvm_g2g_share_check(code != pkvm_g2g_share_verdict_to_smccc(j),
+						     PKVM_G2G_SHARE_CHK_M1, (i << 8) | j);
+	}
+
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
+		v = cases[i].op == 0 ? pkvm_g2g_offer_verdict(cases[i].facts)
+		  : cases[i].op == 1 ? pkvm_g2g_accept_verdict(cases[i].facts)
+		  : pkvm_g2g_end_verdict(cases[i].facts);
+		pkvm_g2g_share_check(v == cases[i].want, PKVM_G2G_SHARE_CHK_CASE, i);
+	}
+
+	pkvm_g2g_share_selftest_cases = ARRAY_SIZE(cases);
+	/* Last: non-zero is what tells the host the check ran to the end. */
+	pkvm_g2g_share_selftest_inputs = inputs;
+}
+#endif /* CONFIG_PKVM_GUEST_TO_GUEST: section 1 */
+
+#ifdef CONFIG_PKVM_GUEST_TO_GUEST
+/*
+ * ============================================================================
+ * Guest-to-guest sharing, 2 of 3: the transitions.
+ * ============================================================================
+ *
+ * Naming: A owns the pages and offers them, B borrows them, and "host" is the
+ * untrusted pKVM host. Per page:
+ *
+ *	situation		A's PTE			B's PTE			host state
+ *	offered			SHARED_OWNED|G2G	-			NOPAGE
+ *	accepted		SHARED_OWNED|G2G	SHARED_BORROWED|G2G	G2G_LENT
+ *	released, B died	SHARED_OWNED|G2G	-			NOPAGE
+ *	revoked			OWNED			-			NOPAGE
+ *
+ * pkvm_g2g_reclaim_action() already decides each of these for teardown.
+ * G2G_ORPHANED is never produced: a dying owner's borrowers lose the pages
+ * first (pkvm_g2g_share_vm_dying()).
+ *
+ * Lock order: vm_table_lock (read; the write lock in teardown) ->
+ * host_mmu.lock -> one guest pgtable_lock at a time. Never two guest locks:
+ * guest_lock_component() sets the single per-CPU current_vm, which cannot
+ * nest. ACCEPT reads the owner's pages under the owner's lock, drops it, and
+ * maps into the borrower under the borrower's. That is safe because, while
+ * host_mmu.lock and the vm_table read lock are held, nothing can change an
+ * owner page that is in a share: the owner's own calls (MEM_SHARE,
+ * MEM_RELINQUISH, FF-A, a second OFFER) all require PKVM_PAGE_OWNED, donation
+ * into and reclaim from the owner take host_mmu.lock, and teardown takes the
+ * vm_table write lock.
+ *
+ * The share table is guarded by host_mmu.lock, which every transition holds
+ * anyway because every transition changes host-side page state. A record holds
+ * a VM pointer only while that VM has not started teardown:
+ * pkvm_g2g_share_vm_dying() clears every reference to a VM in the same
+ * vm_table write-locked step that marks it dying, and a VM is freed only after
+ * that, so no pointer here can dangle.
+ *
+ * Nothing here WARNs (a hyp WARN is fatal on this tree), allocates outside the
+ * vCPU memcache, or loops more than PKVM_G2G_SHARE_MAX records or
+ * PKVM_G2G_SHARE_MAX_PAGES pages.
+ */
+
+#define PKVM_G2G_SHARE_MAX		64
+#define PKVM_G2G_SHARE_MAX_PER_OWNER	16
+#define PKVM_G2G_SHARE_MAX_PAGES	512
+
+enum pkvm_g2g_share_state {
+	PKVM_G2G_SHARE_FREE = 0,
+	PKVM_G2G_SHARE_OFFERED,
+	PKVM_G2G_SHARE_ACCEPTED,
+};
+
+struct pkvm_g2g_share {
+	enum pkvm_g2g_share_state	state;
+	u32				gen;		/* never 0; half the handle */
+	u64				flags;		/* ARM_SMCCC_KVM_G2G_SHARE_RO */
+	u64				nr_pages;
+	struct pkvm_hyp_vm		*owner;
+	u64				owner_ipa;
+	struct pkvm_g2g_identity	to;		/* the borrower the owner named */
+	struct pkvm_hyp_vm		*borrower;	/* only while ACCEPTED */
+	u64				borrower_ipa;	/* only while ACCEPTED */
+};
+
+/* Guarded by host_mmu.lock. */
+static struct pkvm_g2g_share pkvm_g2g_shares[PKVM_G2G_SHARE_MAX];
+static u32 pkvm_g2g_share_gen;
+
+static u64 pkvm_g2g_share_handle(const struct pkvm_g2g_share *s)
+{
+	return ((u64)s->gen << 32) | (u64)(s - pkvm_g2g_shares);
+}
+
+/* The live record a handle names, or NULL. Caller holds host_mmu.lock. */
+static struct pkvm_g2g_share *pkvm_g2g_share_find(u64 handle)
+{
+	u64 slot = handle & U32_MAX;
+	struct pkvm_g2g_share *s;
+
+	hyp_assert_lock_held(&host_mmu.lock);
+
+	if (slot >= PKVM_G2G_SHARE_MAX)
+		return NULL;
+
+	s = &pkvm_g2g_shares[slot];
+	if (s->state == PKVM_G2G_SHARE_FREE || s->gen != (u32)(handle >> 32))
+		return NULL;
+
+	return s;
+}
+
+/* A free record for @owner, or NULL if the table or @owner's quota is full. */
+static struct pkvm_g2g_share *pkvm_g2g_share_alloc(struct pkvm_hyp_vm *owner)
+{
+	struct pkvm_g2g_share *free = NULL;
+	unsigned int i, mine = 0;
+
+	hyp_assert_lock_held(&host_mmu.lock);
+
+	for (i = 0; i < PKVM_G2G_SHARE_MAX; i++) {
+		struct pkvm_g2g_share *s = &pkvm_g2g_shares[i];
+
+		if (s->state == PKVM_G2G_SHARE_FREE) {
+			if (!free)
+				free = s;
+		} else if (s->owner == owner) {
+			mine++;
+		}
+	}
+
+	return mine < PKVM_G2G_SHARE_MAX_PER_OWNER ? free : NULL;
+}
+
+/* Back to FREE. The generation is kept, so an old handle never matches again. */
+static void pkvm_g2g_share_free(struct pkvm_g2g_share *s)
+{
+	u32 gen = s->gen;
+
+	memset(s, 0, sizeof(*s));
+	s->gen = gen;
+}
+
+/* The leaf covering @ipa in @vm's stage-2. Caller holds @vm's pgtable lock. */
+static int pkvm_g2g_leaf(struct pkvm_hyp_vm *vm, u64 ipa, kvm_pte_t *pte,
+			 u64 *base, u64 *gran)
+{
+	s8 level;
+	int ret;
+
+	ret = kvm_pgtable_get_leaf(&vm->pgt, ipa, pte, &level);
+	if (ret)
+		return ret;
+
+	*gran = kvm_granule_size(level);
+	*base = ALIGN_DOWN(ipa, *gran);
+	return 0;
+}
+
+/*
+ * The OFFER facts only the owner's page table and the host vmemmap can give:
+ * PKVM_G2G_OFFER_STATE, _UNMAPPED and _STRADDLE. Does not stop at the first, so
+ * that the verdict sees all of them (a range with an unmapped page and a page
+ * in the wrong state is refused, not mapped in for nothing). Caller holds
+ * host_mmu.lock and @vm's lock.
+ */
+static u32 pkvm_g2g_offer_range_facts(struct pkvm_hyp_vm *vm, u64 ipa, u64 size)
+{
+	u64 addr = ipa, end = ipa + size;
+	u32 facts = 0;
+
+	while (addr < end) {
+		u64 base, gran, next, a;
+		kvm_pte_t pte;
+
+		if (pkvm_g2g_leaf(vm, addr, &pte, &base, &gran)) {
+			facts |= PKVM_G2G_OFFER_STATE;	/* past the IPA space */
+			break;
+		}
+
+		if (!kvm_pte_valid(pte)) {
+			/* An annotation (MMIO guard) is not a page the caller owns. */
+			facts |= pte ? PKVM_G2G_OFFER_STATE : PKVM_G2G_OFFER_UNMAPPED;
+			addr += PAGE_SIZE;
+			continue;
+		}
+
+		if (base < ipa || base + gran > end)
+			facts |= PKVM_G2G_OFFER_STRADDLE;
+		if (guest_get_page_state(pte, addr) != PKVM_PAGE_OWNED)
+			facts |= PKVM_G2G_OFFER_STATE;
+
+		next = min(base + gran, end);
+		for (a = addr; a < next; a += PAGE_SIZE) {
+			u64 phys = kvm_pte_to_phys(pte) + (a - base);
+
+			/* Not RAM, under DMA, or not the guest's alone. */
+			if (!addr_is_memory(phys) ||
+			    hyp_page_count(hyp_phys_to_virt(phys)) ||
+			    get_host_state(hyp_phys_to_page(phys)) != PKVM_NOPAGE)
+				facts |= PKVM_G2G_OFFER_STATE;
+		}
+		addr = next;
+	}
+
+	return facts;
+}
+
+/*
+ * Re-mark every leaf of [ipa, ipa + size) in @vm with @prot. Every leaf there
+ * is valid and wholly inside the range (the caller checked), and only software
+ * bits change, so kvm_pgtable_stage2_map() takes its "only changing software
+ * bits" path: no break-before-make, no allocation, no failure. Caller holds
+ * @vm's lock.
+ */
+static void pkvm_g2g_mark_leaves(struct pkvm_hyp_vm *vm,
+				 struct kvm_hyp_memcache *mc, u64 ipa, u64 size,
+				 enum kvm_pgtable_prot prot)
+{
+	u64 addr = ipa, end = ipa + size;
+
+	while (addr < end) {
+		u64 base, gran;
+		kvm_pte_t pte;
+
+		if (pkvm_g2g_leaf(vm, addr, &pte, &base, &gran) ||
+		    !kvm_pte_valid(pte)) {
+			addr += PAGE_SIZE;
+			continue;
+		}
+
+		kvm_pgtable_stage2_map(&vm->pgt, base, gran, kvm_pte_to_phys(pte),
+				       prot, mc, 0);
+		addr = base + gran;
+	}
+}
+
+/*
+ * The physical page behind @ipa in owner @vm, if it is lent out as a share
+ * leaves it (SHARED_OWNED | G2G, the owner's permissions untouched). Caller
+ * holds @vm's lock.
+ */
+static bool pkvm_g2g_owner_page(struct pkvm_hyp_vm *vm, u64 ipa, u64 *phys)
+{
+	u64 base, gran;
+	kvm_pte_t pte;
+
+	if (pkvm_g2g_leaf(vm, ipa, &pte, &base, &gran) || !kvm_pte_valid(pte) ||
+	    guest_get_page_state(pte, ipa) !=
+	    (PKVM_PAGE_SHARED_OWNED | PKVM_PAGE_G2G))
+		return false;
+
+	*phys = kvm_pte_to_phys(pte) + (ipa - base);
+	return true;
+}
+
+/*
+ * The physical page behind @ipa in borrower @vm, if it is a borrowed share page
+ * as ACCEPT maps one: SHARED_BORROWED | G2G at PAGE_SIZE. A borrowed page is
+ * never executable, so guest_get_page_state() also reports RESTRICTED_PROT.
+ * Caller holds @vm's lock.
+ */
+static bool pkvm_g2g_borrowed_page(struct pkvm_hyp_vm *vm, u64 ipa, u64 *phys)
+{
+	u64 base, gran;
+	kvm_pte_t pte;
+
+	if (pkvm_g2g_leaf(vm, ipa, &pte, &base, &gran) || !kvm_pte_valid(pte) ||
+	    gran != PAGE_SIZE ||
+	    (guest_get_page_state(pte, ipa) & ~PKVM_PAGE_RESTRICTED_PROT) !=
+	    (PKVM_PAGE_SHARED_BORROWED | PKVM_PAGE_G2G))
+		return false;
+
+	*phys = kvm_pte_to_phys(pte);
+	return true;
+}
+
+/* Every page of [ipa, ipa + size) in @vm is an all-zero PTE. Caller holds @vm's lock. */
+static bool pkvm_g2g_dest_empty(struct pkvm_hyp_vm *vm, u64 ipa, u64 size)
+{
+	u64 addr, base, gran;
+	kvm_pte_t pte;
+
+	for (addr = ipa; addr < ipa + size; addr += PAGE_SIZE)
+		if (pkvm_g2g_leaf(vm, addr, &pte, &base, &gran) || pte)
+			return false;
+
+	return true;
+}
+
+/*
+ * Share @s is still lent out by its owner page for page, and every page's host
+ * state is @host. Caller holds host_mmu.lock; the owner's lock is taken here.
+ */
+static bool pkvm_g2g_owner_consistent(struct pkvm_g2g_share *s,
+				      enum pkvm_page_state host)
+{
+	bool ok = true;
+	u64 i, phys;
+
+	hyp_assert_lock_held(&host_mmu.lock);
+
+	guest_lock_component(s->owner);
+	for (i = 0; ok && i < s->nr_pages; i++)
+		ok = pkvm_g2g_owner_page(s->owner, s->owner_ipa + i * PAGE_SIZE,
+					 &phys) &&
+		     get_host_state(hyp_phys_to_page(phys)) == host;
+	guest_unlock_component(s->owner);
+
+	return ok;
+}
+
+/*
+ * Take [ipa, ipa + nr_pages * PAGE_SIZE) out of borrower @b and mark the pages
+ * no longer lent. Caller holds host_mmu.lock; @b's lock is taken here.
+ *
+ * Returns true if every page was a borrowed page whose host state says lent.
+ * With @check_only nothing changes. Without it, every page that is as expected
+ * is dropped and any other is left alone: teardown cannot refuse, and leaving a
+ * page held leaks it, where dropping a page we do not understand could hand it
+ * out.
+ */
+static bool pkvm_g2g_drop_borrowed(struct pkvm_hyp_vm *b, u64 ipa, u64 nr_pages,
+				   bool check_only)
+{
+	bool ok = true;
+	u64 i, phys;
+
+	hyp_assert_lock_held(&host_mmu.lock);
+
+	guest_lock_component(b);
+	for (i = 0; i < nr_pages; i++) {
+		u64 addr = ipa + i * PAGE_SIZE;
+
+		if (!pkvm_g2g_borrowed_page(b, addr, &phys) ||
+		    get_host_state(hyp_phys_to_page(phys)) != PKVM_PAGE_G2G_LENT) {
+			ok = false;
+			continue;
+		}
+		if (check_only)
+			continue;
+
+		/* Invalidates @b's TLB for the page, by VMID and IPA. */
+		kvm_pgtable_stage2_unmap(&b->pgt, addr, PAGE_SIZE);
+		__host_update_page_state(phys, PAGE_SIZE, PKVM_NOPAGE);
+	}
+	guest_unlock_component(b);
+
+	return ok;
+}
+
+/*
+ * Map offered share @s into @vm at @ipa, one page at a time, all or nothing.
+ * The caller holds host_mmu.lock and has checked, under it, that the share is
+ * offered to @vm, the owner's pages are as offered, the destination is empty
+ * and @mc covers a page-table path. The owner's pages cannot have changed since,
+ * but @vm's own other vCPUs can map into the destination (MMIO guard needs only
+ * @vm's lock), so each page is re-checked as it is mapped and the whole share
+ * is taken back if one fails.
+ */
+static enum pkvm_g2g_share_verdict
+pkvm_g2g_borrow(struct pkvm_g2g_share *s, struct pkvm_hyp_vm *vm,
+		struct kvm_hyp_memcache *mc, u64 ipa)
+{
+	enum kvm_pgtable_prot prot = KVM_PGTABLE_PROT_R;
+	u64 i, phys = 0, dst;
+	bool ok = true;
+	kvm_pte_t pte;
+	s8 level;
+
+	if (!(s->flags & ARM_SMCCC_KVM_G2G_SHARE_RO))
+		prot |= KVM_PGTABLE_PROT_W;
+	prot = pkvm_mkprot_g2g(pkvm_mkstate(prot, PKVM_PAGE_SHARED_BORROWED));
+
+	for (i = 0; i < s->nr_pages; i++) {
+		dst = ipa + i * PAGE_SIZE;
+
+		guest_lock_component(s->owner);
+		ok = pkvm_g2g_owner_page(s->owner, s->owner_ipa + i * PAGE_SIZE,
+					 &phys);
+		guest_unlock_component(s->owner);
+		if (!ok)
+			break;
+
+		guest_lock_component(vm);
+		ok = !kvm_pgtable_get_leaf(&vm->pgt, dst, &pte, &level) && !pte &&
+		     !kvm_pgtable_stage2_map(&vm->pgt, dst, PAGE_SIZE, phys, prot,
+					     mc, 0);
+		guest_unlock_component(vm);
+		if (!ok)
+			break;
+
+		__host_update_page_state(phys, PAGE_SIZE, PKVM_PAGE_G2G_LENT);
+	}
+
+	if (!ok) {
+		/* Pages 0..i-1 are mapped and marked lent: take them back. */
+		pkvm_g2g_drop_borrowed(vm, ipa, i, false);
+		return PKVM_G2G_SHARE_DENIED;
+	}
+
+	s->state = PKVM_G2G_SHARE_ACCEPTED;
+	s->borrower = vm;
+	s->borrower_ipa = ipa;
+
+	return PKVM_G2G_SHARE_DO;
+}
+
+static enum pkvm_g2g_share_verdict
+__pkvm_g2g_share_offer(struct pkvm_hyp_vm *vm, struct kvm_hyp_memcache *mc,
+		       u32 facts, u64 ipa, u64 nr_pages, u64 flags,
+		       const struct pkvm_g2g_identity *to, u64 *handle)
+{
+	enum pkvm_g2g_share_verdict v;
+	struct pkvm_g2g_share *s;
+	u64 limit = BIT_ULL(vm->pgt.ia_bits);
+	u64 size;
+
+	*handle = 0;
+	if (flags & ~ARM_SMCCC_KVM_G2G_SHARE_RO)
+		facts |= PKVM_G2G_OFFER_FLAGS_BAD;
+	if (!nr_pages || nr_pages > PKVM_G2G_SHARE_MAX_PAGES)
+		facts |= PKVM_G2G_OFFER_NR_BAD;
+	else if (!PAGE_ALIGNED(ipa) || ipa >= limit ||
+		 nr_pages * PAGE_SIZE > limit - ipa)
+		facts |= PKVM_G2G_OFFER_IPA_BAD;
+
+	v = pkvm_g2g_offer_verdict(facts);
+	if (v != PKVM_G2G_SHARE_DO)
+		return v;
+
+	size = nr_pages * PAGE_SIZE;
+	host_lock_component();
+	guest_lock_component(vm);
+
+	s = pkvm_g2g_share_alloc(vm);
+	if (!s)
+		facts |= PKVM_G2G_OFFER_LIMIT;
+	facts |= pkvm_g2g_offer_range_facts(vm, ipa, size);
+
+	v = pkvm_g2g_offer_verdict(facts);
+	if (v == PKVM_G2G_SHARE_DO) {
+		pkvm_g2g_mark_leaves(vm, mc, ipa, size,
+				     pkvm_mkprot_g2g(pkvm_mkstate(KVM_PGTABLE_PROT_RWX,
+								  PKVM_PAGE_SHARED_OWNED)));
+		if (!++pkvm_g2g_share_gen)
+			pkvm_g2g_share_gen = 1;
+		s->state = PKVM_G2G_SHARE_OFFERED;
+		s->gen = pkvm_g2g_share_gen;
+		s->flags = flags;
+		s->nr_pages = nr_pages;
+		s->owner = vm;
+		s->owner_ipa = ipa;
+		s->to = *to;
+		*handle = pkvm_g2g_share_handle(s);
+	}
+
+	guest_unlock_component(vm);
+	host_unlock_component();
+
+	return v;
+}
+
+static enum pkvm_g2g_share_verdict
+__pkvm_g2g_share_accept(struct pkvm_hyp_vm *vm, struct kvm_hyp_memcache *mc,
+			struct pkvm_hyp_vm *owner, u32 facts, u64 ipa,
+			u64 nr_pages, u64 handle, u64 flags, u64 *share_flags)
+{
+	u64 limit = BIT_ULL(vm->pgt.ia_bits);
+	enum pkvm_g2g_share_verdict v;
+	struct pkvm_g2g_share *s;
+	u64 size;
+
+	*share_flags = 0;
+	if (flags)
+		facts |= PKVM_G2G_ACCEPT_FLAGS_BAD;
+	if (!nr_pages || nr_pages > PKVM_G2G_SHARE_MAX_PAGES)
+		facts |= PKVM_G2G_ACCEPT_NR_BAD;
+	else if (!PAGE_ALIGNED(ipa) || ipa >= limit ||
+		 nr_pages * PAGE_SIZE > limit - ipa ||
+		 (ipa & (PMD_SIZE - 1)) + nr_pages * PAGE_SIZE > PMD_SIZE)
+		facts |= PKVM_G2G_ACCEPT_IPA_BAD;
+
+	v = pkvm_g2g_accept_verdict(facts);
+	if (v != PKVM_G2G_SHARE_DO)
+		return v;
+
+	size = nr_pages * PAGE_SIZE;
+	host_lock_component();
+
+	s = pkvm_g2g_share_find(handle);
+	if (!s || s->owner != owner || s->nr_pages != nr_pages ||
+	    s->to.lo != vm->g2g_id.lo || s->to.hi != vm->g2g_id.hi ||
+	    s->to.incarnation != vm->g2g_id.incarnation) {
+		facts |= PKVM_G2G_ACCEPT_NO_SHARE;
+	} else if (s->state == PKVM_G2G_SHARE_ACCEPTED) {
+		facts |= PKVM_G2G_ACCEPT_TAKEN;
+	} else {
+		if (!pkvm_g2g_owner_consistent(s, PKVM_NOPAGE))
+			facts |= PKVM_G2G_ACCEPT_OWNER_STATE;
+
+		guest_lock_component(vm);
+		if (!pkvm_g2g_dest_empty(vm, ipa, size))
+			facts |= PKVM_G2G_ACCEPT_DEST_BUSY;
+		if (mc->nr_pages < kvm_mmu_cache_min_pages(&vm->kvm.arch.mmu))
+			facts |= PKVM_G2G_ACCEPT_MEMCACHE_LOW;
+		guest_unlock_component(vm);
+	}
+
+	v = pkvm_g2g_accept_verdict(facts);
+	if (v == PKVM_G2G_SHARE_DO) {
+		v = pkvm_g2g_borrow(s, vm, mc, ipa);
+		if (v == PKVM_G2G_SHARE_DO)
+			*share_flags = s->flags;
+	}
+
+	host_unlock_component();
+
+	return v;
+}
+
+static enum pkvm_g2g_share_verdict
+__pkvm_g2g_share_revoke(struct pkvm_hyp_vm *vm, struct kvm_hyp_memcache *mc,
+			u64 handle, u64 flags)
+{
+	u32 facts = flags ? PKVM_G2G_END_FLAGS_BAD : 0;
+	enum pkvm_g2g_share_verdict v;
+	struct pkvm_g2g_share *s;
+	bool accepted = false;
+
+	v = pkvm_g2g_end_verdict(facts);
+	if (v != PKVM_G2G_SHARE_DO)
+		return v;
+
+	host_lock_component();
+
+	s = pkvm_g2g_share_find(handle);
+	if (!s || s->owner != vm) {
+		facts |= PKVM_G2G_END_NO_SHARE;
+	} else {
+		accepted = s->state == PKVM_G2G_SHARE_ACCEPTED;
+		if (!pkvm_g2g_owner_consistent(s, accepted ? PKVM_PAGE_G2G_LENT :
+							     PKVM_NOPAGE) ||
+		    (accepted && !pkvm_g2g_drop_borrowed(s->borrower,
+							  s->borrower_ipa,
+							  s->nr_pages, true)))
+			facts |= PKVM_G2G_END_DIVERGED;
+	}
+
+	v = pkvm_g2g_end_verdict(facts);
+	if (v == PKVM_G2G_SHARE_DO) {
+		/*
+		 * The borrower first: its next access faults. No poison: the
+		 * pages never leave the owner.
+		 */
+		if (accepted)
+			pkvm_g2g_drop_borrowed(s->borrower, s->borrower_ipa,
+					       s->nr_pages, false);
+		guest_lock_component(vm);
+		pkvm_g2g_mark_leaves(vm, mc, s->owner_ipa,
+				     s->nr_pages * PAGE_SIZE,
+				     pkvm_mkstate(KVM_PGTABLE_PROT_RWX,
+						  PKVM_PAGE_OWNED));
+		guest_unlock_component(vm);
+		pkvm_g2g_share_free(s);
+	}
+
+	host_unlock_component();
+
+	return v;
+}
+
+static enum pkvm_g2g_share_verdict
+__pkvm_g2g_share_release(struct pkvm_hyp_vm *vm, u64 handle, u64 flags)
+{
+	u32 facts = flags ? PKVM_G2G_END_FLAGS_BAD : 0;
+	enum pkvm_g2g_share_verdict v;
+	struct pkvm_g2g_share *s;
+
+	v = pkvm_g2g_end_verdict(facts);
+	if (v != PKVM_G2G_SHARE_DO)
+		return v;
+
+	host_lock_component();
+
+	s = pkvm_g2g_share_find(handle);
+	if (!s || s->state != PKVM_G2G_SHARE_ACCEPTED || s->borrower != vm)
+		facts |= PKVM_G2G_END_NO_SHARE;
+	else if (!pkvm_g2g_drop_borrowed(vm, s->borrower_ipa, s->nr_pages, true))
+		facts |= PKVM_G2G_END_DIVERGED;
+
+	v = pkvm_g2g_end_verdict(facts);
+	if (v == PKVM_G2G_SHARE_DO) {
+		pkvm_g2g_drop_borrowed(vm, s->borrower_ipa, s->nr_pages, false);
+		s->state = PKVM_G2G_SHARE_OFFERED;
+		s->borrower = NULL;
+		s->borrower_ipa = 0;
+	}
+
+	host_unlock_component();
+
+	return v;
+}
+
+/*
+ * Dismantle every share @vm is part of. Called from __pkvm_start_teardown_vm()
+ * with the vm_table write lock held, in the same step that marks @vm dying, so
+ * no moment exists where @vm is dying and still part of a share. @vm's vCPUs
+ * can no longer be loaded.
+ *
+ *  - Where @vm borrows, the pages leave @vm's stage-2 and stop being lent. The
+ *    record goes back to OFFERED with no borrower. It named @vm's incarnation,
+ *    which is never reused, so nobody can accept it again, and the owner's
+ *    REVOKE gives the owner its pages back.
+ *  - Where @vm owns, the borrower loses the pages first (its next access
+ *    faults), then the record is freed. @vm's own PTEs keep saying
+ *    SHARED_OWNED | G2G with host state NOPAGE, which pkvm_g2g_reclaim_action()
+ *    decides as SOLE_OWNER when the host reclaims them: poisoned, then given
+ *    back. Nothing leaks, and the host needs no knowledge of any of it.
+ */
+void pkvm_g2g_share_vm_dying(struct pkvm_hyp_vm *vm)
+{
+	unsigned int i;
+
+	host_lock_component();
+	for (i = 0; i < PKVM_G2G_SHARE_MAX; i++) {
+		struct pkvm_g2g_share *s = &pkvm_g2g_shares[i];
+
+		if (s->state == PKVM_G2G_SHARE_FREE ||
+		    (s->owner != vm && s->borrower != vm))
+			continue;
+
+		if (s->state == PKVM_G2G_SHARE_ACCEPTED) {
+			pkvm_g2g_drop_borrowed(s->borrower, s->borrower_ipa,
+					       s->nr_pages, false);
+			s->state = PKVM_G2G_SHARE_OFFERED;
+			s->borrower = NULL;
+			s->borrower_ipa = 0;
+		}
+
+		if (s->owner == vm)
+			pkvm_g2g_share_free(s);
+	}
+	host_unlock_component();
+}
+
+enum pkvm_g2g_share_verdict
+pkvm_g2g_share_offer(struct pkvm_hyp_vcpu *vcpu, u32 peer_facts, u64 ipa,
+		     u64 nr_pages, u64 flags, const struct pkvm_g2g_identity *to,
+		     u64 *handle)
+{
+	return __pkvm_g2g_share_offer(pkvm_hyp_vcpu_to_hyp_vm(vcpu),
+				      &vcpu->vcpu.arch.stage2_mc, peer_facts,
+				      ipa, nr_pages, flags, to, handle);
+}
+
+enum pkvm_g2g_share_verdict
+pkvm_g2g_share_accept(struct pkvm_hyp_vcpu *vcpu, struct pkvm_hyp_vm *owner,
+		      u32 peer_facts, u64 ipa, u64 nr_pages, u64 handle,
+		      u64 flags, u64 *share_flags)
+{
+	return __pkvm_g2g_share_accept(pkvm_hyp_vcpu_to_hyp_vm(vcpu),
+				       &vcpu->vcpu.arch.stage2_mc, owner,
+				       peer_facts, ipa, nr_pages, handle, flags,
+				       share_flags);
+}
+
+enum pkvm_g2g_share_verdict
+pkvm_g2g_share_revoke(struct pkvm_hyp_vcpu *vcpu, u64 handle, u64 flags)
+{
+	return __pkvm_g2g_share_revoke(pkvm_hyp_vcpu_to_hyp_vm(vcpu),
+				       &vcpu->vcpu.arch.stage2_mc, handle, flags);
+}
+
+enum pkvm_g2g_share_verdict
+pkvm_g2g_share_release(struct pkvm_hyp_vcpu *vcpu, u64 handle, u64 flags)
+{
+	return __pkvm_g2g_share_release(pkvm_hyp_vcpu_to_hyp_vm(vcpu), handle,
+					flags);
+}
+#endif /* CONFIG_PKVM_GUEST_TO_GUEST: section 2 */
+
+#ifdef CONFIG_PKVM_GUEST_TO_GUEST
+/*
+ * ============================================================================
+ * Guest-to-guest sharing, 3 of 3: the lifecycle self-check.
+ * ============================================================================
+ *
+ * Section 1's check proves the decisions. This one runs section 2's real
+ * transitions against real stage-2 page tables, at EL2 init, before any guest
+ * exists. Two scratch VMs - not in vm_table, so no guest or host call can
+ * reach them - get page tables built the way pkvm_ownership_selftest() builds
+ * its one, and two real pages go hyp -> host -> A through
+ * __pkvm_hyp_donate_host() and __pkvm_host_donate_guest(), as a protected VM's
+ * memory does. Every step is followed by a check of A's PTEs, B's PTEs, both
+ * pages' host state and the share record. At the end A is torn down through
+ * pkvm_g2g_share_vm_dying() and __pkvm_host_reclaim_page_guest(), the real
+ * teardown path, and the pages must reach the host poisoned.
+ *
+ * Failures are counted, never WARNed: a hyp WARN is fatal on this tree, and a
+ * check that panics the hypervisor tells nobody which step failed. The host
+ * prints the counts from finalize_pkvm(); first_bad names the step.
+ */
+#define PKVM_G2G_ST_PGD_MAX	16	/* concatenated pgd pages a scratch VM may need */
+#define PKVM_G2G_ST_POOL	4	/* spare table pages per scratch VM */
+#define PKVM_G2G_ST_MC		4	/* vCPU memcache pages per scratch VM */
+#define PKVM_G2G_ST_PAGES	2	/* the pages that are shared */
+
+static struct pkvm_hyp_vm pkvm_g2g_st_vm[2];
+static struct pkvm_hyp_vcpu pkvm_g2g_st_vcpu[2];
+static u64 pkvm_g2g_st_ipa_a, pkvm_g2g_st_ipa_b, pkvm_g2g_st_phys;
+
+static bool pkvm_g2g_st_take(void **scratch, unsigned long *left,
+			     unsigned long n, void **out)
+{
+	if (*left < n)
+		return false;
+	*out = *scratch;
+	*scratch += n * PAGE_SIZE;
+	*left -= n;
+	return true;
+}
+
+/*
+ * @n pages aligned to their own size, which the stage-2 pgd needs: the VM's
+ * pool hands it out as one buddy block. The pages skipped to get there are
+ * simply not used. Fails, rather than letting the allocator WARN (fatal), if
+ * @n is not a power of two or the scratch runs out.
+ */
+static bool pkvm_g2g_st_take_aligned(void **scratch, unsigned long *left,
+				     unsigned long n, void **out)
+{
+	u64 phys = hyp_virt_to_phys(*scratch);
+	void *unused;
+
+	if (!n || (n & (n - 1)))
+		return false;
+
+	return pkvm_g2g_st_take(scratch, left,
+				(ALIGN(phys, n * PAGE_SIZE) - phys) >> PAGE_SHIFT,
+				&unused) &&
+	       pkvm_g2g_st_take(scratch, left, n, out);
+}
+
+static bool pkvm_g2g_st_init_vm(int idx, void **scratch, unsigned long *left)
+{
+	struct pkvm_hyp_vm *vm = &pkvm_g2g_st_vm[idx];
+	struct pkvm_hyp_vcpu *vcpu = &pkvm_g2g_st_vcpu[idx];
+	unsigned long pgd_pages, i;
+	void *p;
+
+	vm->kvm.arch.mmu.arch = &vm->kvm.arch;
+	vm->kvm.arch.mmu.pgt = &vm->pgt;
+	vm->kvm.arch.mmu.vtcr = host_mmu.arch.mmu.vtcr;
+	vm->kvm.arch.pkvm.pvmfw_load_addr = PVMFW_INVALID_LOAD_ADDR;
+	vcpu->vcpu.arch.hw_mmu = &vm->kvm.arch.mmu;
+	vcpu->vcpu.kvm = &vm->kvm;
+
+	pgd_pages = kvm_pgtable_stage2_pgd_size(vm->kvm.arch.mmu.vtcr) >> PAGE_SHIFT;
+	if (pgd_pages > PKVM_G2G_ST_PGD_MAX ||
+	    !pkvm_g2g_st_take_aligned(scratch, left, pgd_pages, &p) ||
+	    kvm_guest_prepare_stage2(vm, p))
+		return false;
+
+	/* Spare table pages, as init_selftest_vm() gives its VM. */
+	for (i = 0; i < PKVM_G2G_ST_POOL; i++) {
+		if (!pkvm_g2g_st_take(scratch, left, 1, &p))
+			return false;
+		hyp_virt_to_page(p)->refcount = 1;
+		hyp_put_page(&vm->pool, p);
+	}
+
+	/* And a vCPU memcache, which ACCEPT insists on. */
+	for (i = 0; i < PKVM_G2G_ST_MC; i++) {
+		if (!pkvm_g2g_st_take(scratch, left, 1, &p))
+			return false;
+		push_hyp_memcache(&vcpu->vcpu.arch.stage2_mc, p,
+				  hyp_virt_to_phys, 0);
+	}
+
+	return true;
+}
+
+/* @vm's state for @ipa, and whether it maps @phys (when it maps anything). */
+static bool pkvm_g2g_st_pte(struct pkvm_hyp_vm *vm, u64 ipa, u64 phys,
+			    enum pkvm_page_state want)
+{
+	kvm_pte_t pte;
+	s8 level;
+	bool ok;
+
+	guest_lock_component(vm);
+	ok = !kvm_pgtable_get_leaf(&vm->pgt, ipa, &pte, &level) &&
+	     guest_get_page_state(pte, ipa) == want &&
+	     (!kvm_pte_valid(pte) || kvm_pte_to_phys(pte) +
+	      (ipa - ALIGN_DOWN(ipa, kvm_granule_size(level))) == phys);
+	guest_unlock_component(vm);
+
+	return ok;
+}
+
+/* Both pages: A's state, B's state, host state. */
+static bool pkvm_g2g_st_is(enum pkvm_page_state a, enum pkvm_page_state b,
+			   enum pkvm_page_state host)
+{
+	bool ok = true;
+	u64 i, phys;
+
+	host_lock_component();
+	for (i = 0; i < PKVM_G2G_ST_PAGES; i++) {
+		phys = pkvm_g2g_st_phys + i * PAGE_SIZE;
+		ok &= pkvm_g2g_st_pte(&pkvm_g2g_st_vm[0],
+				      pkvm_g2g_st_ipa_a + i * PAGE_SIZE, phys, a);
+		ok &= pkvm_g2g_st_pte(&pkvm_g2g_st_vm[1],
+				      pkvm_g2g_st_ipa_b + i * PAGE_SIZE, phys, b);
+		ok &= get_host_state(hyp_phys_to_page(phys)) == host;
+	}
+	host_unlock_component();
+
+	return ok;
+}
+
+static enum pkvm_g2g_share_state pkvm_g2g_st_rec(u64 handle)
+{
+	enum pkvm_g2g_share_state state;
+	struct pkvm_g2g_share *s;
+
+	host_lock_component();
+	s = pkvm_g2g_share_find(handle);
+	state = s ? s->state : PKVM_G2G_SHARE_FREE;
+	host_unlock_component();
+
+	return state;
+}
+
+/* B's permissions on its first borrowed page. */
+static enum kvm_pgtable_prot pkvm_g2g_st_prot_b(void)
+{
+	struct pkvm_hyp_vm *vm = &pkvm_g2g_st_vm[1];
+	kvm_pte_t pte = 0;
+	s8 level;
+
+	host_lock_component();
+	guest_lock_component(vm);
+	kvm_pgtable_get_leaf(&vm->pgt, pkvm_g2g_st_ipa_b, &pte, &level);
+	guest_unlock_component(vm);
+	host_unlock_component();
+
+	return kvm_pgtable_stage2_pte_prot(pte);
+}
+
+/* Write @val over the first word of a page, or test that the page is all zero. */
+static void pkvm_g2g_st_fill(u64 phys, u64 val)
+{
+	u64 *p = hyp_fixmap_map(phys);
+
+	*p = val;
+	hyp_fixmap_unmap();
+}
+
+static bool pkvm_g2g_st_zero(u64 phys)
+{
+	u64 *p = hyp_fixmap_map(phys);
+	bool zero = true;
+	unsigned int i;
+
+	for (i = 0; i < PAGE_SIZE / sizeof(u64); i++)
+		zero &= !p[i];
+	hyp_fixmap_unmap();
+
+	return zero;
+}
+
+/*
+ * REVOKE as owner A's vCPU issues it: in guest context, with A's vCPU the
+ * running one and A's stage-2 loaded, so that taking the pages out of B's
+ * stage-2 flushes B's VMID through enter_vmid_context()'s guest-context path -
+ * the one that has to switch to another guest's stage-2, which no host-context
+ * call exercises. At init no vCPU is running, so A's scratch vCPU is made the
+ * running one for the call. What stage-2 is loaded does not matter yet:
+ * HCR_EL2.VM is still clear, and __pkvm_prot_finalize() loads the host's.
+ */
+static enum pkvm_g2g_share_verdict pkvm_g2g_st_revoke_as_guest(u64 handle)
+{
+	struct kvm_cpu_context *host_ctxt = &this_cpu_ptr(&kvm_host_data)->host_ctxt;
+	struct pkvm_hyp_vcpu *a = &pkvm_g2g_st_vcpu[0];
+	enum pkvm_g2g_share_verdict v;
+
+	host_ctxt->__hyp_running_vcpu = &a->vcpu;
+	__load_stage2(a->vcpu.arch.hw_mmu, kern_hyp_va(a->vcpu.arch.hw_mmu->arch));
+	v = __pkvm_g2g_share_revoke(&pkvm_g2g_st_vm[0], &a->vcpu.arch.stage2_mc,
+				    handle, 0);
+	host_ctxt->__hyp_running_vcpu = NULL;
+	__load_host_stage2();
+
+	return v;
+}
+
+#define PKVM_G2G_ST_SO	(PKVM_PAGE_SHARED_OWNED | PKVM_PAGE_G2G)
+#define PKVM_G2G_ST_SB	(PKVM_PAGE_SHARED_BORROWED | PKVM_PAGE_G2G | \
+			 PKVM_PAGE_RESTRICTED_PROT)
+
+static void pkvm_g2g_share_lifecycle_selftest(void *scratch,
+					      unsigned long nr_pages)
+{
+	struct pkvm_hyp_vm *a = &pkvm_g2g_st_vm[0], *b = &pkvm_g2g_st_vm[1];
+	struct kvm_hyp_memcache *mca = &pkvm_g2g_st_vcpu[0].vcpu.arch.stage2_mc;
+	struct kvm_hyp_memcache *mcb = &pkvm_g2g_st_vcpu[1].vcpu.arch.stage2_mc;
+	const u32 found = PKVM_G2G_SHARE_PEER_FOUND;
+	u32 step = 0, before = pkvm_g2g_share_selftest_failures;
+	u64 h, h2, sflags, pfn, gfn, i;
+	void *pages;
+
+#define PKVM_G2G_ST_STEP(cond)						\
+	do {								\
+		pkvm_g2g_share_check(cond, PKVM_G2G_SHARE_CHK_STEP, step); \
+		step++;							\
+	} while (0)
+#define PKVM_G2G_ST_OFFER(flags, hp)					\
+	__pkvm_g2g_share_offer(a, mca, found, pkvm_g2g_st_ipa_a,	\
+			       PKVM_G2G_ST_PAGES, flags, &b->g2g_id, hp)
+#define PKVM_G2G_ST_ACCEPT(hd)						\
+	__pkvm_g2g_share_accept(b, mcb, a, found, pkvm_g2g_st_ipa_b,	\
+				PKVM_G2G_ST_PAGES, hd, 0, &sflags)
+
+	if (!pkvm_g2g_st_init_vm(0, &scratch, &nr_pages) ||
+	    !pkvm_g2g_st_init_vm(1, &scratch, &nr_pages) ||
+	    !pkvm_g2g_st_take(&scratch, &nr_pages, PKVM_G2G_ST_PAGES, &pages)) {
+		pkvm_g2g_share_check(false, PKVM_G2G_SHARE_CHK_STEP, 0xffff);
+		return;
+	}
+
+	a->g2g_id = (struct pkvm_g2g_identity){ .lo = 0x7473, .hi = 0xa, .incarnation = 1 };
+	b->g2g_id = (struct pkvm_g2g_identity){ .lo = 0x7473, .hi = 0xb, .incarnation = 2 };
+	pkvm_g2g_st_ipa_a = BIT_ULL(a->pgt.ia_bits - 2);
+	pkvm_g2g_st_ipa_b = BIT_ULL(b->pgt.ia_bits - 1) - PMD_SIZE;
+	pkvm_g2g_st_phys = hyp_virt_to_phys(pages);
+	pfn = hyp_phys_to_pfn(pkvm_g2g_st_phys);
+	gfn = hyp_phys_to_pfn(pkvm_g2g_st_ipa_a);
+
+	/* 0-3: hyp -> host -> A, a page at a time, as guest memory arrives. */
+	PKVM_G2G_ST_STEP(!__pkvm_hyp_donate_host(pfn, PKVM_G2G_ST_PAGES));
+	for (i = 0; i < PKVM_G2G_ST_PAGES; i++)
+		PKVM_G2G_ST_STEP(!__pkvm_host_donate_guest(pfn + i, gfn + i, 1,
+							   &pkvm_g2g_st_vcpu[0]));
+	PKVM_G2G_ST_STEP(pkvm_g2g_st_is(PKVM_PAGE_OWNED, PKVM_NOPAGE, PKVM_NOPAGE));
+	if (pkvm_g2g_share_selftest_failures != before)
+		goto out;	/* nothing below means anything without these */
+	pkvm_g2g_st_fill(pkvm_g2g_st_phys, 0x6732672d73686172ULL);
+
+	/* 4-5: offer; the pages stay A's, the host side does not move. */
+	PKVM_G2G_ST_STEP(PKVM_G2G_ST_OFFER(0, &h) == PKVM_G2G_SHARE_DO);
+	PKVM_G2G_ST_STEP(pkvm_g2g_st_is(PKVM_G2G_ST_SO, PKVM_NOPAGE, PKVM_NOPAGE) &&
+			 pkvm_g2g_st_rec(h) == PKVM_G2G_SHARE_OFFERED);
+	/* 6: not twice */
+	PKVM_G2G_ST_STEP(PKVM_G2G_ST_OFFER(0, &h2) == PKVM_G2G_SHARE_DENIED && !h2);
+	/* 7: a handle of another generation names nothing */
+	PKVM_G2G_ST_STEP(PKVM_G2G_ST_ACCEPT(h + BIT_ULL(32)) == PKVM_G2G_SHARE_NO_SHARE);
+	/* 8-9: accept: B maps A's two pages, lent host-side */
+	PKVM_G2G_ST_STEP(PKVM_G2G_ST_ACCEPT(h) == PKVM_G2G_SHARE_DO && !sflags);
+	PKVM_G2G_ST_STEP(pkvm_g2g_st_is(PKVM_G2G_ST_SO, PKVM_G2G_ST_SB, PKVM_PAGE_G2G_LENT) &&
+			 pkvm_g2g_st_rec(h) == PKVM_G2G_SHARE_ACCEPTED &&
+			 (pkvm_g2g_st_prot_b() & KVM_PGTABLE_PROT_W) &&
+			 !(pkvm_g2g_st_prot_b() & KVM_PGTABLE_PROT_X));
+	/* 10: taken */
+	PKVM_G2G_ST_STEP(PKVM_G2G_ST_ACCEPT(h) == PKVM_G2G_SHARE_DENIED);
+	/* 11: the borrower cannot revoke, the owner cannot release */
+	PKVM_G2G_ST_STEP(__pkvm_g2g_share_revoke(b, mcb, h, 0) == PKVM_G2G_SHARE_NO_SHARE &&
+			 __pkvm_g2g_share_release(a, h, 0) == PKVM_G2G_SHARE_NO_SHARE);
+	/* 12-13: release */
+	PKVM_G2G_ST_STEP(__pkvm_g2g_share_release(b, h, 0) == PKVM_G2G_SHARE_DO);
+	PKVM_G2G_ST_STEP(pkvm_g2g_st_is(PKVM_G2G_ST_SO, PKVM_NOPAGE, PKVM_NOPAGE) &&
+			 pkvm_g2g_st_rec(h) == PKVM_G2G_SHARE_OFFERED);
+	/* 14: twice */
+	PKVM_G2G_ST_STEP(__pkvm_g2g_share_release(b, h, 0) == PKVM_G2G_SHARE_NO_SHARE);
+	/* 15-16: accepted again, then revoked with the pages mapped, from guest context */
+	PKVM_G2G_ST_STEP(PKVM_G2G_ST_ACCEPT(h) == PKVM_G2G_SHARE_DO);
+	PKVM_G2G_ST_STEP(pkvm_g2g_st_revoke_as_guest(h) == PKVM_G2G_SHARE_DO &&
+			 pkvm_g2g_st_is(PKVM_PAGE_OWNED, PKVM_NOPAGE, PKVM_NOPAGE) &&
+			 pkvm_g2g_st_rec(h) == PKVM_G2G_SHARE_FREE);
+	/* 17: gone for both */
+	PKVM_G2G_ST_STEP(__pkvm_g2g_share_revoke(a, mca, h, 0) == PKVM_G2G_SHARE_NO_SHARE &&
+			 __pkvm_g2g_share_release(b, h, 0) == PKVM_G2G_SHARE_NO_SHARE);
+	/* 18: read-only */
+	PKVM_G2G_ST_STEP(PKVM_G2G_ST_OFFER(ARM_SMCCC_KVM_G2G_SHARE_RO, &h) == PKVM_G2G_SHARE_DO &&
+			 PKVM_G2G_ST_ACCEPT(h) == PKVM_G2G_SHARE_DO &&
+			 sflags == ARM_SMCCC_KVM_G2G_SHARE_RO &&
+			 !(pkvm_g2g_st_prot_b() & KVM_PGTABLE_PROT_W));
+	/* 19-20: the borrower dies first; the owner revokes */
+	pkvm_g2g_share_vm_dying(b);
+	PKVM_G2G_ST_STEP(pkvm_g2g_st_is(PKVM_G2G_ST_SO, PKVM_NOPAGE, PKVM_NOPAGE) &&
+			 pkvm_g2g_st_rec(h) == PKVM_G2G_SHARE_OFFERED);
+	PKVM_G2G_ST_STEP(__pkvm_g2g_share_revoke(a, mca, h, 0) == PKVM_G2G_SHARE_DO &&
+			 pkvm_g2g_st_is(PKVM_PAGE_OWNED, PKVM_NOPAGE, PKVM_NOPAGE));
+	/* 21-23: the owner dies first, the borrower mapping: B loses the pages */
+	PKVM_G2G_ST_STEP(PKVM_G2G_ST_OFFER(0, &h) == PKVM_G2G_SHARE_DO &&
+			 PKVM_G2G_ST_ACCEPT(h) == PKVM_G2G_SHARE_DO);
+	pkvm_g2g_share_vm_dying(a);
+	PKVM_G2G_ST_STEP(pkvm_g2g_st_is(PKVM_G2G_ST_SO, PKVM_NOPAGE, PKVM_NOPAGE) &&
+			 pkvm_g2g_st_rec(h) == PKVM_G2G_SHARE_FREE);
+	PKVM_G2G_ST_STEP(__pkvm_g2g_share_release(b, h, 0) == PKVM_G2G_SHARE_NO_SHARE);
+	/* 24-26: the host reclaims A's pages through the real path: poisoned, returned */
+	for (i = 0; i < PKVM_G2G_ST_PAGES; i++)
+		PKVM_G2G_ST_STEP(!__pkvm_host_reclaim_page_guest(gfn + i, 1, a));
+	PKVM_G2G_ST_STEP(pkvm_g2g_st_is(PKVM_NOPAGE, PKVM_NOPAGE, PKVM_PAGE_OWNED) &&
+			 pkvm_g2g_st_zero(pkvm_g2g_st_phys) &&
+			 pkvm_g2g_st_zero(pkvm_g2g_st_phys + PAGE_SIZE));
+	/* 27: back to the hypervisor, where they came from */
+	PKVM_G2G_ST_STEP(!__pkvm_host_donate_hyp(pfn, PKVM_G2G_ST_PAGES));
+
+out:
+	destroy_hyp_vm_pgt(a);
+	destroy_hyp_vm_pgt(b);
+	pkvm_g2g_share_selftest_steps = step;
+
+#undef PKVM_G2G_ST_ACCEPT
+#undef PKVM_G2G_ST_OFFER
+#undef PKVM_G2G_ST_STEP
+}
+
+/*
+ * Returns true if both parts passed, by the same test the host applies when
+ * it prints PASS: the decisions ran, the lifecycle ran, and nothing failed.
+ * Guest-to-guest stays disabled unless it did (see pkvm_g2g_enabled).
+ */
+bool pkvm_g2g_share_selftest(void *scratch, unsigned long nr_pages)
+{
+	pkvm_g2g_share_verdict_selftest();
+	pkvm_g2g_share_lifecycle_selftest(scratch, nr_pages);
+
+	return pkvm_g2g_share_selftest_inputs && pkvm_g2g_share_selftest_steps &&
+	       !pkvm_g2g_share_selftest_failures;
+}
+#endif /* CONFIG_PKVM_GUEST_TO_GUEST: section 3 */
+
 static int pkvm_host_donate_hyp(u64 pfn, u64 nr_pages, enum kvm_pgtable_prot prot,
 				enum host_check_page_state_flags flags)
 {
@@ -2393,6 +3838,19 @@ static int get_valid_guest_pte(struct pkvm_hyp_vm *vm, u64 ipa, kvm_pte_t *ptep,
 }
 
 /* Return PA for an owned guest IPA or request it, and repeat the guest HVC */
+/*
+ * TODO(g2g): this insists on PKVM_PAGE_OWNED and returns -EPERM for anything
+ * else, so a page VM A has offered to a peer is ineligible for every caller of
+ * this helper - which on this tree includes the pvIOMMU DMA request path via
+ * pkvm_get_guest_pa_request_use_dma(). Decide deliberately whether a
+ * guest-to-guest shared page may be used for DMA by its owner. Refusing is a
+ * defensible answer and is what this state check does now as a side effect;
+ * it should be the answer on purpose, with an error the caller can tell
+ * apart.
+ *
+ * Note this site does not exist on the mainline-flavoured pKVM branches - it
+ * is part of the Tegra pvIOMMU work carried by this tree.
+ */
 int pkvm_get_guest_pa_request(struct pkvm_hyp_vcpu *hyp_vcpu, u64 ipa,
 			      size_t ipa_size_request, u64 *out_pa, s8 *out_level)
 {
@@ -3404,7 +4862,20 @@ int __pkvm_host_share_guest(u64 pfn, u64 gfn, u64 nr_pages, struct pkvm_hyp_vcpu
 				goto unlock;
 			}
 
-			/* Only host to np-guest multi-sharing is tolerated */
+			/*
+			 * Only host to np-guest multi-sharing is tolerated
+			 *
+			 * TODO(g2g): this is the in-tree statement of the
+			 * multi-sharing policy. Note what it does and does not
+			 * say: it restricts multi-sharing of *host-owned*
+			 * pages to *non protected* guests. A guest-to-guest
+			 * share is a different thing - the page is owned by a
+			 * guest, the host never regains access, and the share
+			 * never comes through here (GUEST_SHARE_*, in the
+			 * "Guest-to-guest sharing" sections above) - so this
+			 * check continues to apply unchanged to the
+			 * host-to-guest path. Do not relax it in passing.
+			 */
 			if (page->host_share_guest_count)
 				continue;
 
@@ -3431,6 +4902,16 @@ unlock:
 	return ret;
 }
 
+/*
+ * TODO(g2g): this asserts get_host_state(page) == PKVM_PAGE_SHARED_OWNED for
+ * any guest page in PKVM_PAGE_SHARED_BORROWED, i.e. it assumes every borrowed
+ * page was borrowed *from the host*. A page borrowed from a peer VM carries
+ * PKVM_PAGE_G2G in its guest state (and PKVM_PAGE_G2G_LENT as its host state),
+ * so it is rejected here with -EPERM, which leaks into
+ * __pkvm_host_unshare_guest() and the permission/aging helpers built on it.
+ * Rejecting is safe, but the callers will need a way to tell "not shared by
+ * the host" from "not shared at all".
+ */
 static int __check_host_shared_guest(struct pkvm_hyp_vm *vm, u64 *__phys, u64 ipa, u64 size)
 {
 	enum pkvm_page_state state;
@@ -3945,6 +5426,15 @@ static void assert_page_state(void)
 		assert_page_state();			\
 	} while (0)
 
+/*
+ * TODO(g2g): this already models two guests (selftest_state.guest[0] and
+ * guest[1]) for the host-to-np-guest multi-share case. The guest-to-guest
+ * transitions and teardown orderings are checked elsewhere, at every EL2 init
+ * with CONFIG_PKVM_GUEST_TO_GUEST: pkvm_g2g_reclaim_selftest() and
+ * pkvm_g2g_share_selftest(), the latter on two scratch VMs of its own.
+ * Extending this one with the guest-to-guest cases would hold them to the same
+ * ownership assertions as every other transition, under CONFIG_NVHE_EL2_DEBUG.
+ */
 void pkvm_ownership_selftest(void *base)
 {
 	enum kvm_pgtable_prot prot = KVM_PGTABLE_PROT_RWX;
@@ -4325,6 +5815,17 @@ static int __pkvm_use_dma_locked(phys_addr_t phys, size_t size, struct pkvm_hyp_
  * In case in the future shared pages are allowed to be mapped,
  * similar checks are needed in host_request_unshare() and
  * host_ack_unshare()
+ */
+/*
+ * TODO(g2g): the comment above is the existing authors flagging this exact
+ * interaction - "In case in the future shared pages are allowed to be mapped,
+ * similar checks are needed". A guest-to-guest shared page is a new case: two
+ * VMs can reach it, and one of them may want to DMA to it. Today it cannot:
+ * an OFFER refuses a page in DMA use (its hyp_page refcount), and both DMA
+ * paths require PKVM_PAGE_OWNED - the host's state here, the owner's in
+ * pkvm_get_guest_pa_request() - which a shared page is not. Decide whether
+ * that is the answer, and make it one on purpose rather than a side effect of
+ * the state checks.
  */
 int __pkvm_use_dma(phys_addr_t phys, size_t size, struct pkvm_hyp_vm *vm)
 {

@@ -96,6 +96,11 @@ extern u32 kvm_nvhe_sym(pkvm_g2g_msg_selftest_inputs);
 extern u32 kvm_nvhe_sym(pkvm_g2g_msg_selftest_cases);
 extern u32 kvm_nvhe_sym(pkvm_g2g_msg_selftest_failures);
 extern u32 kvm_nvhe_sym(pkvm_g2g_msg_selftest_first_bad);
+extern u32 kvm_nvhe_sym(pkvm_g2g_share_selftest_inputs);
+extern u32 kvm_nvhe_sym(pkvm_g2g_share_selftest_cases);
+extern u32 kvm_nvhe_sym(pkvm_g2g_share_selftest_steps);
+extern u32 kvm_nvhe_sym(pkvm_g2g_share_selftest_failures);
+extern u32 kvm_nvhe_sym(pkvm_g2g_share_selftest_first_bad);
 extern bool kvm_nvhe_sym(pkvm_g2g_enabled);
 
 /*
@@ -110,7 +115,7 @@ static void __init pkvm_g2g_report_selftest(void)
 	u32 pairs = READ_ONCE(kvm_nvhe_sym(pkvm_g2g_selftest_pairs));
 	u32 cases = READ_ONCE(kvm_nvhe_sym(pkvm_g2g_selftest_cases));
 	u32 bad = READ_ONCE(kvm_nvhe_sym(pkvm_g2g_selftest_failures));
-	u32 inputs;
+	u32 inputs, steps;
 
 	if (!pairs)
 		pr_err("pkvm-g2g: EL2 reclaim matrix self-check did not run\n");
@@ -140,6 +145,35 @@ static void __init pkvm_g2g_report_selftest(void)
 		pr_info("pkvm-g2g: EL2 mailbox self-check: PASS (%u inputs, %u named cases, 0 failures)\n",
 			inputs, cases);
 
+	/*
+	 * Guest-to-guest sharing: the decisions (inputs, cases) and the
+	 * lifecycle on scratch VMs (steps). A lifecycle that did not run is a
+	 * failure, not a pass. As for the others, this is what EL2 reported to
+	 * a host that has not yet dropped its privileges: evidence on a
+	 * cooperative host, not proof against a hostile one.
+	 */
+	inputs = READ_ONCE(kvm_nvhe_sym(pkvm_g2g_share_selftest_inputs));
+	cases = READ_ONCE(kvm_nvhe_sym(pkvm_g2g_share_selftest_cases));
+	steps = READ_ONCE(kvm_nvhe_sym(pkvm_g2g_share_selftest_steps));
+	bad = READ_ONCE(kvm_nvhe_sym(pkvm_g2g_share_selftest_failures));
+
+	if (!inputs)
+		pr_err("pkvm-g2g: EL2 share self-check did not run\n");
+	else if (bad || !steps)
+		pr_err("pkvm-g2g: EL2 share self-check: FAIL (%u inputs, %u named cases, %u lifecycle steps, %u failures, first 0x%08x)\n",
+		       inputs, cases, steps, bad,
+		       READ_ONCE(kvm_nvhe_sym(pkvm_g2g_share_selftest_first_bad)));
+	else
+		pr_info("pkvm-g2g: EL2 share self-check: PASS (%u inputs, %u named cases, %u lifecycle steps, 0 failures)\n",
+			inputs, cases, steps);
+
+	/*
+	 * EL2 fails closed: unless all three checks ran and passed it advertises
+	 * none of the guest-to-guest calls, refuses each of them, and reclaims
+	 * every page through the pre-existing path. Report the flag EL2 acts
+	 * on rather than recomputing it from the counts above, so that this
+	 * line cannot disagree with what EL2 does.
+	 */
 	if (!READ_ONCE(kvm_nvhe_sym(pkvm_g2g_enabled)))
 		pr_err("pkvm-g2g: guest-to-guest DISABLED: an EL2 self-check failed or did not run, so calls 12-20 are not advertised and are refused\n");
 }
@@ -527,6 +561,9 @@ void __init kvm_hyp_reserve(void)
 	hyp_mem_pages += host_s2_pgtable_pages();
 	hyp_mem_pages += hyp_vmemmap_pages(STRUCT_HYP_PAGE_SIZE);
 	hyp_mem_pages += pkvm_selftest_pages();
+#ifdef CONFIG_PKVM_GUEST_TO_GUEST
+	hyp_mem_pages += pkvm_g2g_selftest_pages();
+#endif
 	hyp_mem_pages += hyp_ffa_proxy_pages();
 	hyp_mem_pages++; /* hyp_ppages */
 	hyp_mem_pages += kvm_iommu_pages();

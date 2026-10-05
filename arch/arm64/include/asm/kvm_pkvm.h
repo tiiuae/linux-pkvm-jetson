@@ -249,6 +249,15 @@ static inline unsigned long pkvm_selftest_pages(void) { return 32; }
 static inline unsigned long pkvm_selftest_pages(void) { return 0; }
 #endif
 
+#ifdef CONFIG_PKVM_GUEST_TO_GUEST
+/*
+ * Scratch for the guest-to-guest sharing self-check at EL2 init: two scratch
+ * VMs' page tables (each pgd aligned to its own size) and memcaches, and the
+ * two pages they share. Never reused.
+ */
+static inline unsigned long pkvm_g2g_selftest_pages(void) { return 96; }
+#endif
+
 #define KVM_FFA_MBOX_NR_PAGES	1
 
 #define KVM_FFA_MBOX_NR_PAGES		1
