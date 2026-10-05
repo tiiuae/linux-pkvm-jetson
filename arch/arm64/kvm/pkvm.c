@@ -2176,12 +2176,15 @@ retry:
 		 * legacy path does when it unpins. Left charged, every leaked
 		 * page would count against the VMM's RLIMIT_MEMLOCK for as long
 		 * as its mm lives, across every VM it creates after this one.
+		 * A page of identity-mapped guest RAM was never pinned nor
+		 * charged, so there is nothing to release for it.
 		 */
 		if (ret == -EOWNERDEAD || ret == -ENOTRECOVERABLE) {
 			WARN_ON_ONCE(ret == -ENOTRECOVERABLE);
 			pr_warn_ratelimited("pkvm-g2g: EL2 kept the guest page at IPA 0x%llx (%d), leaking %u page(s)\n",
 					    (u64)ppage->ipa, ret, 1U << ppage->order);
-			account_locked_vm(mm, 1 << ppage->order, false);
+			if (ppage->pinned)
+				account_locked_vm(mm, 1 << ppage->order, false);
 			kvm_pinned_pages_remove(ppage, &kvm->arch.pkvm.pinned_pages);
 			kfree(ppage);
 			ppage = next;
