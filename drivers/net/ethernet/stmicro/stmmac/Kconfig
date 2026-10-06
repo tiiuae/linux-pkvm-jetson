@@ -330,6 +330,18 @@ config DWMAC_TEGRA
 	  layer on top of the stmmac driver required for these NVIDIA Tegra SoC
 	  devices.
 
+config DWMAC_TEGRA_PKVM
+	tristate "pKVM support for NVIDIA Tegra234 MGBE reset"
+	depends on KVM && ARCH_TEGRA && m
+	help
+	  Adds a reset handler for the MGBE Controller found on the NVIDIA Tegra
+	  SoC devices in the pKVM hypervisor.
+
+	  This is a pKVM EL2 module and must be loaded before the host is
+	  deprivileged, via kvm-arm.protected_modules=tegra234-mgbe-pkvm.
+
+	  If you don't know what to do here, say N.
+
 config DWMAC_VISCONTI
 	tristate "Toshiba Visconti DWMAC support"
 	default ARCH_VISCONTI
