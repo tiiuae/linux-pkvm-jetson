@@ -174,6 +174,17 @@ static int vfio_platform_tegra234_mgbe_init(struct vfio_platform_device *vpdev)
 		return ret;
 	}
 
+	/*
+	 * In protected mode the register-level reset is done by the pKVM EL2
+	 * module (tegra234-mgbe-pkvm); the host only handles clocks and the
+	 * BPMP reset line and never touches the MMIO.
+	 */
+	if (is_protected_kvm_enabled()) {
+		mgbe->mac = NULL;
+		vpdev->reset_opaque = mgbe;
+		return 0;
+	}
+
 	mac_regs->ioaddr = ioremap(mac_regs->addr, mac_regs->size);
 	if (!mac_regs->ioaddr)
 		return -ENOMEM;
@@ -202,7 +213,10 @@ static int vfio_platform_tegra234_mgbe_reset(struct vfio_platform_device *vpdev)
 	if (!mgbe)
 		return -ENODEV;
 
-	toggle_reset(dev, "mac", mgbe->mac_rst);
+	ret = toggle_reset(dev, "mac", mgbe->mac_rst);
+
+	if (!mgbe->mac)
+		return ret;
 
 	for (int i = 0; i < 10; i++)
 		disable_dma_irq(mgbe->mac, i);
