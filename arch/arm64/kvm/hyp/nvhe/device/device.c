@@ -12,6 +12,7 @@
 #include <nvhe/pkvm.h>
 #include <nvhe/pviommu-host.h>
 #include <nvhe/serial.h>
+#include <nvhe/spinlock.h>
 
 #include <kvm/arm_hypercalls.h>
 #include <kvm/device.h>
@@ -32,6 +33,59 @@ unsigned long registered_devices_nr;
 static DEFINE_HYP_SPINLOCK(device_spinlock);
 
 #define PKVM_LATE_DEVICES_MAX	256
+
+/*
+ * Reset handlers registered by modules before the device table exists.
+ * Modules can only be loaded before deprivilege, while devices are registered
+ * late (pkvm_devices_register_late()), so registrations are kept here and
+ * applied once the table is installed. Protected by device_spinlock.
+ */
+#define PKVM_PENDING_RESETS_MAX	16
+
+struct pkvm_pending_reset {
+	u64 phys;
+	void *cookie;
+	struct pkvm_device_ops *cb;
+};
+
+static struct pkvm_pending_reset pending_resets[PKVM_PENDING_RESETS_MAX];
+static unsigned int pending_resets_nr;
+
+/*
+ * Late, post-finalize device registration. The host calls this once after
+ * PCI enumeration has settled. Wrapped in a one-shot guard so a compromised
+ * host cannot re-register or overwrite the device table.
+ */
+static bool late_devices_done;
+
+static struct pkvm_device *pkvm_get_device_by_addr(u64 addr);
+
+static void pkvm_apply_pending_resets(void)
+{
+	struct pkvm_pending_reset *p;
+	struct pkvm_device *dev;
+	unsigned int i;
+
+	hyp_assert_lock_held(&device_spinlock);
+
+	for (i = 0; i < pending_resets_nr; i++) {
+		p = &pending_resets[i];
+		dev = pkvm_get_device_by_addr(p->phys);
+		if (!dev) {
+			hyp_warn("pkvm: pending reset handler for 0x%llx matches no device",
+				 p->phys);
+			continue;
+		} else if (dev->ops) {
+			hyp_warn("pkvm: duplicate reset handler for 0x%llx ignored",
+				 p->phys);
+			continue;
+		}
+		dev->ops = p->cb;
+		dev->cookie = p->cookie;
+	}
+	hyp_info("device: all pending resets registered");
+	pending_resets_nr = 0;
+}
 
 static bool pkvm_mmio_in_assign_region(u64 base, u64 size)
 {
@@ -64,6 +118,10 @@ int pkvm_init_devices(unsigned long nr_devs, struct pkvm_device *devs)
 		return ret;
 
 	for (i = 0; i < nr_devs; i++) {
+		/* Never trust function pointers coming from the host. */
+		table[i].ops = NULL;
+		table[i].cookie = NULL;
+
 		for (j = 0; j < table[i].nr_resources; j++) {
 			struct pkvm_dev_resource *res = &table[i].resources[j];
 
@@ -77,17 +135,13 @@ int pkvm_init_devices(unsigned long nr_devs, struct pkvm_device *devs)
 		}
 	}
 
+	hyp_spin_lock(&device_spinlock);
 	registered_devices    = table;
 	registered_devices_nr = nr_devs;
+	pkvm_apply_pending_resets();
+	hyp_spin_unlock(&device_spinlock);
 	return 0;
 }
-
-/*
- * Late, post-finalize device registration. The host calls this once after
- * PCI enumeration has settled. Wrapped in a one-shot guard so a compromised
- * host cannot re-register or overwrite the device table.
- */
-static bool late_devices_done;
 
 int pkvm_devices_register_late(unsigned long nr_devs, struct pkvm_device *devs)
 {
@@ -553,19 +607,45 @@ void pkvm_devices_put_context(u64 iommu_id, u32 endpoint_id)
 int pkvm_device_register_ops(u64 phys, struct pkvm_device_ops *ops, void *cookie)
 {
 	struct pkvm_device *dev;
+	unsigned int i;
 	int ret = 0;
 
-	dev = pkvm_get_device_by_addr(phys);
-	if (!dev)
-		return -ENODEV;
-
 	hyp_spin_lock(&device_spinlock);
+	dev = pkvm_get_device_by_addr(phys);
+	if (!dev) {
+		/* Device table not installed yet: defer the registration. */
+		if (late_devices_done || registered_devices_nr) {
+			ret = -ENODEV;
+			goto out_unlock;
+		}
+		hyp_info("pkvm_device_register_reset: installing pending reset");
+		for (i = 0; i < pending_resets_nr; i++) {
+			if (pending_resets[i].phys == phys) {
+				ret = -EBUSY;
+				goto out_unlock;
+			}
+		}
+		if (pending_resets_nr >= PKVM_PENDING_RESETS_MAX) {
+			ret = -ENOSPC;
+			goto out_unlock;
+		}
+		pending_resets[pending_resets_nr] = (struct pkvm_pending_reset) {
+			.phys = phys,
+			.cookie = cookie,
+			.cb = ops,
+		};
+		hyp_info("pending_resets[%d] installed for %llx", pending_resets_nr, phys);
+		pending_resets_nr++;
+		goto out_unlock;
+	}
+
 	if (dev->ops) {
 		ret = -EBUSY;
 	} else {
 		dev->ops = ops;
 		dev->cookie = cookie;
 	}
+out_unlock:
 	hyp_spin_unlock(&device_spinlock);
 
 	return ret;
