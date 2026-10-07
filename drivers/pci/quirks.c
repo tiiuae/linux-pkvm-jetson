@@ -4210,69 +4210,6 @@ reset_complete:
 	return 0;
 }
 
-#define PCI_DEVICE_ID_REALTEK_8822CE	0xc822
-#define RTW_PCI_MMIO_BAR		2
-#define RTW_PCI_HIMR0			0x0B0
-#define RTW_PCI_HISR0			0x0B4
-#define RTW_PCI_HIMR1			0x0B8
-#define RTW_PCI_HISR1			0x0BC
-#define RTW_PCI_HIMR2			0x10B0
-#define RTW_PCI_HISR2			0x10B4
-#define RTW_PCI_HIMR3			0x10B8
-#define RTW_PCI_HISR3			0x10BC
-
-/*
- * The RTL8822CE MAC keeps its interrupt state across a secondary bus reset.
- * If the owner (e.g. a VM) dies with interrupts armed, the card asserts INTx
- * again as soon as it is back in D0 with DisINTx clear, before any driver is bound.
- * Clear the MAC interrupts then do the bus reset.
- */
-static int reset_realtek_8822ce(struct pci_dev *dev, bool probe)
-{
-	static const u16 himr[] = { RTW_PCI_HIMR0, RTW_PCI_HIMR1,
-				    RTW_PCI_HIMR2, RTW_PCI_HIMR3 };
-	static const u16 hisr[] = { RTW_PCI_HISR0, RTW_PCI_HISR1,
-				    RTW_PCI_HISR2, RTW_PCI_HISR3 };
-	struct pci_dev *bridge = dev->bus->self;
-	struct pci_dev *pdev;
-	void __iomem *bar;
-	u16 cmd;
-	int i;
-
-	if (pci_is_root_bus(dev->bus) || !bridge ||
-	    dev->dev_flags & PCI_DEV_FLAGS_NO_BUS_RESET ||
-	    !(pci_resource_flags(dev, RTW_PCI_MMIO_BAR) & IORESOURCE_MEM))
-		return -ENOTTY;
-
-	list_for_each_entry(pdev, &dev->bus->devices, bus_list)
-		if (pdev != dev)
-			return -ENOTTY;
-
-	if (probe)
-		return 0;
-
-	bar = pci_iomap(dev, RTW_PCI_MMIO_BAR, RTW_PCI_HISR3 + sizeof(u32));
-	if (bar) {
-		pci_read_config_word(dev, PCI_COMMAND, &cmd);
-		pci_write_config_word(dev, PCI_COMMAND,
-				      cmd | PCI_COMMAND_MEMORY);
-
-		if (readl(bar + RTW_PCI_HIMR0) != ~0U) {
-			for (i = 0; i < ARRAY_SIZE(himr); i++)
-				writel(0, bar + himr[i]);
-			for (i = 0; i < ARRAY_SIZE(hisr); i++)
-				writel(readl(bar + hisr[i]), bar + hisr[i]);
-		} else {
-			pci_warn(dev, "MMIO not responding, skipping IRQ quiesce\n");
-		}
-
-		pci_write_config_word(dev, PCI_COMMAND, cmd);
-		pci_iounmap(dev, bar);
-	}
-
-	return pci_bridge_secondary_bus_reset(bridge);
-}
-
 static const struct pci_dev_reset_methods pci_dev_reset_methods[] = {
 	{ PCI_VENDOR_ID_INTEL, PCI_DEVICE_ID_INTEL_82599_SFP_VF,
 		 reset_intel_82599_sfp_virtfn },
@@ -4288,8 +4225,6 @@ static const struct pci_dev_reset_methods pci_dev_reset_methods[] = {
 		reset_chelsio_generic_dev },
 	{ PCI_VENDOR_ID_HUAWEI, PCI_DEVICE_ID_HINIC_VF,
 		reset_hinic_vf_dev },
-	{ PCI_VENDOR_ID_REALTEK, PCI_DEVICE_ID_REALTEK_8822CE,
-		reset_realtek_8822ce },
 	{ 0 }
 };
 
