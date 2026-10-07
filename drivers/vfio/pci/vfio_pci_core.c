@@ -205,6 +205,14 @@ static bool vfio_pci_nointx(struct pci_dev *pdev)
 		default:
 			return false;
 		}
+	case PCI_VENDOR_ID_REALTEK:
+		switch (pdev->device) {
+		/* RTL8822CE */
+		case 0xc822:
+			return true;
+		default:
+			return false;
+		}
 	}
 
 	return false;
@@ -488,11 +496,11 @@ int vfio_pci_core_enable(struct vfio_pci_core_device *vdev)
 		goto out_disable_device;
 
 	vdev->reset_works = !ret;
-	pci_save_state(pdev);
-	vdev->pci_saved_state = pci_store_saved_state(pdev);
-	if (!vdev->pci_saved_state)
-		pci_dbg(pdev, "%s: Couldn't store saved state\n", __func__);
 
+	/*
+	 * Mask broken INTx before saving state, so the state restored on
+	 * close keeps it masked while the device is unowned.
+	 */
 	if (likely(!nointxmask)) {
 		if (vfio_pci_nointx(pdev)) {
 			pci_info(pdev, "Masking broken INTx support\n");
@@ -501,6 +509,11 @@ int vfio_pci_core_enable(struct vfio_pci_core_device *vdev)
 		} else
 			vdev->pci_2_3 = pci_intx_mask_supported(pdev);
 	}
+
+	pci_save_state(pdev);
+	vdev->pci_saved_state = pci_store_saved_state(pdev);
+	if (!vdev->pci_saved_state)
+		pci_dbg(pdev, "%s: Couldn't store saved state\n", __func__);
 
 	pci_read_config_word(pdev, PCI_COMMAND, &cmd);
 	if (vdev->pci_2_3 && (cmd & PCI_COMMAND_INTX_DISABLE)) {
