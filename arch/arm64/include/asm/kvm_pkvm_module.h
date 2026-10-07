@@ -212,6 +212,15 @@ struct pkvm_sglist_page {
  *				for pVMs. The @ops.trng_uuid is used to advertise the
  *				identity of TRNG implementation. @ops.trng_rnd64 is used
  *				to generate entropy bits to guest.
+ * @device_register_reset_range:
+ *				Same as @device_register_reset, for devices whose MMIO
+ *				address is not known when the module is loaded (e.g. PCI
+ *				BARs assigned after deprivilege). The device is the one
+ *				with exactly one resource fully inside [@base, @base +
+ *				@size). @cb receives that resource's physical address,
+ *				a hypervisor private device mapping of it (valid
+ *				whether the host, hypervisor or guest owns the pages)
+ *				and its size.
  */
 struct pkvm_module_ops {
 	int (*create_private_mapping)(phys_addr_t phys, size_t size,
@@ -286,6 +295,10 @@ struct pkvm_module_ops {
 				     int (*cb)(void *cookie, bool host_to_guest));
 	int (*iommu_register_pviommu_drv)(pkvm_handle_t drv_id);
 	int (*register_guest_trng_ops)(const struct pkvm_module_trng_ops *ops);
+	int (*device_register_reset_range)(u64 base, u64 size, void *cookie,
+					   int (*cb)(void *cookie, bool host_to_guest,
+						     u64 phys, void __iomem *va,
+						     u64 size));
 	ANDROID_KABI_RESERVE(1);
 	ANDROID_KABI_RESERVE(2);
 	ANDROID_KABI_RESERVE(3);

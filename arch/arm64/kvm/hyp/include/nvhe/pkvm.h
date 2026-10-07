@@ -228,6 +228,10 @@ int pkvm_device_reclaim_mmio(u64 pfn, u64 nr_pages);
 int pkvm_host_map_guest_mmio(struct pkvm_hyp_vcpu *hyp_vcpu, u64 pfn, u64 gfn);
 int pkvm_device_register_reset(u64 phys, void *cookie,
 			       int (*cb)(void *cookie, bool host_to_guest));
+int pkvm_device_register_reset_range(u64 base, u64 size, void *cookie,
+				     int (*cb)(void *cookie, bool host_to_guest,
+					       u64 phys, void __iomem *va,
+					       u64 size));
 int pkvm_msix_read_entry(u32 device_idx, u32 entry_idx,
 			 u64 *packed_addr, u64 *packed_data_ctrl);
 int pkvm_msix_write_entry(u32 device_idx, u32 entry_idx,

@@ -41,8 +41,11 @@ static DEFINE_HYP_SPINLOCK(device_spinlock);
 
 struct pkvm_pending_reset {
 	u64 phys;
+	u64 size;
 	void *cookie;
 	int (*cb)(void *cookie, bool host_to_guest);
+	int (*res_cb)(void *cookie, bool host_to_guest, u64 phys,
+		      void __iomem *va, u64 size);
 };
 
 static struct pkvm_pending_reset pending_resets[PKVM_PENDING_RESETS_MAX];
@@ -57,29 +60,103 @@ static bool late_devices_done;
 
 static struct pkvm_device *pkvm_get_device_by_addr(u64 addr);
 
+/*
+ * Return the device that owns the resource inside [base, base + size)
+ */
+static struct pkvm_device *pkvm_get_device_res_in_range(u64 base, u64 size,
+							u32 *idx)
+{
+	struct pkvm_device *dev, *found = NULL;
+	struct pkvm_dev_resource *res;
+	u64 end = base + size;
+	int i, j;
+
+	if (!size || end < base)
+		return NULL;
+
+	for (i = 0; i < registered_devices_nr; ++i) {
+		dev = &registered_devices[i];
+		for (j = 0; j < dev->nr_resources; ++j) {
+			res = &dev->resources[j];
+			if (res->base < base || res->base + res->size > end)
+				continue;
+			if (found) {
+				hyp_warn(
+					"pkvm: reset range 0x%llx+0x%llx matches several resources",
+					base, size);
+				return NULL;
+			}
+			found = dev;
+			*idx = j;
+		}
+	}
+
+	return found;
+}
+
+/* Attach a reset registration to its device. Caller holds device_spinlock. */
+static int pkvm_install_reset(const struct pkvm_pending_reset *p)
+{
+	struct pkvm_device *dev;
+	u32 idx = 0;
+
+	hyp_assert_lock_held(&device_spinlock);
+
+	if (p->size)
+		dev = pkvm_get_device_res_in_range(p->phys, p->size, &idx);
+	else
+		dev = pkvm_get_device_by_addr(p->phys);
+	if (!dev)
+		return -ENODEV;
+
+	if (dev->reset_handler || dev->reset_res_handler)
+		return -EBUSY;
+
+	if (p->size) {
+		struct pkvm_dev_resource *res = &dev->resources[idx];
+		unsigned long va;
+		int ret;
+
+		/*
+		 * Don't rely on the hyp linear map: pkvm_hyp_donate_guest()
+		 * removes each BAR page from it once the guest maps the page,
+		 * and the handler still runs on teardown.
+		 */
+		ret = __pkvm_create_private_mapping(res->base, res->size,
+						    PAGE_HYP_DEVICE, &va);
+		if (ret)
+			return ret;
+
+		dev->reset_res_handler = p->res_cb;
+		dev->reset_res_idx = idx;
+		dev->reset_res_va = (void __iomem *)va;
+	} else {
+		dev->reset_handler = p->cb;
+	}
+	dev->cookie = p->cookie;
+	return 0;
+}
+
 static void pkvm_apply_pending_resets(void)
 {
 	struct pkvm_pending_reset *p;
-	struct pkvm_device *dev;
 	unsigned int i;
+	int ret;
 
 	hyp_assert_lock_held(&device_spinlock);
 
 	for (i = 0; i < pending_resets_nr; i++) {
 		p = &pending_resets[i];
-		dev = pkvm_get_device_by_addr(p->phys);
-		if (!dev) {
-			hyp_warn("pkvm: pending reset handler for 0x%llx matches no device",
-				 p->phys);
-			continue;
-		}
-		if (dev->reset_handler) {
+		ret = pkvm_install_reset(p);
+		if (ret == -ENODEV)
+			hyp_warn("pkvm: pending reset handler for 0x%llx+0x%llx matches no device",
+				p->phys, p->size);
+		else if (ret == -EBUSY)
 			hyp_warn("pkvm: duplicate reset handler for 0x%llx ignored",
-				 p->phys);
-			continue;
-		}
-		dev->reset_handler = p->cb;
-		dev->cookie = p->cookie;
+				p->phys);
+		else if (ret)
+			hyp_warn("pkvm: reset handler for 0x%llx+0x%llx not installed: %d",
+				 p->phys, p->size, ret);
 	}
 	hyp_info("device: all pending resets registered");
 	pending_resets_nr = 0;
@@ -118,6 +195,9 @@ int pkvm_init_devices(unsigned long nr_devs, struct pkvm_device *devs)
 	for (i = 0; i < nr_devs; i++) {
 		/* Never trust function pointers coming from the host. */
 		table[i].reset_handler = NULL;
+		table[i].reset_res_handler = NULL;
+		table[i].reset_res_idx = 0;
+		table[i].reset_res_va = NULL;
 		table[i].cookie = NULL;
 
 		for (j = 0; j < table[i].nr_resources; j++) {
@@ -298,6 +378,23 @@ static int pkvm_device_reset(struct pkvm_device *dev, bool host_to_guest)
 	 */
 	if (dev->reset_handler) {
 		ret = dev->reset_handler(dev->cookie, host_to_guest);
+		if (ret)
+			return ret;
+	} else if (dev->reset_res_handler) {
+		struct pkvm_dev_resource *res;
+
+		if (dev->reset_res_idx >= dev->nr_resources ||
+		    !dev->reset_res_va)
+			return -EINVAL;
+		res = &dev->resources[dev->reset_res_idx];
+
+		/*
+		 * The BAR is hyp-owned on assignment but may be guest-owned
+		 * on teardown, so use the private mapping, not __hyp_va().
+		 */
+		ret = dev->reset_res_handler(dev->cookie, host_to_guest,
+					     res->base, dev->reset_res_va,
+					     res->size);
 		if (ret)
 			return ret;
 	}
@@ -556,52 +653,70 @@ void pkvm_devices_put_context(u64 iommu_id, u32 endpoint_id)
 	hyp_spin_unlock(&device_spinlock);
 }
 
-int pkvm_device_register_reset(u64 phys, void *cookie,
-			       int (*cb)(void *cookie, bool host_to_guest))
+static int __pkvm_device_register_reset(const struct pkvm_pending_reset *req)
 {
-	struct pkvm_device *dev;
 	unsigned int i;
 	int ret = 0;
 
 	hyp_spin_lock(&device_spinlock);
-	dev = pkvm_get_device_by_addr(phys);
-	if (!dev) {
-		/* Device table not installed yet: defer the registration. */
-		if (late_devices_done || registered_devices_nr) {
-			ret = -ENODEV;
-			goto out_unlock;
-		}
-		hyp_info("pkvm_device_register_reset: installing pending reset");
-		for (i = 0; i < pending_resets_nr; i++) {
-			if (pending_resets[i].phys == phys) {
-				ret = -EBUSY;
-				goto out_unlock;
-			}
-		}
-		if (pending_resets_nr >= PKVM_PENDING_RESETS_MAX) {
-			ret = -ENOSPC;
-			goto out_unlock;
-		}
-		pending_resets[pending_resets_nr] = (struct pkvm_pending_reset) {
-			.phys = phys,
-			.cookie = cookie,
-			.cb = cb,
-		};
-		hyp_info("pending_resets[%d] installed for %llx", pending_resets_nr, phys);
-		pending_resets_nr++;
+	if (late_devices_done || registered_devices_nr) {
+		ret = pkvm_install_reset(req);
 		goto out_unlock;
 	}
 
-	if (!dev->reset_handler) {
-		dev->reset_handler = cb;
-		dev->cookie = cookie;
-	} else {
-		ret = -EBUSY;
+	/* Device table not installed yet: defer the registration. */
+	hyp_info("pkvm_device_register_reset: installing pending reset");
+	for (i = 0; i < pending_resets_nr; i++) {
+		if (pending_resets[i].phys == req->phys) {
+			ret = -EBUSY;
+			goto out_unlock;
+		}
 	}
+	if (pending_resets_nr >= PKVM_PENDING_RESETS_MAX) {
+		ret = -ENOSPC;
+		goto out_unlock;
+	}
+	pending_resets[pending_resets_nr] = *req;
+	hyp_info("pending_resets[%d] installed for %llx+%llx",
+		 pending_resets_nr, req->phys, req->size);
+	pending_resets_nr++;
 out_unlock:
 	hyp_spin_unlock(&device_spinlock);
 
 	return ret;
+}
+
+int pkvm_device_register_reset(u64 phys, void *cookie,
+			       int (*cb)(void *cookie, bool host_to_guest))
+{
+	struct pkvm_pending_reset req = {
+		.phys = phys,
+		.cookie = cookie,
+		.cb = cb,
+	};
+
+	if (!cb)
+		return -EINVAL;
+
+	return __pkvm_device_register_reset(&req);
+}
+
+int pkvm_device_register_reset_range(u64 base, u64 size, void *cookie,
+				     int (*cb)(void *cookie, bool host_to_guest,
+					       u64 phys, void __iomem *va,
+					       u64 size))
+{
+	struct pkvm_pending_reset req = {
+		.phys = base,
+		.size = size,
+		.cookie = cookie,
+		.res_cb = cb,
+	};
+
+	if (!cb || !size || base + size < base)
+		return -EINVAL;
+
+	return __pkvm_device_register_reset(&req);
 }
 
 /*

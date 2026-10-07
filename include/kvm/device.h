@@ -38,8 +38,17 @@ struct pkvm_device {
 	u32 group_id;
 	void *ctxt;
 	unsigned short refcount;
-	int (*reset_handler)(void *cookie, bool host_to_guest);
 	void *cookie; /* cookie from drivers. */
+	int (*reset_handler)(void *cookie, bool host_to_guest);
+	int (*reset_res_handler)(void *cookie, bool host_to_guest, u64 phys,
+				 void __iomem *va, u64 size);
+	u32 reset_res_idx;
+	/*
+	 * Hyp private mapping of resources[reset_res_idx], independent of the
+	 * page ownership (the linear map entry goes away once the guest maps
+	 * the page).
+	 */
+	void __iomem *reset_res_va;
 
 	/*
 	 * MSI-X table info, populated at boot before prot_finalize.

@@ -320,6 +320,7 @@ const struct pkvm_module_ops module_ops = {
 	.device_register_reset = pkvm_device_register_reset,
 	.iommu_register_pviommu_drv = kvm_iommu_register_pviommu_drv,
 	.register_guest_trng_ops = __register_guest_trng_ops,
+	.device_register_reset_range = pkvm_device_register_reset_range,
 };
 
 static void *pkvm_module_hyp_va(struct pkvm_el2_module *mod, void *kern_va)
