@@ -141,7 +141,12 @@
 
 #define OVERFLOW_STACK_SIZE	SZ_4K
 
+#if PAGE_SIZE == SZ_4K
+#define NVHE_STACK_SHIFT       (PAGE_SHIFT + 1)
+#else
 #define NVHE_STACK_SHIFT       PAGE_SHIFT
+#endif
+
 #define NVHE_STACK_SIZE        (UL(1) << NVHE_STACK_SHIFT)
 
 /*
@@ -237,6 +242,11 @@ static inline u64 __pure read_tcr(void)
 extern s64			memstart_addr;
 /* PHYS_OFFSET - the physical address of the start of memory. */
 #define PHYS_OFFSET		({ VM_BUG_ON(memstart_addr & 1); memstart_addr; })
+
+#ifdef CONFIG_EXECMEM
+extern u64 module_direct_base;
+extern u64 module_plt_base;
+#endif
 
 /* the offset between the kernel virtual and physical mappings */
 extern u64			kimage_voffset;

@@ -28,6 +28,9 @@
 #include <linux/highmem.h>
 #include <linux/io.h>
 #include <linux/kmemleak.h>
+#include <linux/sched.h>
+#include <linux/jiffies.h>
+#include <linux/gcma.h>
 #include <trace/events/cma.h>
 
 #include "internal.h"
@@ -161,11 +164,18 @@ static void __init cma_activate_area(struct cma *cma)
 			count = early_pfn[r] - cmr->base_pfn;
 			bitmap_count = cma_bitmap_pages_to_bits(cma, count);
 			bitmap_set(cmr->bitmap, 0, bitmap_count);
+		} else {
+			count = 0;
 		}
 
-		for (pfn = early_pfn[r]; pfn < cmr->base_pfn + cmr->count;
-		     pfn += pageblock_nr_pages)
-			init_cma_reserved_pageblock(pfn_to_page(pfn));
+		if (cma->gcma) {
+			register_gcma_area(cma->name, PFN_PHYS(early_pfn[r]),
+					   (cmr->count - count) << PAGE_SHIFT);
+		} else {
+			for (pfn = early_pfn[r]; pfn < cmr->base_pfn + cmr->count;
+			     pfn += pageblock_nr_pages)
+				init_cma_reserved_pageblock(pfn_to_page(pfn));
+		}
 	}
 
 	spin_lock_init(&cma->lock);
@@ -216,7 +226,7 @@ void __init cma_reserve_pages_on_error(struct cma *cma)
 
 static int __init cma_new_area(const char *name, phys_addr_t size,
 			       unsigned int order_per_bit,
-			       struct cma **res_cma)
+			       struct cma **res_cma, bool gcma)
 {
 	struct cma *cma;
 
@@ -235,7 +245,8 @@ static int __init cma_new_area(const char *name, phys_addr_t size,
 	if (name)
 		snprintf(cma->name, CMA_MAX_NAME, "%s", name);
 	else
-		snprintf(cma->name, CMA_MAX_NAME,  "cma%d\n", cma_area_count);
+		snprintf(cma->name, CMA_MAX_NAME,
+			 gcma ? "gcma%d\n" : "cma%d\n", cma_area_count);
 
 	cma->available_count = cma->count = size >> PAGE_SHIFT;
 	cma->order_per_bit = order_per_bit;
@@ -266,7 +277,7 @@ static void __init cma_drop_area(struct cma *cma)
 int __init cma_init_reserved_mem(phys_addr_t base, phys_addr_t size,
 				 unsigned int order_per_bit,
 				 const char *name,
-				 struct cma **res_cma)
+				 struct cma **res_cma, bool gcma)
 {
 	struct cma *cma;
 	int ret;
@@ -288,7 +299,7 @@ int __init cma_init_reserved_mem(phys_addr_t base, phys_addr_t size,
 	if (!IS_ALIGNED(base | size, CMA_MIN_ALIGNMENT_BYTES))
 		return -EINVAL;
 
-	ret = cma_new_area(name, size, order_per_bit, &cma);
+	ret = cma_new_area(name, size, order_per_bit, &cma, gcma);
 	if (ret != 0)
 		return ret;
 
@@ -297,6 +308,7 @@ int __init cma_init_reserved_mem(phys_addr_t base, phys_addr_t size,
 	cma->ranges[0].count = cma->count;
 	cma->nranges = 1;
 	cma->nid = NUMA_NO_NODE;
+	cma->gcma = gcma;
 
 	*res_cma = cma;
 
@@ -503,7 +515,8 @@ static int __init __cma_declare_contiguous_nid(phys_addr_t *basep,
 		kmemleak_ignore_phys(base);
 	}
 
-	ret = cma_init_reserved_mem(base, size, order_per_bit, name, res_cma);
+	ret = cma_init_reserved_mem(base, size, order_per_bit, name, res_cma,
+				    false);
 	if (ret) {
 		memblock_phys_free(base, size);
 		return ret;
@@ -567,7 +580,7 @@ int __init cma_declare_contiguous_multi(phys_addr_t total_size,
 	sizesum = 0;
 	failed = NULL;
 
-	ret = cma_new_area(name, total_size, order_per_bit, &cma);
+	ret = cma_new_area(name, total_size, order_per_bit, &cma, false);
 	if (ret != 0)
 		goto out;
 
@@ -784,6 +797,8 @@ static int cma_range_alloc(struct cma *cma, struct cma_memrange *cmr,
 	unsigned long start, pfn, mask, offset;
 	int ret = -EBUSY;
 	struct page *page = NULL;
+	int num_attempts = 0;
+	int max_retries = 5;
 
 	mask = cma_bitmap_aligned_mask(cma, align);
 	offset = cma_bitmap_aligned_offset(cma, cmr, align);
@@ -807,8 +822,28 @@ static int cma_range_alloc(struct cma *cma, struct cma_memrange *cmr,
 				bitmap_maxno, start, bitmap_count, mask,
 				offset);
 		if (bitmap_no >= bitmap_maxno) {
-			spin_unlock_irq(&cma->lock);
-			break;
+			if ((num_attempts < max_retries) && (ret == -EBUSY)) {
+				spin_unlock_irq(&cma->lock);
+
+				if (fatal_signal_pending(current))
+					break;
+
+				/*
+				 * Page may be momentarily pinned by some other
+				 * process which has been scheduled out, e.g.
+				 * in exit path, during unmap call, or process
+				 * fork and so cannot be freed there. Sleep
+				 * for 100ms and retry the allocation.
+				 */
+				start = 0;
+				ret = -ENOMEM;
+				schedule_timeout_killable(msecs_to_jiffies(100));
+				num_attempts++;
+				continue;
+			} else {
+				spin_unlock_irq(&cma->lock);
+				break;
+			}
 		}
 
 		pfn = cmr->base_pfn + (bitmap_no << cma->order_per_bit);
@@ -836,7 +871,12 @@ static int cma_range_alloc(struct cma *cma, struct cma_memrange *cmr,
 		spin_unlock_irq(&cma->lock);
 
 		mutex_lock(&cma->alloc_mutex);
-		ret = alloc_contig_range(pfn, pfn + count, ACR_FLAGS_CMA, gfp);
+		if (cma->gcma) {
+			gcma_alloc_range(pfn, pfn + count - 1);
+			ret = 0;
+		} else {
+			ret = alloc_contig_range(pfn, pfn + count, ACR_FLAGS_CMA, gfp);
+		}
 		mutex_unlock(&cma->alloc_mutex);
 		if (!ret)
 			break;
@@ -856,7 +896,7 @@ out:
 	return ret;
 }
 
-static struct page *__cma_alloc(struct cma *cma, unsigned long count,
+struct page *__cma_alloc(struct cma *cma, unsigned long count,
 		       unsigned int align, gfp_t gfp)
 {
 	struct page *page = NULL;
@@ -913,6 +953,7 @@ static struct page *__cma_alloc(struct cma *cma, unsigned long count,
 
 	return page;
 }
+EXPORT_SYMBOL_GPL(__cma_alloc);
 
 /**
  * cma_alloc() - allocate pages from contiguous area
@@ -1009,7 +1050,10 @@ bool cma_release(struct cma *cma, const struct page *pages,
 	if (r == cma->nranges)
 		return false;
 
-	free_contig_range(pfn, count);
+	if (cma->gcma)
+		gcma_free_range(pfn, pfn + count - 1);
+	else
+		free_contig_range(pfn, count);
 	cma_clear_bitmap(cma, cmr, pfn, count);
 	cma_sysfs_account_release_pages(cma, count);
 	trace_cma_release(cma->name, pfn, pages, count);

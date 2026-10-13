@@ -11,8 +11,13 @@
 #include <linux/const.h>
 #include <linux/types.h>
 #include <linux/compiler.h>
+#include <linux/stddef.h>
 #include <linux/ioctl.h>
 #include <asm/kvm.h>
+
+#ifdef __KERNEL__
+#include <linux/kvm_types.h>
+#endif
 
 #define KVM_API_VERSION 12
 
@@ -519,7 +524,7 @@ struct kvm_coalesced_mmio {
 
 struct kvm_coalesced_mmio_ring {
 	__u32 first, last;
-	struct kvm_coalesced_mmio coalesced_mmio[];
+	__DECLARE_FLEX_ARRAY(struct kvm_coalesced_mmio, coalesced_mmio);
 };
 
 #define KVM_COALESCED_MMIO_MAX \
@@ -569,7 +574,7 @@ struct kvm_clear_dirty_log {
 /* for KVM_SET_SIGNAL_MASK */
 struct kvm_signal_mask {
 	__u32 len;
-	__u8  sigset[];
+	__DECLARE_FLEX_ARRAY(__u8, sigset);
 };
 
 /* for KVM_TPR_ACCESS_REPORTING */
@@ -680,6 +685,12 @@ struct kvm_enable_cap {
 #define KVM_VM_TYPE_ARM_IPA_SIZE_MASK	0xffULL
 #define KVM_VM_TYPE_ARM_IPA_SIZE(x)		\
 	((x) & KVM_VM_TYPE_ARM_IPA_SIZE_MASK)
+
+#define KVM_VM_TYPE_ARM_PROTECTED	(1UL << 31)
+
+#define KVM_VM_TYPE_MASK	(KVM_VM_TYPE_ARM_IPA_SIZE_MASK | \
+				 KVM_VM_TYPE_ARM_PROTECTED)
+
 /*
  * ioctls for /dev/kvm fds:
  */
@@ -704,6 +715,7 @@ struct kvm_enable_cap {
 /*
  * Extension capability list.
  */
+#define KVM_CAP_CORE -1	/* represents core KVM capabilities */
 #define KVM_CAP_IRQCHIP	  0
 #define KVM_CAP_HLT	  1
 #define KVM_CAP_MMU_SHADOW_CACHE_CONTROL 2
@@ -964,6 +976,8 @@ struct kvm_enable_cap {
 #define KVM_CAP_ARM_CACHEABLE_PFNMAP_SUPPORTED 243
 #define KVM_CAP_GUEST_MEMFD_FLAGS 244
 
+#define KVM_CAP_ARM_PROTECTED_VM 0xffbadab1
+
 struct kvm_irq_routing_irqchip {
 	__u32 irqchip;
 	__u32 pin;
@@ -1025,7 +1039,7 @@ struct kvm_irq_routing_entry {
 struct kvm_irq_routing {
 	__u32 nr;
 	__u32 flags;
-	struct kvm_irq_routing_entry entries[];
+	__DECLARE_FLEX_ARRAY(struct kvm_irq_routing_entry, entries);
 };
 
 #define KVM_IRQFD_FLAG_DEASSIGN (1 << 0)
@@ -1116,7 +1130,7 @@ struct kvm_dirty_tlb {
 
 struct kvm_reg_list {
 	__u64 n; /* number of regs */
-	__u64 reg[];
+	__DECLARE_FLEX_ARRAY(__u64, reg);
 };
 
 struct kvm_one_reg {
@@ -1168,6 +1182,48 @@ struct kvm_device_attr {
 #define   KVM_DEV_VFIO_GROUP_ADD	KVM_DEV_VFIO_FILE_ADD
 #define   KVM_DEV_VFIO_GROUP_DEL	KVM_DEV_VFIO_FILE_DEL
 #define   KVM_DEV_VFIO_GROUP_SET_SPAPR_TCE		3
+
+/* PVIOMMU for guests. */
+#define KVM_DEV_VFIO_PVIOMMU				5
+#define  KVM_DEV_VFIO_PVIOMMU_ATTACH			1
+
+/**
+ * struct kvm_vfio_iommu_info
+ * @size: sizeof(struct kvm_vfio_iommu_info)
+ * @device_fd: File descriptor for VFIO device
+ * @out_nr_sids: Number of IOMMU endpoints for this device (returned)
+ * @__reserved: Must be 0
+ * Probe IOMMU information for a VFIO device so it can be
+ * configured from userspace to have a virtual toplogy for
+ * KVM guests.
+ */
+struct kvm_vfio_iommu_info {
+	__u32 size;
+	__s32 device_fd;
+	__u32 out_nr_sids;
+	__u32 __reserved;
+};
+#define  KVM_DEV_VFIO_PVIOMMU_GET_INFO			2
+
+/* pvIOMMU fd IOCTLs. */
+
+/**
+ * struct kvm_vfio_iommu_info
+ * @size: sizeof(struct kvm_vfio_iommu_info)
+ * @device_fd: File descriptor for VFIO device
+ * @sid_idx: Index of sid (within number from KVM_DEV_VFIO_PVIOMMU_GET_INFO)
+ * @vsid: virtual SID visible to guest for this SID
+ * @__reserved: Must be 0
+ * Configure KVM guest virtual view for a device IOMMU endpoints.
+ */
+struct kvm_vfio_iommu_config {
+	__u32 size;
+	__s32 device_fd;
+	__u32 sid_idx;
+	__u32 vsid;
+	__u32 __reserved;
+};
+#define KVM_PVIOMMU_SET_CONFIG                 _IOWR(KVMIO, 0x1, struct kvm_vfio_iommu_config)
 
 enum kvm_device_type {
 	KVM_DEV_TYPE_FSL_MPIC_20	= 1,
@@ -1568,7 +1624,11 @@ struct kvm_stats_desc {
 	__u16 size;
 	__u32 offset;
 	__u32 bucket_size;
-	char name[];
+#ifdef __KERNEL__
+	char name[KVM_STATS_NAME_SIZE];
+#else
+	__DECLARE_FLEX_ARRAY(char, name);
+#endif
 };
 
 #define KVM_GET_STATS_FD  _IO(KVMIO,  0xce)
