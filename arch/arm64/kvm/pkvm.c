@@ -737,6 +737,7 @@ static int pkvm_register_device(struct of_phandle_args *args,
 
 	dev->nr_iommus = j;
 	dev->ctxt = NULL;
+	dev->refcount = 0;
 	dev->group_id = group_id;
 
 	return 0;
@@ -2147,6 +2148,11 @@ static int __pkvm_arch_reclaim_device(struct device *dev, void *data)
 	struct platform_device *pdev;
 	struct resource *r;
 	int index = 0;
+
+	if (!dev)
+		return -EINVAL;
+	if (!dev_is_platform(dev))
+		return -EOPNOTSUPP;
 
 	pdev = to_platform_device(dev);
 
