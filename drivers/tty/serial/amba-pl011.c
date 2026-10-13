@@ -3066,7 +3066,9 @@ static struct platform_driver arm_sbsa_uart_platform_driver = {
 		.pm	= &pl011_dev_pm_ops,
 		.of_match_table = sbsa_uart_of_match,
 		.acpi_match_table = sbsa_uart_acpi_match,
-		.suppress_bind_attrs = IS_BUILTIN(CONFIG_SERIAL_AMBA_PL011),
+		/* We want to allow driver unbind for vfio-platform assignment.
+		 * See commit 646097940ad35aa2c1f2012af932d55976a9f255 for why this was enabled. */
+		.suppress_bind_attrs = IS_ENABLED(CONFIG_DEBUG_TEST_DRIVER_REMOVE),
 	},
 };
 

@@ -177,13 +177,66 @@ static inline void tegra_bpmp_free_mrq(struct tegra_bpmp *bpmp,
 }
 
 static inline bool tegra_bpmp_mrq_is_supported(struct tegra_bpmp *bpmp,
-					      unsigned int mrq)
+					       unsigned int mrq)
 {
 	return false;
 }
 #endif
 
 void tegra_bpmp_handle_rx(struct tegra_bpmp *bpmp);
+
+struct tegra_bpmp_req_packed {
+	u32 mrq;
+	u64 tx_size;
+	u8 tx_data[MSG_DATA_MIN_SZ];
+	/* Expected response size from caller side */
+	u64 rx_size;
+	u64 flags;
+};
+
+struct tegra_bpmp_resp_packed {
+	u32 ret;
+	u64 rx_size;
+	u8 rx_data[MSG_DATA_MIN_SZ];
+};
+
+bool tegra_bpmp_message_valid(const struct tegra_bpmp_message *msg);
+
+#if IS_ENABLED(CONFIG_TEGRA_BPMP_HOST_PROXY)
+int bpmp_message_req_serialize(const struct tegra_bpmp_message *msg,
+			       struct tegra_bpmp_req_packed *out);
+int bpmp_message_resp_deserialize(const struct tegra_bpmp_resp_packed *resp,
+				  struct tegra_bpmp_message *msg);
+int bpmp_message_req_deserialize(const struct tegra_bpmp_req_packed *req,
+				 struct tegra_bpmp_message *msg);
+int bpmp_message_resp_serialize(const struct tegra_bpmp_message *msg,
+				struct tegra_bpmp_resp_packed *out);
+#else
+static inline int
+bpmp_message_req_serialize(const struct tegra_bpmp_message *msg,
+			   struct tegra_bpmp_req_packed *out)
+{
+	return -ENOTSUPP;
+}
+static inline int
+bpmp_message_resp_deserialize(const struct tegra_bpmp_resp_packed *resp,
+			      struct tegra_bpmp_message *msg)
+{
+	return -ENOTSUPP;
+}
+static inline int
+bpmp_message_req_deserialize(const struct tegra_bpmp_req_packed *req,
+			     struct tegra_bpmp_message *msg)
+{
+	return -ENOTSUPP;
+}
+static inline int
+bpmp_message_resp_serialize(const struct tegra_bpmp_message *msg,
+			    struct tegra_bpmp_resp_packed *out)
+{
+	return -ENOTSUPP;
+}
+#endif
 
 #if IS_ENABLED(CONFIG_CLK_TEGRA_BPMP)
 int tegra_bpmp_init_clocks(struct tegra_bpmp *bpmp);
@@ -220,6 +273,5 @@ static inline int tegra_bpmp_init_debugfs(struct tegra_bpmp *bpmp)
 	return 0;
 }
 #endif
-
 
 #endif /* __SOC_TEGRA_BPMP_H */
