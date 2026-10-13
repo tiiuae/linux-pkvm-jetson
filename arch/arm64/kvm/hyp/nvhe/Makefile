@@ -41,6 +41,13 @@ hyp-obj-$(CONFIG_ARM_SMMU_V3_PKVM_PV) += $(HYP_SMMU_V3_DRV_PATH)/pkvm/pv/arm-smm
 	$(HYP_SMMU_V3_DRV_PATH)/pkvm/arm-smmu-v3-lib-hyp.o
 endif
 
+# Only for built-in, not modules
+HYP_PL011_DRV_PATH = ../../../../../drivers/tty/serial/pkvm-pl011
+
+ifeq ($(CONFIG_SERIAL_PKVM_PL011),y)
+hyp-obj-$(CONFIG_SERIAL_PKVM_PL011) += $(HYP_PL011_DRV_PATH)/hyp/pl011-hyp.o
+endif
+
 $(obj)/hyp.lds: $(src)/hyp.lds.S FORCE
 	$(call if_changed_dep,cpp_lds_S)
 
