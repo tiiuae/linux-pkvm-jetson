@@ -2048,7 +2048,7 @@ static void handle___pkvm_mc_register_sid(struct kvm_cpu_context *host_ctxt)
 	DECLARE_REG(u32, sid, host_ctxt, 2);
 
 	ret = mc_register_sid_mapping(client_id, sid);
-	hyp_reqs_smccc_encode(ret, host_ctxt, this_cpu_ptr(&host_hyp_reqs));
+	this_cpu_hyp_req_to_smccc(ret, host_ctxt);
 }
 #endif
 
@@ -2063,7 +2063,7 @@ static void handle___pkvm_host_iommu_debug(struct kvm_cpu_context *host_ctxt)
 	DECLARE_REG(size_t, out_sz, host_ctxt, 5);
 
 	ret = kvm_iommu_debug(drv_id, smmu_id, op, kern_hyp_va(out), out_sz);
-	hyp_reqs_smccc_encode(ret, host_ctxt, this_cpu_ptr(&host_hyp_reqs));
+	this_cpu_hyp_req_to_smccc(ret, host_ctxt);
 }
 #endif
 
