@@ -6,12 +6,17 @@
 
 #include <asm/kvm_asm.h>
 #include <asm/kvm_hyp.h>
+#include <asm/kvm_hypevents.h>
 #include <asm/kvm_mmu.h>
-#include <linux/arm-smccc.h>
 #include <linux/kvm_host.h>
 #include <uapi/linux/psci.h>
 
+#include <nvhe/arm-smccc.h>
+#include <nvhe/mem_protect.h>
 #include <nvhe/memory.h>
+#include <nvhe/mm.h>
+#include <nvhe/modules.h>
+#include <nvhe/pkvm.h>
 #include <nvhe/trap_handler.h>
 
 void kvm_hyp_cpu_entry(unsigned long r0);
@@ -21,6 +26,23 @@ void __noreturn __host_enter(struct kvm_cpu_context *host_ctxt);
 
 /* Config options set by the host. */
 struct kvm_host_psci_config __ro_after_init kvm_host_psci_config;
+
+static void (*pkvm_psci_notifier)(enum pkvm_psci_notification, struct user_pt_regs *);
+static void pkvm_psci_notify(enum pkvm_psci_notification notif, struct kvm_cpu_context *host_ctxt)
+{
+	if (smp_load_acquire(&pkvm_psci_notifier))
+		pkvm_psci_notifier(notif, &host_ctxt->regs);
+}
+
+int __pkvm_register_psci_notifier(void (*cb)(enum pkvm_psci_notification, struct user_pt_regs *))
+{
+	/*
+	 * Paired with smp_load_acquire(&pkvm_psci_notifier) in
+	 * pkvm_psci_notify(). Ensure memory stores hapenning during a pKVM module
+	 * init are observed before executing the callback.
+	 */
+	return cmpxchg_release(&pkvm_psci_notifier, NULL, cb) ? -EBUSY : 0;
+}
 
 #define INVALID_CPU_ID	UINT_MAX
 
@@ -153,6 +175,7 @@ static int psci_cpu_suspend(u64 func_id, struct kvm_cpu_context *host_ctxt)
 	DECLARE_REG(u64, power_state, host_ctxt, 1);
 	DECLARE_REG(unsigned long, pc, host_ctxt, 2);
 	DECLARE_REG(unsigned long, r0, host_ctxt, 3);
+	int ret;
 
 	struct psci_boot_args *boot_args;
 	struct kvm_nvhe_init_params *init_params;
@@ -167,13 +190,17 @@ static int psci_cpu_suspend(u64 func_id, struct kvm_cpu_context *host_ctxt)
 	boot_args->pc = pc;
 	boot_args->r0 = r0;
 
+	pkvm_psci_notify(PKVM_PSCI_CPU_SUSPEND, host_ctxt);
+
 	/*
 	 * Will either return if shallow sleep state, or wake up into the entry
 	 * point if it is a deep sleep state.
 	 */
-	return psci_call(func_id, power_state,
-			 __hyp_pa(&kvm_hyp_cpu_resume),
-			 __hyp_pa(init_params));
+	ret = psci_call(func_id, power_state,
+			__hyp_pa(&kvm_hyp_cpu_resume),
+			__hyp_pa(init_params));
+
+	return ret;
 }
 
 static int psci_system_suspend(u64 func_id, struct kvm_cpu_context *host_ctxt)
@@ -194,10 +221,42 @@ static int psci_system_suspend(u64 func_id, struct kvm_cpu_context *host_ctxt)
 	boot_args->pc = pc;
 	boot_args->r0 = r0;
 
+	pkvm_psci_notify(PKVM_PSCI_SYSTEM_SUSPEND, host_ctxt);
+
 	/* Will only return on error. */
 	return psci_call(func_id,
 			 __hyp_pa(&kvm_hyp_cpu_resume),
 			 __hyp_pa(init_params), 0);
+}
+
+static void psci_relax_late_cpu_vector(void)
+{
+	u64 pfr0;
+	u8 csv2;
+
+	pfr0 = read_sysreg_s(SYS_ID_AA64PFR0_EL1);
+	csv2 = cpuid_feature_extract_unsigned_field(pfr0, ID_AA64PFR0_EL1_CSV2_SHIFT);
+	if (csv2 >= ID_AA64PFR0_EL1_CSV2_CSV2_3) {
+		pkvm_cpu_set_vector(HYP_VECTOR_DIRECT);
+	} else if (csv2) {
+		u64 mmfr1 = read_sysreg_s(SYS_ID_AA64MMFR1_EL1);
+
+		if (cpuid_feature_extract_unsigned_field(mmfr1, ID_AA64MMFR1_EL1_ECBHB_SHIFT))
+			pkvm_cpu_set_vector(HYP_VECTOR_DIRECT);
+	}
+}
+
+static void psci_handle_late_cpu(struct kvm_cpu_context *host_ctxt)
+{
+	if (!host_data_test_flag(PKVM_LATE_CPU))
+		return;
+
+	kvm_init_host_cpu_context(host_ctxt);
+	kvm_init_host_debug_data();
+
+	psci_relax_late_cpu_vector();
+
+	host_data_clear_flag(PKVM_LATE_CPU);
 }
 
 asmlinkage void __noreturn __kvm_host_psci_cpu_entry(bool is_cpu_on)
@@ -205,7 +264,14 @@ asmlinkage void __noreturn __kvm_host_psci_cpu_entry(bool is_cpu_on)
 	struct psci_boot_args *boot_args;
 	struct kvm_cpu_context *host_ctxt;
 
+	__hyp_enter();
+
 	host_ctxt = host_data_ptr(host_ctxt);
+
+	psci_handle_late_cpu(host_ctxt);
+
+	if (static_branch_unlikely(&kvm_vgic_global_state.gicv3_cpuif))
+		__vgic_v3_init_lrs();
 
 	if (is_cpu_on)
 		boot_args = this_cpu_ptr(&cpu_on_args);
@@ -221,7 +287,58 @@ asmlinkage void __noreturn __kvm_host_psci_cpu_entry(bool is_cpu_on)
 	write_sysreg_el1(INIT_SCTLR_EL1_MMU_OFF, SYS_SCTLR);
 	write_sysreg(INIT_PSTATE_EL1, SPSR_EL2);
 
+	pkvm_psci_notify(PKVM_PSCI_CPU_ENTRY, host_ctxt);
+	__hyp_exit();
+	hyp_ftrace_ret_flush();
 	__host_enter(host_ctxt);
+}
+
+static DEFINE_HYP_SPINLOCK(mem_protect_lock);
+
+static u64 psci_mem_protect(s64 offset)
+{
+	static u64 cnt;
+	u64 new = cnt + offset;
+
+	hyp_assert_lock_held(&mem_protect_lock);
+
+	if (!offset || kvm_host_psci_config.version < PSCI_VERSION(1, 1))
+		return cnt;
+
+	if (!cnt || !new)
+		psci_call(PSCI_1_1_FN_MEM_PROTECT, offset < 0 ? 0 : 1, 0, 0);
+
+	trace_psci_mem_protect(new, cnt);
+
+	cnt = new;
+	return cnt;
+}
+
+static bool psci_mem_protect_active(void)
+{
+	return psci_mem_protect(0);
+}
+
+void psci_mem_protect_inc(u64 n)
+{
+	hyp_spin_lock(&mem_protect_lock);
+	psci_mem_protect(n);
+	hyp_spin_unlock(&mem_protect_lock);
+}
+
+void psci_mem_protect_dec(u64 n)
+{
+	hyp_spin_lock(&mem_protect_lock);
+	psci_mem_protect(-n);
+	hyp_spin_unlock(&mem_protect_lock);
+}
+
+static unsigned long psci_poison_and_freeze(struct kvm_cpu_context *host_ctxt)
+{
+	pkvm_poison_pvmfw_pages();
+	/* Avoid racing with a MEM_PROTECT call. */
+	hyp_spin_lock(&mem_protect_lock);
+	return psci_forward(host_ctxt);
 }
 
 static unsigned long psci_0_1_handler(u64 func_id, struct kvm_cpu_context *host_ctxt)
@@ -252,7 +369,7 @@ static unsigned long psci_0_2_handler(u64 func_id, struct kvm_cpu_context *host_
 	 */
 	case PSCI_0_2_FN_SYSTEM_OFF:
 	case PSCI_0_2_FN_SYSTEM_RESET:
-		return psci_forward(host_ctxt);
+		return psci_poison_and_freeze(host_ctxt);
 	case PSCI_0_2_FN64_CPU_SUSPEND:
 		return psci_cpu_suspend(func_id, host_ctxt);
 	case PSCI_0_2_FN64_CPU_ON:
@@ -262,15 +379,32 @@ static unsigned long psci_0_2_handler(u64 func_id, struct kvm_cpu_context *host_
 	}
 }
 
+static unsigned long psci_system_reset2(struct kvm_cpu_context *host_ctxt)
+{
+	DECLARE_REG(u32, reset_type, host_ctxt, 1);
+
+	pkvm_poison_pvmfw_pages();
+	hyp_spin_lock(&mem_protect_lock);
+
+	if (psci_mem_protect_active() &&
+	    reset_type == PSCI_1_1_RESET_TYPE_SYSTEM_WARM_RESET) {
+		cpu_reg(host_ctxt, 0) = PSCI_0_2_FN_SYSTEM_RESET;
+	}
+
+	return psci_forward(host_ctxt);
+}
+
 static unsigned long psci_1_0_handler(u64 func_id, struct kvm_cpu_context *host_ctxt)
 {
 	switch (func_id) {
+	case PSCI_1_1_FN64_SYSTEM_RESET2:
+		return psci_system_reset2(host_ctxt);
 	case PSCI_1_0_FN_PSCI_FEATURES:
 	case PSCI_1_0_FN_SET_SUSPEND_MODE:
-	case PSCI_1_1_FN64_SYSTEM_RESET2:
+		return psci_forward(host_ctxt);
 	case PSCI_1_3_FN_SYSTEM_OFF2:
 	case PSCI_1_3_FN64_SYSTEM_OFF2:
-		return psci_forward(host_ctxt);
+		return psci_poison_and_freeze(host_ctxt);
 	case PSCI_1_0_FN64_SYSTEM_SUSPEND:
 		return psci_system_suspend(func_id, host_ctxt);
 	default:

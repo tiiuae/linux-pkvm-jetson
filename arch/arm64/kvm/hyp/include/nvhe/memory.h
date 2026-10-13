@@ -6,6 +6,7 @@
 #include <asm/page.h>
 
 #include <linux/types.h>
+#include <nvhe/refcount.h>
 
 /*
  * Bits 0-1 are used to encode the memory ownership state of each page from the
@@ -30,6 +31,16 @@ enum pkvm_page_state {
 	 * struct hyp_page.
 	 */
 	PKVM_NOPAGE			= BIT(0) | BIT(1),
+	PKVM_MODULE_OWNED_PAGE		= BIT(2),
+	PKVM_MODULE_SHARED_OWNED_PAGE	= BIT(3),
+
+	/*
+	 * Meta-states which aren't encoded directly in the PTE's SW bits (or
+	 * the hyp_vmemmap entry for the host)
+	 */
+	PKVM_PAGE_RESTRICTED_PROT	= BIT(4),
+	PKVM_MMIO			= BIT(5),
+	PKVM_ACCEPT_MODULE_OWNED	= BIT(6),
 };
 #define PKVM_PAGE_STATE_MASK		(BIT(0) | BIT(1))
 
@@ -61,23 +72,16 @@ struct hyp_page {
 	 */
 	unsigned __hyp_state_comp : 4;
 
-	u32 host_share_guest_count;
+	union {
+		u32 host_share_guest_count;
+
+		/* When the page is hyp owned, a tag may be added */
+		u32 tag;
+	};
 };
 
 extern u64 __hyp_vmemmap;
 #define hyp_vmemmap ((struct hyp_page *)__hyp_vmemmap)
-
-#define __hyp_va(phys)	((void *)((phys_addr_t)(phys) - hyp_physvirt_offset))
-
-static inline void *hyp_phys_to_virt(phys_addr_t phys)
-{
-	return __hyp_va(phys);
-}
-
-static inline phys_addr_t hyp_virt_to_phys(void *addr)
-{
-	return __hyp_pa(addr);
-}
 
 #define hyp_phys_to_pfn(phys)	((phys) >> PAGE_SHIFT)
 #define hyp_pfn_to_phys(pfn)	((phys_addr_t)((pfn) << PAGE_SHIFT))
@@ -117,37 +121,34 @@ static inline void set_hyp_state(struct hyp_page *p, enum pkvm_page_state state)
 }
 
 /*
- * Refcounting for 'struct hyp_page'.
- * hyp_pool::lock must be held if atomic access to the refcount is required.
+ * Refcounting wrappers for 'struct hyp_page'.
  */
 static inline int hyp_page_count(void *addr)
 {
 	struct hyp_page *p = hyp_virt_to_page(addr);
 
-	return p->refcount;
+	/* Callers shouldn't see the extra reference held by page_alloc.c */
+	return hyp_refcount_get(p->refcount) - 1;
 }
 
 static inline void hyp_page_ref_inc(struct hyp_page *p)
 {
-	BUG_ON(p->refcount == USHRT_MAX);
-	p->refcount++;
+	hyp_refcount_inc(p->refcount);
 }
 
 static inline void hyp_page_ref_dec(struct hyp_page *p)
 {
-	BUG_ON(!p->refcount);
-	p->refcount--;
+	hyp_refcount_dec(p->refcount);
 }
 
-static inline int hyp_page_ref_dec_and_test(struct hyp_page *p)
-{
-	hyp_page_ref_dec(p);
-	return (p->refcount == 0);
-}
+/*
+ * page_alloc.c takes an extra reference on freshly-allocated pages,
+ * hence we initialise the reference count to 2.
+ */
+#define HYP_PAGE_INIT_REFCOUNT 2
 
 static inline void hyp_set_page_refcounted(struct hyp_page *p)
 {
-	BUG_ON(p->refcount);
-	p->refcount = 1;
+	hyp_refcount_set(p->refcount, HYP_PAGE_INIT_REFCOUNT);
 }
 #endif /* __KVM_HYP_MEMORY_H */
