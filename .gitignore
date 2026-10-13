@@ -10,12 +10,6 @@
 #
 # Normal rules (sorted alphabetically)
 #
-
-gki/aarch64/abi.stg
-gki/aarch64/abi.stg.allowed_breaks
-gki/aarch64/symbols/pixel
-gki/x86_64/abi.stg
-
 .*
 *.a
 *.asn1.[ch]
