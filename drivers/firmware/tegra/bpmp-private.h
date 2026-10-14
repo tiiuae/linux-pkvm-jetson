@@ -23,8 +23,19 @@ struct tegra_bpmp_ops {
 	int (*resume)(struct tegra_bpmp *bpmp);
 };
 
+struct tegra_bpmp_transfer_ops {
+	int (*transfer_atomic)(struct tegra_bpmp *bpmp,
+			       struct tegra_bpmp_message *msg);
+	int (*transfer)(struct tegra_bpmp *bpmp,
+			struct tegra_bpmp_message *msg);
+};
+
 extern const struct tegra_bpmp_ops tegra186_bpmp_ops;
 extern const struct tegra_bpmp_ops tegra210_bpmp_ops;
+
+int tegra_bpmp_ping(struct tegra_bpmp *bpmp);
+int tegra_bpmp_get_firmware_tag(struct tegra_bpmp *bpmp, char *tag,
+				size_t size);
 
 /**
  * Transport Error Codes
