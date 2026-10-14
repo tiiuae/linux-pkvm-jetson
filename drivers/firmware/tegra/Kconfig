@@ -34,4 +34,15 @@ config TEGRA_BPMP_HOST_PROXY
 
 	  Say Y here to enable this driver. If unsure, say N.
 
+config VIRTIO_BPMP
+	bool "Virtio BPMP driver"
+	depends on VIRTIO
+	select TEGRA_BPMP
+	help
+	  Para-virtualised BPMP driver with virtio.
+
+	  Say Y here if you intend to run this kernel as a guest.
+	  Expects the host to act as a proxy for BPMP commands sent by the guest for passthrough
+	  devices.
+
 endmenu
