@@ -1129,6 +1129,14 @@ static void smmu_cb_write(struct hyp_arm_smmu_v2_device *smmu, int cb_idx)
 	if (stage1)
 		reg |= ARM_SMMU_SCTLR_S1_ASIDPNE;
 
+	/*
+	 * Guest contexts have no fault interrupt, so nothing clears a fault
+	 * once it is recorded. Without HUPCF the SMMU would then terminate
+	 * every later transaction in the context, not just the faulting one.
+	 */
+	if (cb->vmid)
+		reg |= ARM_SMMU_SCTLR_HUPCF;
+
 	cb->sctlr = reg;
 	smmu_writel(smmu, cb_page, ARM_SMMU_CB_SCTLR, reg);
 }
@@ -2609,6 +2617,13 @@ static int smmu_domain_alloc(pkvm_handle_t iommu,
 	if (ret)
 		goto error_with_cb;
 
+	/*
+	 * Context banks are reused across domains. Clear any fault left by a
+	 * previous user, as smmu_reset() does at boot.
+	 */
+	smmu_writel(smmu, smmu->numpage + cb_idx, ARM_SMMU_CB_FSR,
+		    ARM_SMMU_CB_FSR_FAULT);
+
 	/* Initialise our context bank and write it to hardware */
 	smmu_cb_init(smmu, cb_idx, type, (u16)domain->domain_id,
 		     &smmu_domain->pgtable->cfg);
@@ -2638,6 +2653,8 @@ static void smmu_domain_free(struct kvm_hyp_iommu_domain *domain)
 	hyp_spin_lock(&smmu->lock);
 	memset(cb, 0, sizeof(*cb));
 	smmu_cb_write(smmu, cb_idx);
+	smmu_writel(smmu, smmu->numpage + cb_idx, ARM_SMMU_CB_FSR,
+		    ARM_SMMU_CB_FSR_FAULT);
 	smmu_cb_free(smmu, cb_idx);
 
 	sme_idx = smmu_sme_find_by_cb(smmu, cb_idx);
