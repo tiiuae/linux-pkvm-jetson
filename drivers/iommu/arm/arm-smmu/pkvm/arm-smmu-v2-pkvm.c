@@ -2478,26 +2478,32 @@ static int smmu_host_stage2_idmap(phys_addr_t start, phys_addr_t end, int prot)
 
 		while (size) {
 			mapped = 0;
-
 			pgsize = smmu_pgsize_idmap(size, start, pgtable->cfg.pgsize_bitmap);
 			pgcount = size / pgsize;
 			ret = pgtable->ops.map_pages(&pgtable->ops, start, start,
 						     pgsize, pgcount, prot, 0, &mapped);
+			/*
+			 * Failing to map isn't compromising security. Make sure we don't crash for
+			 * that.
+			 */
+			if (ret || !mapped)
+				return 0;
+
 			size -= mapped;
 			start += mapped;
-			if (!mapped || ret)
-				return 0;
 		}
 	} else {
 		while (size) {
+			iommu_iotlb_gather_init(&gather);
 			pgsize = smmu_pgsize_idmap(size, start, pgtable->cfg.pgsize_bitmap);
 			pgcount = size / pgsize;
 			unmapped = pgtable->ops.unmap_pages(&pgtable->ops, start,
 							    pgsize, pgcount, &gather);
-			size -= unmapped;
-			start += unmapped;
 			if (!unmapped)
 				break;
+
+			size -= unmapped;
+			start += unmapped;
 		}
 		/* Some memory were not unmapped. */
 		if (WARN_ON(size))
