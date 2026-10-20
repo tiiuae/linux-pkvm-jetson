@@ -705,6 +705,7 @@ struct iommu_ops {
 
 	const struct iommu_domain_ops *default_domain_ops;
 	struct module *owner;
+	bool msi_iova_bypass;
 	struct iommu_domain *identity_domain;
 	struct iommu_domain *blocked_domain;
 	struct iommu_domain *release_domain;
