@@ -55,19 +55,28 @@ static int tegra186_mc_enumerate_sids(struct tegra_mc *mc)
 	struct of_phandle_args iommu_args, ic_args;
 	const struct tegra_mc_client *client;
 	u32 sid;
-	int err, i;
+	int err, i, j;
 
 	dev_info(mc->dev, "MC: Enumerating Stream ID assignments for pKVM\n");
 
+	dev_dbg(mc->dev, "Enumerating MC clients\n");
+	for (i = 0; i < mc->soc->num_clients; i++) {
+		client = &mc->soc->clients[i];
+		dev_dbg(mc->dev, "MC: client %s: id = 0x%x, sid = 0x%x\n",
+			client->name, client->id, client->sid);
+	}
+
 	/* Walk all device tree nodes with "iommus" property */
 	for_each_node_with_property(np, "iommus") {
+		dev_dbg(mc->dev, "MC: Device %pOF has iommu\n", np);
+
 		/* Skip if no interconnects property (not an MC client) */
 		if (!of_find_property(np, "interconnects", NULL))
 			continue;
 
 		/* Extract Stream ID from iommus property */
 		err = of_parse_phandle_with_args(np, "iommus", "#iommu-cells",
-						  0, &iommu_args);
+						 0, &iommu_args);
 		if (err) {
 			dev_warn(mc->dev, "MC: Failed to parse iommus for %pOF: %d\n",
 				 np, err);
@@ -76,29 +85,39 @@ static int tegra186_mc_enumerate_sids(struct tegra_mc *mc)
 
 		/* Stream ID is first argument */
 		sid = iommu_args.args[0];
+		dev_dbg(mc->dev, "MC: Device %pOF has sid = 0x%x\n", np, sid);
 
 		/* Parse interconnects property to find MC client IDs */
 		i = 0;
 		while (!of_parse_phandle_with_args(np, "interconnects",
-						     "#interconnect-cells",
-						     i * 2, &ic_args)) {
+						   "#interconnect-cells", i,
+						   &ic_args)) {
+			/* Skip &emc phandle or missing client id */
+			if (ic_args.np != mc->dev->of_node ||
+			    ic_args.args_count == 0) {
+				i++;
+				continue;
+			}
+
 			u32 client_id = ic_args.args[0];
+			dev_dbg(mc->dev,
+				"MC: device: %pOF, iteration %d, current client_id: 0x%x\n",
+				np, i, client_id);
 			of_node_put(ic_args.np);
 
 			/* Find client in MC's client table */
-			for (client = mc->soc->clients;
-			     client < mc->soc->clients + mc->soc->num_clients;
-			     client++) {
+			for (j = 0; j < mc->soc->num_clients; j++) {
+				client = &mc->soc->clients[j];
 				if (client->id == client_id) {
 					struct arm_smccc_res res;
 
 					dev_info(mc->dev,
-						 "MC: Device %pOF: client %s (0x%x) -> SID 0x%x\n",
-						 np, client->name, client_id, sid);
+						"MC: Device %pOF: client %s (0x%x) -> SID 0x%x\n",
+						np, client->name, client_id, sid);
 
 					/* Register with EL2 hypervisor via SMCCC */
 					arm_smccc_1_1_hvc(KVM_HOST_SMCCC_FUNC(__pkvm_mc_register_sid),
-							  client_id, sid, 0, 0, 0, 0, 0, &res);
+						client_id, sid, 0, 0, 0, 0, 0, &res);
 					err = (int)res.a1;
 					if (err) {
 						dev_err(mc->dev,
