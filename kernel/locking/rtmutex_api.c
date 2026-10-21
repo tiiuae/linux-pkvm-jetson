@@ -77,6 +77,18 @@ void __sched _rt_mutex_lock_nest_lock(struct rt_mutex *lock, struct lockdep_map 
 }
 EXPORT_SYMBOL_GPL(_rt_mutex_lock_nest_lock);
 
+/*
+ * rt_mutex_lock() is a macro wrapping rt_mutex_lock_nested() here. Provide
+ * an out-of-line version for modules that reference it by symbol name.
+ */
+#undef rt_mutex_lock
+void __sched rt_mutex_lock(struct rt_mutex *lock);
+void __sched rt_mutex_lock(struct rt_mutex *lock)
+{
+	__rt_mutex_lock_common(lock, TASK_UNINTERRUPTIBLE, NULL, 0);
+}
+EXPORT_SYMBOL_GPL(rt_mutex_lock);
+
 #else /* !CONFIG_DEBUG_LOCK_ALLOC */
 
 /**
