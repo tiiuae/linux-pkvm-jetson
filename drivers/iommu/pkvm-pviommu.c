@@ -311,6 +311,27 @@ static struct pviommu *pviommu_get_by_fwnode(struct fwnode_handle *fwnode)
 
 static struct iommu_ops pviommu_ops;
 
+static bool pviommu_sids_untranslated(struct pviommu *pv,
+				      struct iommu_fwspec *fwspec)
+{
+	struct arm_smccc_res res;
+	int i;
+
+	if (!fwspec->num_ids)
+		return false;
+
+	for (i = 0; i < fwspec->num_ids; i++) {
+		arm_smccc_1_1_hvc(ARM_SMCCC_VENDOR_HYP_KVM_PVIOMMU_OP_FUNC_ID,
+				  KVM_PVIOMMU_OP_SID_INFO,
+				  pv->id, fwspec->ids[i], 0, 0, 0, &res);
+		if (res.a0 != SMCCC_RET_SUCCESS ||
+		    !(res.a1 & KVM_PVIOMMU_SID_UNTRANSLATED))
+			return false;
+	}
+
+	return true;
+}
+
 static struct iommu_device *pviommu_probe_device(struct device *dev)
 {
 	struct pviommu_master *master;
@@ -322,6 +343,14 @@ static struct iommu_device *pviommu_probe_device(struct device *dev)
 
 	pv = pviommu_get_by_fwnode(fwspec->iommu_fwnode);
 	if (!pv)
+		return ERR_PTR(-ENODEV);
+
+	/*
+	 * Leave a stream the hardware never translates out of the IOMMU
+	 * entirely. A domain of any type, identity included, makes the DMA API
+	 * hand back an address the device does not use.
+	 */
+	if (pviommu_sids_untranslated(pv, fwspec))
 		return ERR_PTR(-ENODEV);
 
 	master = kzalloc(sizeof(*master), GFP_KERNEL);
