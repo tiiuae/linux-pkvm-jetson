@@ -7,6 +7,7 @@
 #include <linux/acpi.h>
 #include <linux/dma-buf.h>
 #include <linux/mman.h>
+#include <linux/pkvm-guest-ram.h>
 #include <linux/kvm_host.h>
 #include <linux/io.h>
 #include <linux/hugetlb.h>
@@ -2166,7 +2167,8 @@ void pkvm_release_ppage(struct kvm_pinned_page *ppage, bool dirty)
  * the IPA lies in the reserved identity range, so a guest backed by ordinary
  * memory can never land here however its IPAs happen to be laid out.
  */
-static int pkvm_mem_abort_identity(struct kvm_vcpu *vcpu, gfn_t gfn, long nr_pages)
+static int pkvm_mem_abort_identity(struct kvm_vcpu *vcpu, struct kvm_memory_slot *memslot,
+				   gfn_t gfn, long nr_pages)
 {
 	struct list_head ppage_prealloc = LIST_HEAD_INIT(ppage_prealloc);
 	struct kvm_pinned_page *ppage, *tmp;
@@ -2202,8 +2204,11 @@ static int pkvm_mem_abort_identity(struct kvm_vcpu *vcpu, gfn_t gfn, long nr_pag
 		list_del_init(&ppage->list_node);
 
 		ppage->_page = pfn_to_page(pfn);
+		ppage->file = NULL;
+		ppage->pfn = pfn;
 		ppage->ipa = ipa;
 		ppage->order = 0;
+		ppage->slot = memslot;
 		ppage->pinned = false;
 		list_add_tail(&ppage->list_node, &ppages);
 	}
@@ -2271,8 +2276,8 @@ static int pkvm_mem_abort(struct kvm_vcpu *vcpu, phys_addr_t fault_ipa, size_t s
 		 * whose RAM is ordinary anonymous or memfd memory pins fine and
 		 * never gets here.
 		 */
-		if (pkvm_ipa_is_identity(fault_ipa))
-			return pkvm_mem_abort_identity(vcpu, gfn, nr_pages);
+		if (pkvm_ipa_is_identity(vcpu->kvm, fault_ipa))
+			return pkvm_mem_abort_identity(vcpu, memslot, gfn, nr_pages);
 
 		ret = pkvm_mem_abort_device(vcpu, memslot, gfn, nr_pages);
 		if (!ret)
@@ -2370,7 +2375,7 @@ int __pkvm_pgtable_stage2_split(struct kvm_vcpu *vcpu, phys_addr_t ipa, size_t s
 		return -EINVAL;
 
 	/* Identity RAM is only ever mapped at 4K, so there is no block to split. */
-	if (pkvm_ipa_is_identity(ipa))
+	if (pkvm_ipa_is_identity(kvm, ipa))
 		return -EINVAL;
 
 	nr_pages = hyp_memcache->nr_pages;
@@ -3174,13 +3179,26 @@ void kvm_arch_commit_memory_region(struct kvm *kvm,
 	}
 }
 
-/* Identity RAM is mapped by the donation path, never from this VMA. */
-static bool kvm_slot_is_identity_ram(const struct kvm_memory_slot *slot)
+static int pkvm_record_identity_slot(struct kvm *kvm,
+				     const struct kvm_memory_slot *new)
 {
-	u64 start = slot->base_gfn << PAGE_SHIFT;
-	u64 end = start + (slot->npages << PAGE_SHIFT) - 1;
+	u64 gpa = new->base_gfn << PAGE_SHIFT;
+	u64 len = new->npages << PAGE_SHIFT;
+	phys_addr_t base;
+	u64 size;
 
-	return pkvm_ipa_is_identity(start) && pkvm_ipa_is_identity(end);
+	if (!pkvm_identity_ram_reservation(&base, &size))
+		return -EINVAL;
+
+	if (gpa != base || len > size) {
+		kvm_err("pkvm: identity RAM slot 0x%llx+0x%llx must be 0x%llx+0x%llx or smaller\n",
+			gpa, len, (u64)base, size);
+		return -EINVAL;
+	}
+
+	kvm->arch.pkvm.identity_ram_base = gpa;
+	kvm->arch.pkvm.identity_ram_size = len;
+	return 0;
 }
 
 int kvm_arch_prepare_memory_region(struct kvm *kvm,
@@ -3247,10 +3265,19 @@ int kvm_arch_prepare_memory_region(struct kvm *kvm,
 		}
 
 		if (vma->vm_flags & VM_PFNMAP) {
+			bool identity = kvm_vm_is_protected(kvm) &&
+					pkvm_guest_ram_is_vma(vma);
+
 			/* IO region dirty page logging not allowed */
 			if (new->flags & KVM_MEM_LOG_DIRTY_PAGES) {
 				ret = -EINVAL;
 				break;
+			}
+
+			if (identity) {
+				ret = pkvm_record_identity_slot(kvm, new);
+				if (ret)
+					break;
 			}
 
 			/*
@@ -3260,8 +3287,7 @@ int kvm_arch_prepare_memory_region(struct kvm *kvm,
 			if (kvm_vma_is_cacheable(vma) &&
 			    !kvm_supports_cacheable_pfnmap() &&
 			    !is_dma_buf_file(vma->vm_file) &&
-			    !(kvm_vm_is_protected(kvm) &&
-			      kvm_slot_is_identity_ram(new))) {
+				!identity) {
 				ret = -EINVAL;
 				break;
 			}
