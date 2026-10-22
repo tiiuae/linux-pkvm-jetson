@@ -2484,9 +2484,26 @@ static size_t smmu_pgsize_idmap(size_t size, u64 paddr, size_t pgsize_bitmap)
 	return BIT(__fls(pgsizes));
 }
 
+/*
+ * The idmap can only use 4K pages, so covering the whole input address space
+ * would take far more page-table pages than the IOMMU pool holds. The host
+ * stage-2 snapshot also passes the holes between memory regions, which run all
+ * the way to the top of the address space, and once the pool is exhausted
+ * every later map fails, including memory returned to the host.
+ *
+ * Host devices only DMA to memory and to low MMIO such as the GIC (Tegra234
+ * PCIe handles MSIs inside the controller), so cover only [0, end of memory).
+ */
+static phys_addr_t smmu_idmap_limit(void)
+{
+	struct memblock_region *reg = &hyp_memory[hyp_memblock_nr - 1];
+
+	return reg->base + reg->size;
+}
+
 static int smmu_host_stage2_idmap(phys_addr_t start, phys_addr_t end, int prot)
 {
-	size_t size = end - start;
+	size_t size;
 	size_t pgsize, pgcount;
 	size_t mapped, unmapped;
 	int ret;
@@ -2494,8 +2511,11 @@ static int smmu_host_stage2_idmap(phys_addr_t start, phys_addr_t end, int prot)
 	struct iommu_iotlb_gather gather;
 
 	end = min(end, BIT(pgtable->cfg.oas));
+	end = min(end, smmu_idmap_limit());
 	if (start >= end)
 		return 0;
+
+	size = end - start;
 
 	if (prot) {
 		if (!(prot & IOMMU_MMIO))
