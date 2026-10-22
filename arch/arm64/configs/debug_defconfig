@@ -78,7 +78,7 @@ CONFIG_COMPAT=y
 CONFIG_ARM64_PMEM=y
 CONFIG_ARM64_PSEUDO_NMI=y
 CONFIG_RANDOMIZE_BASE=y
-CONFIG_CMDLINE="kvm-arm.mode=protected vfio_platform.reset_required=0 nokaslr kvm-arm.protected_modules=tegra234-mgbe-pkvm"
+CONFIG_CMDLINE="nokaslr kvm-arm.mode=protected kvm-arm.host_s2=carveout kvm-arm.protected_modules=tegra234-mgbe-pkvm vfio_platform.reset_required=0"
 CONFIG_CMDLINE_EXTEND=y
 CONFIG_WQ_POWER_EFFICIENT_DEFAULT=y
 CONFIG_ENERGY_MODEL=y
