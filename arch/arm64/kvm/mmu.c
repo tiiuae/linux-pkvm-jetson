@@ -2167,7 +2167,8 @@ void pkvm_release_ppage(struct kvm_pinned_page *ppage, bool dirty)
  * the IPA lies in the reserved identity range, so a guest backed by ordinary
  * memory can never land here however its IPAs happen to be laid out.
  */
-static int pkvm_mem_abort_identity(struct kvm_vcpu *vcpu, gfn_t gfn, long nr_pages)
+static int pkvm_mem_abort_identity(struct kvm_vcpu *vcpu, struct kvm_memory_slot *memslot,
+				   gfn_t gfn, long nr_pages)
 {
 	struct list_head ppage_prealloc = LIST_HEAD_INIT(ppage_prealloc);
 	struct kvm_pinned_page *ppage, *tmp;
@@ -2203,8 +2204,11 @@ static int pkvm_mem_abort_identity(struct kvm_vcpu *vcpu, gfn_t gfn, long nr_pag
 		list_del_init(&ppage->list_node);
 
 		ppage->_page = pfn_to_page(pfn);
+		ppage->file = NULL;
+		ppage->pfn = pfn;
 		ppage->ipa = ipa;
 		ppage->order = 0;
+		ppage->slot = memslot;
 		ppage->pinned = false;
 		list_add_tail(&ppage->list_node, &ppages);
 	}
@@ -2273,7 +2277,7 @@ static int pkvm_mem_abort(struct kvm_vcpu *vcpu, phys_addr_t fault_ipa, size_t s
 		 * never gets here.
 		 */
 		if (pkvm_ipa_is_identity(vcpu->kvm, fault_ipa))
-			return pkvm_mem_abort_identity(vcpu, gfn, nr_pages);
+			return pkvm_mem_abort_identity(vcpu, memslot, gfn, nr_pages);
 
 		ret = pkvm_mem_abort_device(vcpu, memslot, gfn, nr_pages);
 		if (!ret)
