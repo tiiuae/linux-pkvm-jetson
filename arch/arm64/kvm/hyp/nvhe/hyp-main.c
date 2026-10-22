@@ -1813,8 +1813,9 @@ static void handle___pkvm_devices_register_late(struct kvm_cpu_context *host_ctx
 	 * Tegra234) where PCI enumeration finishes after stage-2 lockdown.
 	 * EL2 enforces the one-shot guarantee internally.
 	 */
-	cpu_reg(host_ctxt, 1) = pkvm_devices_register_late(nr_devs,
-						(struct pkvm_device *)dev_ptr);
+	errno_to_smccc(pkvm_devices_register_late(nr_devs,
+						  (struct pkvm_device *)dev_ptr),
+		       host_ctxt);
 }
 
 static void handle___pkvm_host_iommu_alloc_domain(struct kvm_cpu_context *host_ctxt)

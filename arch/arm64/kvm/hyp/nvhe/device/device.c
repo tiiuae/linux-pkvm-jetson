@@ -145,6 +145,8 @@ int pkvm_init_devices(unsigned long nr_devs, struct pkvm_device *devs)
 
 int pkvm_devices_register_late(unsigned long nr_devs, struct pkvm_device *devs)
 {
+	int ret;
+
 	if (!nr_devs || nr_devs > PKVM_LATE_DEVICES_MAX)
 		return -EINVAL;
 
@@ -156,7 +158,18 @@ int pkvm_devices_register_late(unsigned long nr_devs, struct pkvm_device *devs)
 	late_devices_done = true;
 	hyp_spin_unlock(&device_spinlock);
 
-	return pkvm_init_devices(nr_devs, devs);
+	ret = pkvm_init_devices(nr_devs, devs);
+	if (ret) {
+		/*
+		 * Nothing was registered, so let the host try again, e.g. once
+		 * it has topped up the memory the donation of the table needs.
+		 */
+		hyp_spin_lock(&device_spinlock);
+		late_devices_done = false;
+		hyp_spin_unlock(&device_spinlock);
+	}
+
+	return ret;
 }
 
 /* return device from a resource, addr and size must match. */

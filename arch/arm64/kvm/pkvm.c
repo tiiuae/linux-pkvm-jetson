@@ -1549,9 +1549,9 @@ static void pkvm_late_register(void)
 	 * hyp BSS which is stage-2 protected after pkvm_drop_host_privileges().
 	 * EL2 will kern_hyp_va() and donate the pages itself.
 	 */
-	ret = kvm_call_hyp_nvhe(__pkvm_devices_register_late,
-				(unsigned long)nr_devs,
-				(unsigned long)devs);
+	ret = kvm_call_refill_hyp_nvhe(__pkvm_devices_register_late,
+				       (unsigned long)nr_devs,
+				       (unsigned long)devs);
 	if (ret) {
 		pr_err("pkvm: late device HVC failed: %d\n", ret);
 		dev_sz = PAGE_ALIGN(size_mul(sizeof(struct pkvm_device), nr_devs));
