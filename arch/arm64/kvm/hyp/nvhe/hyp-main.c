@@ -804,6 +804,9 @@ static void flush_hyp_vcpu(struct pkvm_hyp_vcpu *hyp_vcpu)
 		if (host_iflags & unpack_vcpu_flag(PKVM_HOST_STATE_DIRTY))
 			__flush_hyp_vcpu(hyp_vcpu);
 
+		/* __hyp_running_vcpu must be NULL in a guest context. */
+		hyp_vcpu->vcpu.arch.ctxt.__hyp_running_vcpu = NULL;
+
 		hyp_vcpu->vcpu.arch.iflags = host_iflags;
 		hyp_vcpu->vcpu.arch.hcr_el2 &= ~(HCR_TWI | HCR_TWE | HCR_VSE);
 		hyp_vcpu->vcpu.arch.hcr_el2 |= READ_ONCE(host_vcpu->arch.hcr_el2) &
