@@ -544,6 +544,7 @@ iommu_copy_struct_from_full_user_array(void *kdst, size_t kdst_entry_size,
 				   user_array->entry_num *
 					   user_array->entry_len))
 			return -EFAULT;
+		return 0;
 	}
 
 	/* Copy item by item */
@@ -765,7 +766,8 @@ struct iommu_map_cookie_sg {
  *			     it should also release the cookie as it's not used.
  */
 struct iommu_domain_ops {
-	int (*attach_dev)(struct iommu_domain *domain, struct device *dev);
+	int (*attach_dev)(struct iommu_domain *domain, struct device *dev,
+			  struct iommu_domain *old);
 	int (*set_dev_pasid)(struct iommu_domain *domain, struct device *dev,
 			     ioasid_t pasid, struct iommu_domain *old);
 
@@ -1678,6 +1680,7 @@ void iopf_free_group(struct iopf_group *group);
 int iommu_report_device_fault(struct device *dev, struct iopf_fault *evt);
 void iopf_group_response(struct iopf_group *group,
 			 enum iommu_page_response_code status);
+void iopf_group_dequeue(struct iopf_group *group);
 #else
 static inline int
 iopf_queue_add_device(struct iopf_queue *queue, struct device *dev)
@@ -1721,6 +1724,10 @@ iommu_report_device_fault(struct device *dev, struct iopf_fault *evt)
 
 static inline void iopf_group_response(struct iopf_group *group,
 				       enum iommu_page_response_code status)
+{
+}
+
+static inline void iopf_group_dequeue(struct iopf_group *group)
 {
 }
 #endif /* CONFIG_IOMMU_IOPF */
