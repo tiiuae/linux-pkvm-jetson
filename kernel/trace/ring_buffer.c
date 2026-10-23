@@ -423,41 +423,6 @@ static struct buffer_data_page *alloc_cpu_data(int cpu, int order)
 	return dpage;
 }
 
-/*
- * For best performance, allocate cpu buffer data cache line sized
- * and per CPU.
- */
-#define alloc_cpu_buffer(cpu) (struct ring_buffer_per_cpu *)		\
-	kzalloc_node(ALIGN(sizeof(struct ring_buffer_per_cpu),		\
-			   cache_line_size()), GFP_KERNEL, cpu_to_node(cpu));
-
-#define alloc_cpu_page(cpu) (struct buffer_page *)			\
-	kzalloc_node(ALIGN(sizeof(struct buffer_page),			\
-			   cache_line_size()), GFP_KERNEL, cpu_to_node(cpu));
-
-static struct buffer_data_page *alloc_cpu_data(int cpu, int order)
-{
-	struct buffer_data_page *dpage;
-	struct page *page;
-	gfp_t mflags;
-
-	/*
-	 * __GFP_RETRY_MAYFAIL flag makes sure that the allocation fails
-	 * gracefully without invoking oom-killer and the system is not
-	 * destabilized.
-	 */
-	mflags = GFP_KERNEL | __GFP_RETRY_MAYFAIL | __GFP_COMP | __GFP_ZERO;
-
-	page = alloc_pages_node(cpu_to_node(cpu), mflags, order);
-	if (!page)
-		return NULL;
-
-	dpage = page_address(page);
-	rb_init_page(dpage);
-
-	return dpage;
-}
-
 struct rb_irq_work {
 	struct irq_work			work;
 	wait_queue_head_t		waiters;
@@ -2399,6 +2364,53 @@ static void *rb_page_desc_page(struct rb_page_desc *pdesc, int page_id)
 	return page_id > pdesc->nr_page_va ? NULL : (void *)pdesc->page_va[page_id];
 }
 
+/* ring_buffers with writer set do not own the data pages, only the bpages */
+static void rb_free_writer_subbuf_ids(struct ring_buffer_per_cpu *cpu_buffer,
+				      int nr_subbufs)
+{
+	int i;
+
+	if (!cpu_buffer->subbuf_ids)
+		return;
+
+	for (i = 0; i < nr_subbufs; i++) {
+		if (cpu_buffer->subbuf_ids[i])
+			free_buffer_page(cpu_buffer->subbuf_ids[i]);
+	}
+
+	kfree(cpu_buffer->subbuf_ids);
+	cpu_buffer->subbuf_ids = NULL;
+}
+
+static int rb_setup_writer_subbuf_ids(struct ring_buffer_per_cpu *cpu_buffer,
+				      struct rb_page_desc *pdesc)
+{
+	int i;
+
+	cpu_buffer->subbuf_ids = kcalloc(pdesc->nr_page_va,
+					 sizeof(*cpu_buffer->subbuf_ids),
+					 GFP_KERNEL);
+	if (!cpu_buffer->subbuf_ids)
+		return -ENOMEM;
+
+	for (i = 0; i < pdesc->nr_page_va; i++) {
+		struct buffer_page *bpage = alloc_cpu_page(cpu_buffer->cpu);
+
+		if (!bpage) {
+			rb_free_writer_subbuf_ids(cpu_buffer, pdesc->nr_page_va);
+			return -ENOMEM;
+		}
+
+		bpage->page = rb_page_desc_page(pdesc, i);
+		bpage->order = cpu_buffer->buffer->subbuf_order;
+		bpage->id = i;
+		bpage->range = 1; /* The data page is owned by the writer */
+		cpu_buffer->subbuf_ids[i] = bpage;
+	}
+
+	return 0;
+}
+
 
 static int rb_allocate_pages(struct ring_buffer_per_cpu *cpu_buffer,
 			     unsigned long nr_pages)
@@ -2466,15 +2478,18 @@ rb_allocate_cpu_buffer(struct trace_buffer *buffer, long nr_pages, int cpu)
 
 		cpu_buffer->writer = buffer->writer;
 		cpu_buffer->meta_page = (struct trace_buffer_meta *)(void *)pdesc->meta_va;
-		cpu_buffer->subbuf_ids = pdesc->page_va;
 		cpu_buffer->nr_pages = pdesc->nr_page_va - 1;
+		if (rb_setup_writer_subbuf_ids(cpu_buffer, pdesc))
+			goto fail_free_reader;
 		atomic_inc(&cpu_buffer->record_disabled);
 		atomic_inc(&cpu_buffer->resize_disabled);
 
 		bpage->page = rb_page_desc_page(pdesc,
 						cpu_buffer->meta_page->reader.id);
-		if (!bpage->page)
+		if (!bpage->page) {
+			rb_free_writer_subbuf_ids(cpu_buffer, pdesc->nr_page_va);
 			goto fail_free_reader;
+		}
 		/*
 		 * The meta-page can only describe which of the ring-buffer page
 		 * is the reader. There is no need to init the rest of the
@@ -2558,8 +2573,10 @@ static void rb_free_cpu_buffer(struct ring_buffer_per_cpu *cpu_buffer)
 	irq_work_sync(&cpu_buffer->irq_work.work);
 
 	/* ring_buffers with writer set do not own the data pages */
-	if (cpu_buffer->writer)
+	if (cpu_buffer->writer) {
 		cpu_buffer->reader_page->page = NULL;
+		rb_free_writer_subbuf_ids(cpu_buffer, cpu_buffer->nr_pages + 1);
+	}
 
 	free_buffer_page(cpu_buffer->reader_page);
 
@@ -5582,7 +5599,7 @@ __rb_get_reader_page_from_writer(struct ring_buffer_per_cpu *cpu_buffer)
 	}
 
 	cpu_buffer->reader_page->page =
-		(void *)cpu_buffer->subbuf_ids[cpu_buffer->meta_page->reader.id];
+		cpu_buffer->subbuf_ids[cpu_buffer->meta_page->reader.id]->page;
 	cpu_buffer->reader_page->id = cpu_buffer->meta_page->reader.id;
 	cpu_buffer->reader_page->read = 0;
 	cpu_buffer->read_stamp = cpu_buffer->reader_page->page->time_stamp;
