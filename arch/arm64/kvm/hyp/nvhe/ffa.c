@@ -665,17 +665,19 @@ static int do_ffa_rxtx_guest_map(struct kvm_cpu_context *ctxt, struct pkvm_hyp_v
 	hyp_spin_lock(&kvm_ffa_hyp_lock);
 	ffa_buf = ffa_get_buffers(hyp_vcpu);
 	if (ffa_buf->tx) {
+		hyp_spin_unlock(&kvm_ffa_hyp_lock);
 		ret = -EACCES;
-		goto out_unlock;
+		goto out_err_with_rx;
 	}
 
 	ffa_buf->tx = (void *)tx_va;
 	ffa_buf->rx = (void *)rx_va;
 	ffa_buf->tx_ipa = tx;
 	ffa_buf->rx_ipa = rx;
-out_unlock:
 	hyp_spin_unlock(&kvm_ffa_hyp_lock);
-	return ret;
+	return 0;
+out_err_with_rx:
+	WARN_ON(__pkvm_guest_unshare_hyp_page(pkvm_hyp_vcpu_to_hyp_vm(hyp_vcpu), rx));
 out_err_with_tx:
 	WARN_ON(__pkvm_guest_unshare_hyp_page(pkvm_hyp_vcpu_to_hyp_vm(hyp_vcpu), tx));
 out_err:
