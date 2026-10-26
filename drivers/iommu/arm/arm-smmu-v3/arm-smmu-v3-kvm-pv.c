@@ -206,7 +206,8 @@ out_err:
 	return ret;
 }
 static int kvm_arm_smmu_attach_dev(struct iommu_domain *domain,
-				   struct device *dev)
+				   struct device *dev,
+				   struct iommu_domain *old_domain)
 {
 	struct iommu_domain *old = iommu_get_domain_for_dev(dev);
 
@@ -344,7 +345,8 @@ static int kvm_arm_smmu_def_domain_type(struct device *dev)
 }
 
 static int kvm_arm_smmu_attach_dev_identity(struct iommu_domain *domain,
-					    struct device *dev)
+					    struct device *dev,
+					    struct iommu_domain *old_domain)
 {
 	struct arm_smmu_master *master = dev_iommu_priv_get(dev);
 	struct arm_smmu_device *smmu = master->smmu;
