@@ -2310,6 +2310,70 @@ static int smmu_handle_cb(struct hyp_arm_smmu_v2_device *smmu, u32 offset,
 	return -EINVAL;
 }
 
+/*
+ * Each base of a Tegra234 dual-base instance records its own faults, and the
+ * host's driver reads and clears them per base. Give the host the fault
+ * registers of the secondary base: if a fault there is hidden behind the
+ * primary's registers, the host cannot clear it and the shared fault
+ * interrupt fires until the kernel disables it or locks up.
+ */
+static bool smmu_handle_sec_fault(struct hyp_arm_smmu_v2_device *smmu,
+				  u32 offset, bool is_write, u64 *val)
+{
+	u32 page = offset >> smmu->pgshift;
+	u32 pgoffset = smmu_page_offset(smmu, offset);
+	void __iomem *reg;
+	int cb_idx;
+
+	if (page == ARM_SMMU_GR0) {
+		switch (pgoffset) {
+		case ARM_SMMU_GR0_sGFSR:
+			break;
+		case ARM_SMMU_GR0_sGFSYNR0:
+		case ARM_SMMU_GR0_sGFSYNR1:
+		case ARM_SMMU_GR0_sGFSYNR2:
+			if (is_write)
+				return false;
+			break;
+		default:
+			return false;
+		}
+	} else if (page >= smmu->numpage) {
+		switch (pgoffset) {
+		case ARM_SMMU_CB_FSR:
+			break;
+		case ARM_SMMU_CB_FAR:
+		case ARM_SMMU_CB_FSYNR0:
+			if (is_write)
+				return false;
+			break;
+		default:
+			return false;
+		}
+
+		cb_idx = smmu_host_cb_map(smmu, page - smmu->numpage, false);
+		if (cb_idx < 0) {
+			/* Not one of the host's context banks */
+			if (!is_write)
+				*val = 0;
+			return true;
+		}
+		page = cb_idx + smmu->numpage;
+	} else {
+		return false;
+	}
+
+	reg = smmu->base_sec + (page << smmu->pgshift) + pgoffset;
+	if (is_write)
+		writel_relaxed((u32)*val, reg);
+	else if (page >= smmu->numpage && pgoffset == ARM_SMMU_CB_FAR)
+		*val = readq_relaxed(reg);
+	else
+		*val = readl_relaxed(reg);
+
+	return true;
+}
+
 /**
  * smmu_mmio_handler() - Main MMIO trap handler
  * @addr: Physical address being accessed
@@ -2324,6 +2388,7 @@ static bool smmu_mmio_handler(u64 addr, bool is_write, u64 *val)
 	struct hyp_arm_smmu_v2_device *smmu_i;
 	phys_addr_t base;
 	u32 offset, page, page_offset;
+	bool sec = false;
 	int ret;
 
 	for_each_smmu(smmu_i) {
@@ -2335,17 +2400,14 @@ static bool smmu_mmio_handler(u64 addr, bool is_write, u64 *val)
 			break;
 		}
 
-		/* Ignore writes on secondary base; redirect reads to primary */
+		/* Check secondary base */
 		if (smmu_i->has_secondary_base &&
 		    addr >= smmu_i->mmio_addr_sec &&
 		    addr < smmu_i->mmio_addr_sec + smmu_i->mmio_size) {
-			if (is_write)
-				return true;
-			else {
-				smmu = smmu_i;
-				base = smmu->mmio_addr_sec;
-				break;
-			}
+			smmu = smmu_i;
+			base = smmu->mmio_addr_sec;
+			sec = true;
+			break;
 		}
 	}
 
@@ -2355,6 +2417,17 @@ static bool smmu_mmio_handler(u64 addr, bool is_write, u64 *val)
 	hyp_spin_lock(&smmu->lock);
 
 	offset = addr - base;
+
+	/*
+	 * The secondary base has its own fault registers. Everything else on it
+	 * is mirrored from the primary: ignore writes, redirect reads.
+	 */
+	if (sec && (smmu_handle_sec_fault(smmu, offset, is_write, val) ||
+		    is_write)) {
+		hyp_spin_unlock(&smmu->lock);
+		return true;
+	}
+
 	page = offset >> smmu->pgshift;
 	page_offset = smmu_page_offset(smmu, offset);
 
