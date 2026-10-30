@@ -2901,7 +2901,7 @@ static bool pkvm_g2g_st_init_vm(int idx, void **scratch, unsigned long *left)
 	for (i = 0; i < PKVM_G2G_ST_POOL; i++) {
 		if (!pkvm_g2g_st_take(scratch, left, 1, &p))
 			return false;
-		hyp_virt_to_page(p)->refcount = 1;
+		hyp_set_page_refcounted(hyp_virt_to_page(p));
 		hyp_put_page(&vm->pool, p);
 	}
 
