@@ -2331,7 +2331,7 @@ static u32 pkvm_g2g_offer_range_facts(struct pkvm_hyp_vm *vm, u64 ipa, u64 size)
 
 			/* Not RAM, under DMA, or not the guest's alone. */
 			if (!addr_is_memory(phys) ||
-			    hyp_page_count(hyp_phys_to_virt(phys)) ||
+			    hyp_page_referenced(hyp_phys_to_virt(phys)) ||
 			    get_host_state(hyp_phys_to_page(phys)) != PKVM_NOPAGE)
 				facts |= PKVM_G2G_OFFER_STATE;
 		}
