@@ -2888,6 +2888,7 @@ static bool pkvm_g2g_st_init_vm(int idx, void **scratch, unsigned long *left)
 	vm->kvm.arch.mmu.pgt = &vm->pgt;
 	vm->kvm.arch.mmu.vtcr = host_mmu.arch.mmu.vtcr;
 	vm->kvm.arch.pkvm.pvmfw_load_addr = PVMFW_INVALID_LOAD_ADDR;
+	vm->kvm.arch.pkvm.is_protected = true;
 	vcpu->vcpu.arch.hw_mmu = &vm->kvm.arch.mmu;
 	vcpu->vcpu.kvm = &vm->kvm;
 
