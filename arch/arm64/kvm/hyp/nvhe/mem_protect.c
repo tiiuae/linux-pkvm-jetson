@@ -2894,7 +2894,7 @@ static bool pkvm_g2g_st_init_vm(int idx, void **scratch, unsigned long *left)
 	pgd_pages = kvm_pgtable_stage2_pgd_size(vm->kvm.arch.mmu.vtcr) >> PAGE_SHIFT;
 	if (pgd_pages > PKVM_G2G_ST_PGD_MAX ||
 	    !pkvm_g2g_st_take_aligned(scratch, left, pgd_pages, &p) ||
-	    kvm_guest_prepare_stage2(vm, p))
+	    kvm_guest_prepare_stage2(vm, p, 0))
 		return false;
 
 	/* Spare table pages, as init_selftest_vm() gives its VM. */

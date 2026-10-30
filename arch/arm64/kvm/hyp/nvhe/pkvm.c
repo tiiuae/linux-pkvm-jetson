@@ -2994,7 +2994,7 @@ static bool pkvm_g2g_share_answer(struct pkvm_hyp_vcpu *hyp_vcpu,
 		ret = pkvm_request_split(hyp_vcpu, ipa, nr_pages, exit_code);
 		break;
 	case PKVM_G2G_SHARE_NEED_MEMCACHE:
-		ret = pkvm_request_vcpu_memcache(hyp_vcpu, exit_code);
+		ret = pkvm_request_vcpu_memcache(hyp_vcpu, exit_code, true);
 		break;
 	default:
 		smccc_set_retval(vcpu, pkvm_g2g_share_verdict_to_smccc(v),
