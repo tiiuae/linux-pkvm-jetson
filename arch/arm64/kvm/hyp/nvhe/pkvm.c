@@ -2093,6 +2093,18 @@ static bool pkvm_guest_id_register_call(struct pkvm_hyp_vcpu *hyp_vcpu)
 	}
 
 	/*
+	 * A name is only worth trusting if it was chosen by code that was verified
+	 * before it ran, and only pvmfw is. So only a VM that booted through pvmfw
+	 * may register: pvmfw registers before it jumps to the payload, and the
+	 * once-only rule below keeps the payload from changing it. A VM the host
+	 * started without firmware could otherwise claim any name it likes.
+	 */
+	if (!pkvm_hyp_vm_has_pvmfw(vm)) {
+		smccc_set_retval(vcpu, SMCCC_RET_NOT_SUPPORTED, 0, 0, 0);
+		return true;
+	}
+
+	/*
 	 * The write lock, not the read lock: the uniqueness test and the
 	 * assignment have to be atomic against another VM registering the same
 	 * identity concurrently, and the lock is what makes the scan below a
