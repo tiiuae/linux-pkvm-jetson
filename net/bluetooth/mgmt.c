@@ -2434,9 +2434,13 @@ static int send_cancel(struct hci_dev *hdev, void *data)
 
 	mgmt_cmd_complete(cmd->sk, hdev->id, MGMT_OP_MESH_SEND_CANCEL,
 			  0, NULL, 0);
-	mgmt_pending_free(cmd);
 
 	return 0;
+}
+
+static void send_cancel_destroy(struct hci_dev *hdev, void *data, int err)
+{
+	mgmt_pending_free(data);
 }
 
 static int mesh_send_cancel(struct sock *sk, struct hci_dev *hdev,
@@ -2459,7 +2463,8 @@ static int mesh_send_cancel(struct sock *sk, struct hci_dev *hdev,
 	if (!cmd)
 		err = -ENOMEM;
 	else
-		err = hci_cmd_sync_queue(hdev, send_cancel, cmd, NULL);
+		err = hci_cmd_sync_queue(hdev, send_cancel, cmd,
+					 send_cancel_destroy);
 
 	if (err < 0) {
 		err = mgmt_cmd_status(sk, hdev->id, MGMT_OP_MESH_SEND_CANCEL,
@@ -2645,7 +2650,7 @@ static int send_hci_cmd_sync(struct hci_dev *hdev, void *data)
 	if (IS_ERR(skb)) {
 		mgmt_cmd_status(cmd->sk, hdev->id, MGMT_OP_HCI_CMD_SYNC,
 				mgmt_status(PTR_ERR(skb)));
-		goto done;
+		return 0;
 	}
 
 	mgmt_cmd_complete(cmd->sk, hdev->id, MGMT_OP_HCI_CMD_SYNC, 0,
@@ -2653,10 +2658,12 @@ static int send_hci_cmd_sync(struct hci_dev *hdev, void *data)
 
 	kfree_skb(skb);
 
-done:
-	mgmt_pending_free(cmd);
-
 	return 0;
+}
+
+static void send_hci_cmd_sync_destroy(struct hci_dev *hdev, void *data, int err)
+{
+	mgmt_pending_free(data);
 }
 
 static int mgmt_hci_cmd_sync(struct sock *sk, struct hci_dev *hdev,
@@ -2684,7 +2691,8 @@ static int mgmt_hci_cmd_sync(struct sock *sk, struct hci_dev *hdev,
 	if (!cmd)
 		err = -ENOMEM;
 	else
-		err = hci_cmd_sync_queue(hdev, send_hci_cmd_sync, cmd, NULL);
+		err = hci_cmd_sync_queue(hdev, send_hci_cmd_sync, cmd,
+					 send_hci_cmd_sync_destroy);
 
 	if (err < 0) {
 		err = mgmt_cmd_status(sk, hdev->id, MGMT_OP_HCI_CMD_SYNC,
