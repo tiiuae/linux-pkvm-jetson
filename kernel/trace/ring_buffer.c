@@ -6143,7 +6143,7 @@ ring_buffer_read_start(struct trace_buffer *buffer, int cpu, gfp_t flags)
 	if (!iter)
 		return NULL;
 
-	if (!cpumask_test_cpu(cpu, buffer->cpumask) || buffer->writer)
+	if (!cpumask_test_cpu(cpu, buffer->cpumask))
 		return NULL;
 
 	cpu_buffer = buffer->buffers[cpu];
