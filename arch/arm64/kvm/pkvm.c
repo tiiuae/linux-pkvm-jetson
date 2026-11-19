@@ -1711,14 +1711,15 @@ int pkvm_enable_smc_forwarding(struct file *kvm_file)
 	if (!file_is_kvm(kvm_file))
 		return -EINVAL;
 
-	if (!kvm_get_kvm_safe(kvm_file->private_data))
-		return -EINVAL;
-
 	kvm = kvm_file->private_data;
 	if (!kvm)
 		return -EINVAL;
 
+	if (!kvm_get_kvm_safe(kvm))
+		return -EINVAL;
+
 	kvm->arch.pkvm.smc_forwarded = true;
+	kvm_put_kvm(kvm);
 
 	return 0;
 }
@@ -2681,7 +2682,6 @@ static unsigned long mod_direct_hyp_base;
 
 unsigned long pkvm_el2_mod_kern_va(unsigned long addr)
 {
-#ifdef CONFIG_PKVM_STACKTRACE
 	struct pkvm_el2_module *mod;
 
 	/* Fast lookup into the direct range */
@@ -2699,7 +2699,7 @@ unsigned long pkvm_el2_mod_kern_va(unsigned long addr)
 			return (unsigned long)mod->sections.start +
 				(addr - hyp_va);
 	}
-#endif
+
 	return 0;
 }
 

@@ -150,6 +150,7 @@ static bool pkvm_guest_iommu_attach_dev(struct pkvm_hyp_vcpu *hyp_vcpu, u64 *exi
 			WARN_ON(kvm_iommu_free_domain(domain_id));
 		goto out_unlock;
 	}
+	guest_domain->allocated = true;
 
 	/*
 	 * Identity-map the physical ITS doorbell page (PA -> PA) in this
@@ -290,10 +291,10 @@ out:
 
 static bool pkvm_guest_iommu_free_domain(struct pkvm_hyp_vcpu *hyp_vcpu)
 {
-	int ret;
+	int ret = 0;
 	struct kvm_vcpu *vcpu = &hyp_vcpu->vcpu;
 	u64 domain_id = smccc_get_arg2(vcpu);
-	struct pviommu_guest_domain *guest_domain, *temp;
+	struct pviommu_guest_domain *guest_domain;
 	struct pkvm_hyp_vm *vm = pkvm_hyp_vcpu_to_hyp_vm(hyp_vcpu);
 
 	if (smccc_get_arg3(vcpu) || smccc_get_arg4(vcpu) || smccc_get_arg5(vcpu) ||
@@ -303,17 +304,21 @@ static bool pkvm_guest_iommu_free_domain(struct pkvm_hyp_vcpu *hyp_vcpu)
 	}
 
 	hyp_spin_lock(&pviommu_guest_domain_lock);
-	ret = kvm_iommu_free_domain(domain_id);
-	if (ret)
+	guest_domain = pkvm_guest_iommu_find_domain(vm, domain_id);
+	if (!guest_domain) {
+		ret = -EINVAL;
 		goto out_unlock;
-	list_for_each_entry_safe(guest_domain, temp, &vm->domains, list) {
-		if (guest_domain->id == domain_id) {
-			pkvm_guest_iommu_free_id(domain_id);
-			list_del(&guest_domain->list);
-			hyp_free(guest_domain);
-			break;
-		}
 	}
+
+	if (guest_domain->allocated) {
+		ret = kvm_iommu_free_domain(domain_id);
+		if (ret)
+			goto out_unlock;
+	}
+
+	pkvm_guest_iommu_free_id(domain_id);
+	list_del(&guest_domain->list);
+	hyp_free(guest_domain);
 
 out_unlock:
 	hyp_spin_unlock(&pviommu_guest_domain_lock);
@@ -493,7 +498,8 @@ void kvm_iommu_teardown_guest_domains(struct pkvm_hyp_vm *hyp_vm)
 
 	hyp_spin_lock(&pviommu_guest_domain_lock);
 	list_for_each_entry_safe(guest_domain, temp, &hyp_vm->domains, list) {
-		kvm_iommu_force_free_domain(guest_domain->id, hyp_vm);
+		if (guest_domain->allocated)
+			kvm_iommu_force_free_domain(guest_domain->id, hyp_vm);
 		pkvm_guest_iommu_free_id(guest_domain->id);
 		list_del(&guest_domain->list);
 		hyp_free(guest_domain);

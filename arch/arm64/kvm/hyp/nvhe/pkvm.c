@@ -18,6 +18,7 @@
 
 #include <nvhe/audit.h>
 #include <nvhe/alloc.h>
+#include <nvhe/arm-smccc.h>
 #include <nvhe/errno.h>
 #include <nvhe/ffa.h>
 #include <nvhe/mem_protect.h>
@@ -80,6 +81,15 @@ static void pkvm_vcpu_reset_hcr(struct kvm_vcpu *vcpu)
 		vcpu->arch.hcr_el2 |= HCR_TID4;
 	else
 		vcpu->arch.hcr_el2 |= HCR_TID2;
+
+	/*
+	 * Without AArch32 EL1, leave RW set and let the entry fail with an
+	 * illegal exception return: the *32_EL2 registers EL2 would otherwise
+	 * switch are UNDEFINED there.
+	 */
+	if (vcpu_has_feature(vcpu, KVM_ARM_VCPU_EL1_32BIT) &&
+	    cpus_have_final_cap(ARM64_HAS_32BIT_EL1))
+		vcpu->arch.hcr_el2 &= ~HCR_EL2_RW;
 
 	if (vcpu_has_ptrauth(vcpu))
 		vcpu->arch.hcr_el2 |= (HCR_API | HCR_APK);
@@ -347,8 +357,11 @@ struct pkvm_hyp_vcpu *pkvm_load_hyp_vcpu(pkvm_handle_t handle,
 	if (!hyp_vcpu)
 		goto unlock;
 
-	/* Ensure vcpu isn't loaded on more than one cpu simultaneously. */
-	if (unlikely(cmpxchg_relaxed(&hyp_vcpu->loaded_hyp_vcpu, NULL,
+	/*
+	 * Ensure vcpu isn't loaded on more than one cpu simultaneously.
+	 * Pairs with smp_store_release() in pkvm_put_hyp_vcpu().
+	 */
+	if (unlikely(cmpxchg_acquire(&hyp_vcpu->loaded_hyp_vcpu, NULL,
 				     this_cpu_ptr(&loaded_hyp_vcpu)))) {
 		hyp_vcpu = NULL;
 		goto unlock;
@@ -389,6 +402,43 @@ struct pkvm_hyp_vcpu *pkvm_get_loaded_hyp_vcpu(void)
 {
 	return __this_cpu_read(loaded_hyp_vcpu);
 
+}
+
+static struct pkvm_hyp_vm *pkvm_get_loaded_hyp_vm(struct kvm_vcpu *vcpu)
+{
+	struct pkvm_hyp_vcpu *hyp_vcpu = pkvm_get_loaded_hyp_vcpu();
+
+	if (hyp_vcpu &&
+	    (vcpu == &hyp_vcpu->vcpu || vcpu == hyp_vcpu->host_vcpu))
+		return pkvm_hyp_vcpu_to_hyp_vm(hyp_vcpu);
+
+	return NULL;
+}
+
+/*
+ * A loaded vCPU's VM is the hyp VM. An unloaded host vCPU's is mapped at
+ * EL2 only while pinned, so it's read once and pinned; the pin fails for
+ * memory the host isn't sharing.
+ */
+struct kvm *pkvm_vcpu_get_kvm(struct kvm_vcpu *vcpu)
+{
+	struct pkvm_hyp_vm *hyp_vm = pkvm_get_loaded_hyp_vm(vcpu);
+	struct kvm *kvm;
+
+	if (hyp_vm)
+		return &hyp_vm->kvm;
+
+	kvm = kern_hyp_va(READ_ONCE(vcpu->kvm));
+	if (hyp_pin_shared_mem(kvm, kvm + 1))
+		return NULL;
+
+	return kvm;
+}
+
+void pkvm_vcpu_put_kvm(struct kvm_vcpu *vcpu, struct kvm *kvm)
+{
+	if (kvm && !pkvm_get_loaded_hyp_vm(vcpu))
+		hyp_unpin_shared_mem(kvm, kvm + 1);
 }
 
 struct pkvm_hyp_vm *get_pkvm_hyp_vm(pkvm_handle_t handle)
@@ -998,8 +1048,10 @@ int __pkvm_init_vm(struct kvm *host_kvm, unsigned long pgd_hva)
 	}
 
 	pgd_size = kvm_pgtable_stage2_pgd_size(host_mmu.arch.mmu.vtcr);
-	if (!IS_ALIGNED(pgd_hva, pgd_size))
+	if (!IS_ALIGNED(pgd_hva, pgd_size)) {
+		ret = -EINVAL;
 		goto err_free_last_ran;
+	}
 	pgd = map_donated_memory_noclear(pgd_hva, pgd_size);
 	if (!pgd) {
 		ret = -ENOMEMHOSTS2;
@@ -1049,7 +1101,7 @@ err_unpin_kvm:
 	return ret;
 }
 
-struct ffa_mem_transfer *__pkvm_get_vm_ffa_transfer(u16 handle)
+struct ffa_mem_transfer *__pkvm_get_vm_ffa_transfer(u64 handle)
 {
 	struct pkvm_hyp_vm *vm;
 	struct ffa_mem_transfer *transfer = NULL;

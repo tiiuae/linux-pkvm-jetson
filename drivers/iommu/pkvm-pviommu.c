@@ -389,11 +389,10 @@ static int pviommu_set_dev_pasid(struct iommu_domain *domain,
 	return ret;
 }
 
-static int pviommu_attach_dev(struct iommu_domain *domain, struct device *dev)
+static int pviommu_attach_dev(struct iommu_domain *domain, struct device *dev,
+			      struct iommu_domain *old_domain)
 {
-	struct iommu_domain *old = iommu_get_domain_for_dev(dev);
-
-	return pviommu_set_dev_pasid(domain, dev, 0, old);
+	return pviommu_set_dev_pasid(domain, dev, 0, old_domain);
 }
 
 static struct iommu_domain *pviommu_domain_alloc_paging(struct device *dev)

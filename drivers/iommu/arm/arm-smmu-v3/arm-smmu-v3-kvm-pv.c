@@ -206,7 +206,8 @@ out_err:
 	return ret;
 }
 static int kvm_arm_smmu_attach_dev(struct iommu_domain *domain,
-				   struct device *dev)
+				   struct device *dev,
+				   struct iommu_domain *old_domain)
 {
 	struct iommu_domain *old = iommu_get_domain_for_dev(dev);
 
@@ -344,7 +345,8 @@ static int kvm_arm_smmu_def_domain_type(struct device *dev)
 }
 
 static int kvm_arm_smmu_attach_dev_identity(struct iommu_domain *domain,
-					    struct device *dev)
+					    struct device *dev,
+					    struct iommu_domain *old_domain)
 {
 	struct arm_smmu_master *master = dev_iommu_priv_get(dev);
 	struct arm_smmu_device *smmu = master->smmu;
@@ -543,7 +545,26 @@ static bool kvm_arm_smmu_validate_features(struct arm_smmu_device *smmu)
 
 static irqreturn_t kvm_arm_smmu_evt_handler(int irq, void *dev)
 {
-	return arm_smmu_evtq_common(irq, dev, arm_smmu_handle_event);
+	int ret;
+	irqreturn_t irq_ret;
+	struct arm_smmu_device *smmu = dev;
+	struct host_arm_smmu_device *host_smmu = smmu_to_host(smmu);
+	bool has_pd = host_smmu->power_domain.type != KVM_POWER_DOMAIN_NONE;
+
+	if (has_pd) {
+		ret = pm_runtime_resume_and_get(smmu->dev);
+		if (ret < 0) {
+			dev_err(smmu->dev, "Failed to resume device: %d\n", ret);
+			return IRQ_NONE;
+		}
+	}
+
+	irq_ret = arm_smmu_evtq_common(irq, dev, arm_smmu_handle_event);
+
+	if (has_pd)
+		pm_runtime_put(smmu->dev);
+
+	return irq_ret;
 }
 
 static void kvm_arm_smmu_cmdq_err(struct arm_smmu_device *smmu)
@@ -554,7 +575,26 @@ static void kvm_arm_smmu_cmdq_err(struct arm_smmu_device *smmu)
 
 static irqreturn_t kvm_arm_smmu_gerror_handler(int irq, void *dev)
 {
-	return arm_smmu_gerror_common(irq, dev, kvm_arm_smmu_cmdq_err);
+	int ret;
+	irqreturn_t irq_ret;
+	struct arm_smmu_device *smmu = dev;
+	struct host_arm_smmu_device *host_smmu = smmu_to_host(smmu);
+	bool has_pd = host_smmu->power_domain.type != KVM_POWER_DOMAIN_NONE;
+
+	if (has_pd) {
+		ret = pm_runtime_get_if_active(smmu->dev);
+		if (ret <= 0) {
+			dev_err(smmu->dev, "Unable to handle global error interrupt because device not runtime active\n");
+			return IRQ_NONE;
+		}
+	}
+
+	irq_ret = arm_smmu_gerror_common(irq, dev, kvm_arm_smmu_cmdq_err);
+
+	if (has_pd)
+		pm_runtime_put(smmu->dev);
+
+	return irq_ret;
 }
 
 static irqreturn_t kvm_arm_smmu_combined_handler(int irq, void *dev)

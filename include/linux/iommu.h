@@ -171,7 +171,6 @@ enum iommu_domain_cookie_type {
 	IOMMU_COOKIE_NONE,
 	IOMMU_COOKIE_DMA_IOVA,
 	IOMMU_COOKIE_DMA_MSI,
-	IOMMU_COOKIE_FAULT_HANDLER,
 	IOMMU_COOKIE_SVA,
 	IOMMU_COOKIE_IOMMUFD,
 };
@@ -229,15 +228,15 @@ struct iommu_domain {
 	unsigned long pgsize_bitmap;	/* Bitmap of page sizes in use */
 	struct iommu_domain_geometry geometry;
 	int (*iopf_handler)(struct iopf_group *group);
+	struct {
+		iommu_fault_handler_t handler;
+		void *handler_token;
+	};
 
 	union { /* cookie */
 		struct iommu_dma_cookie *iova_cookie;
 		struct iommu_dma_msi_cookie *msi_cookie;
 		struct iommufd_hw_pagetable *iommufd_hwpt;
-		struct {
-			iommu_fault_handler_t handler;
-			void *handler_token;
-		};
 		struct {	/* IOMMU_DOMAIN_SVA */
 			struct mm_struct *mm;
 			int users;
@@ -544,6 +543,7 @@ iommu_copy_struct_from_full_user_array(void *kdst, size_t kdst_entry_size,
 				   user_array->entry_num *
 					   user_array->entry_len))
 			return -EFAULT;
+		return 0;
 	}
 
 	/* Copy item by item */
@@ -765,7 +765,8 @@ struct iommu_map_cookie_sg {
  *			     it should also release the cookie as it's not used.
  */
 struct iommu_domain_ops {
-	int (*attach_dev)(struct iommu_domain *domain, struct device *dev);
+	int (*attach_dev)(struct iommu_domain *domain, struct device *dev,
+			  struct iommu_domain *old);
 	int (*set_dev_pasid)(struct iommu_domain *domain, struct device *dev,
 			     ioasid_t pasid, struct iommu_domain *old);
 
@@ -998,7 +999,8 @@ static inline void iommu_flush_iotlb_all(struct iommu_domain *domain)
 static inline void iommu_iotlb_sync(struct iommu_domain *domain,
 				  struct iommu_iotlb_gather *iotlb_gather)
 {
-	if (domain->ops->iotlb_sync)
+	if (domain->ops->iotlb_sync &&
+	    likely(iotlb_gather->start < iotlb_gather->end))
 		domain->ops->iotlb_sync(domain, iotlb_gather);
 
 	iommu_iotlb_gather_init(iotlb_gather);
@@ -1678,6 +1680,7 @@ void iopf_free_group(struct iopf_group *group);
 int iommu_report_device_fault(struct device *dev, struct iopf_fault *evt);
 void iopf_group_response(struct iopf_group *group,
 			 enum iommu_page_response_code status);
+void iopf_group_dequeue(struct iopf_group *group);
 #else
 static inline int
 iopf_queue_add_device(struct iopf_queue *queue, struct device *dev)
@@ -1721,6 +1724,10 @@ iommu_report_device_fault(struct device *dev, struct iopf_fault *evt)
 
 static inline void iopf_group_response(struct iopf_group *group,
 				       enum iommu_page_response_code status)
+{
+}
+
+static inline void iopf_group_dequeue(struct iopf_group *group)
 {
 }
 #endif /* CONFIG_IOMMU_IOPF */

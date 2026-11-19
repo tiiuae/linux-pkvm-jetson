@@ -45,6 +45,9 @@ DEFINE_PER_CPU(struct kvm_nvhe_init_params, kvm_init_params);
  */
 DEFINE_PER_CPU(struct kvm_hyp_req, host_hyp_reqs);
 
+/* Number of implemented GICv3 LRs. Used by flush_hyp_vcpu(). */
+unsigned int hyp_gicv3_nr_lr;
+
 void __kvm_hyp_host_forward_smc(struct kvm_cpu_context *host_ctxt);
 
 static bool (*default_trap_handler)(struct user_pt_regs *regs);
@@ -710,6 +713,7 @@ static void __copy_vcpu_state(const struct kvm_vcpu *from_vcpu,
 	copy_sysreg(TFSRE0_EL1);
 
 	copy_sysreg(SCTLR_EL1);
+	copy_sysreg(SCTLR2_EL1);
 	copy_sysreg(ACTLR_EL1);
 	copy_sysreg(CPACR_EL1);
 	copy_sysreg(ZCR_EL1);
@@ -733,6 +737,8 @@ static void __copy_vcpu_state(const struct kvm_vcpu *from_vcpu,
 
 	copy_sysreg(PIR_EL1);
 	copy_sysreg(PIRE0_EL1);
+	copy_sysreg(POR_EL1);
+	copy_sysreg(POR_EL0);
 }
 
 static void __sync_hyp_vcpu(struct pkvm_hyp_vcpu *hyp_vcpu)
@@ -811,8 +817,18 @@ static void flush_hyp_vcpu(struct pkvm_hyp_vcpu *hyp_vcpu)
 		hyp_vcpu->vcpu.arch.hcr_el2 |= READ_ONCE(host_vcpu->arch.hcr_el2) &
 							 (HCR_TWI | HCR_TWE | HCR_VSE);
 
+		/* __hyp_running_vcpu must be NULL in a guest context. */
+		hyp_vcpu->vcpu.arch.ctxt.__hyp_running_vcpu = NULL;
+
 		hyp_vcpu->vcpu.arch.mdcr_el2 = host_vcpu->arch.mdcr_el2;
 		hyp_vcpu->vcpu.arch.vsesr_el2 = host_vcpu->arch.vsesr_el2;
+
+		/* Bound used_lrs by the number of implemented list registers. */
+		hyp_vcpu->vcpu.arch.vgic_cpu.vgic_v3.used_lrs =
+			min_t(unsigned int,
+			      hyp_vcpu->vcpu.arch.vgic_cpu.vgic_v3.used_lrs,
+			      hyp_gicv3_nr_lr);
+
 		flush_debug_state(hyp_vcpu);
 	}
 

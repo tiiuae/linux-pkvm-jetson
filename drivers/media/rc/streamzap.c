@@ -365,6 +365,7 @@ static int streamzap_probe(struct usb_interface *intf,
 
 	return 0;
 rc_submit_fail:
+	rc_unregister_device(sz->rdev);
 	rc_free_device(sz->rdev);
 	usb_set_intfdata(intf, NULL);
 rc_dev_fail:
@@ -392,15 +393,16 @@ static void streamzap_disconnect(struct usb_interface *interface)
 	struct streamzap_ir *sz = usb_get_intfdata(interface);
 	struct usb_device *usbdev = interface_to_usbdev(interface);
 
-	usb_set_intfdata(interface, NULL);
-
 	if (!sz)
 		return;
 
-	usb_kill_urb(sz->urb_in);
 	rc_unregister_device(sz->rdev);
+	usb_set_intfdata(interface, NULL);
+
+	usb_kill_urb(sz->urb_in);
 	usb_free_urb(sz->urb_in);
 	usb_free_coherent(usbdev, sz->buf_in_len, sz->buf_in, sz->dma_in);
+	rc_free_device(sz->rdev);
 
 	kfree(sz);
 }
