@@ -353,7 +353,7 @@ int io_waitid(struct io_kiocb *req, unsigned int issue_flags)
 		 */
 		if (!io_waitid_drop_issue_ref(req)) {
 			if (io_wq_cancel_seen(req, issue_flags))
-				__io_waitid_cancel(req);
+				__io_waitid_cancel(req, true);
 			io_ring_submit_unlock(ctx, issue_flags);
 			return IOU_ISSUE_SKIP_COMPLETE;
 		}
